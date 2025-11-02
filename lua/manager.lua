@@ -4,127 +4,142 @@ local Util = require("mercury.lua.utils")
 
 local M = {}
 
-M.registry = { by_id = {}, order = {} }
-M.buf = nil
-M._mutating = false
+-- One state per buffer
+-- [bufnr] -> { buf, registry={by_id={}}, _mark_to_id={}, order={head,tail,next={},prev={}} }
+local STATE = {}
 
-M._id_to_index = {}
-M._mark_to_id = {}
+local function curbuf()
+	return vim.api.nvim_get_current_buf()
+end
 
--- ---------------- internal helpers ----------------
+local function ensure_state(buf)
+	buf = buf or curbuf()
+	local S = STATE[buf]
+	if not S then
+		S = {
+			buf = buf,
+			registry = { by_id = {} },
+			_mark_to_id = {},
+			order = { head = nil, tail = nil, next = {}, prev = {} },
+		}
+		STATE[buf] = S
+	end
+	return S
+end
 
-local function emit_blocks_changed()
-	if not M.buf or not vim.api.nvim_buf_is_loaded(M.buf) then
+function M.registry_for(buf)
+	return ensure_state(buf).registry
+end
+
+-- TODO Migrate this off registry
+setmetatable(M, {
+	__index = function(_, k)
+		if k == "registry" then
+			return ensure_state(nil).registry
+		elseif k == "buf" then
+			return curbuf()
+		end
+	end,
+})
+
+local function emit_blocks_changed(S)
+	if not S.buf or not vim.api.nvim_buf_is_loaded(S.buf) then
 		return
 	end
 	vim.schedule(function()
 		pcall(
 			vim.api.nvim_exec_autocmds,
 			"User",
-			{ pattern = "NotebookBlocksChanged", modeline = false }
+			{ pattern = "NotebookBlocksChanged", modeline = false, data = { buf = S.buf } }
 		)
 	end)
 end
 
-local function reindex_order()
-	local t = {}
-	for i, id in ipairs(M.registry.order) do
-		t[id] = i
-	end
-	M._id_to_index = t
+-- ----- intrusive linked-list of block IDs (per buffer) -----------------------
+local function order_clear(S)
+	S.order.head, S.order.tail = nil, nil
+	S.order.next, S.order.prev = {}, {}
 end
 
-local function register_block(b, at_index)
-	if at_index then
-		table.insert(M.registry.order, at_index, b.id)
+local function order_insert_after(S, after_id, id)
+	local O = S.order
+	if not O.head then
+		O.head, O.tail = id, id
+		return
+	end
+	if not after_id then
+		-- insert at head
+		S.order.prev[O.head] = id
+		S.order.next[id] = O.head
+		O.head = id
+		return
+	end
+	local nxt = O.next[after_id]
+	O.next[after_id] = id
+	O.prev[id] = after_id
+	if nxt then
+		O.next[id] = nxt
+		O.prev[nxt] = id
 	else
-		M.registry.order[#M.registry.order + 1] = b.id
+		O.tail = id
 	end
-	M.registry.by_id[b.id] = b
-	M._mark_to_id[b.mark] = b.id
-	reindex_order()
 end
 
-local function unregister_block(b)
-	M._mark_to_id[b.mark] = nil
-	M.registry.by_id[b.id] = nil
-	local idx = M._id_to_index[b.id]
-	if idx then
-		table.remove(M.registry.order, idx)
+local function order_remove(S, id)
+	local O = S.order
+	local p, n = O.prev[id], O.next[id]
+	if p then
+		O.next[p] = n
+	else
+		O.head = n
 	end
-	reindex_order()
-end
-
-local function ordered_ids_by_extmarks()
-	if not M.buf then
-		return {}
+	if n then
+		O.prev[n] = p
+	else
+		O.tail = p
 	end
-	local ids = {}
-	local marks = vim.api.nvim_buf_get_extmarks(M.buf, Names.blocks, 0, -1, {})
-	for _, m in ipairs(marks) do
-		local mark_id = m[1]
-		local id = M._mark_to_id[mark_id]
-		if id and M.registry.by_id[id] then
-			ids[#ids + 1] = id
-		end
+	O.next[id], O.prev[id] = nil, nil
+end
+
+local function order_as_list(S)
+	local out, id = {}, S.order.head
+	while id do
+		out[#out + 1] = id
+		id = S.order.next[id]
 	end
-	return ids
+	return out
 end
 
-local function block_index(id)
-	return M._id_to_index[id]
+-- ----- registry ops ----------------------------------------------------------
+local function register_block(S, b, insert_after_id)
+	S.registry.by_id[b.id] = b
+	S._mark_to_id[b.mark] = b.id
+	order_insert_after(S, insert_after_id, b.id)
 end
 
-local function prev_block_of(b)
-	local i = M._id_to_index[b.id]
-	if not i or i <= 1 then
-		return nil
-	end
-	return M.registry.by_id[M.registry.order[i - 1]]
+local function unregister_block(S, b)
+	S._mark_to_id[b.mark] = nil
+	S.registry.by_id[b.id] = nil
+	order_remove(S, b.id)
 end
 
-local function next_block_of(b)
-	local i = M._id_to_index[b.id]
-	if not i then
-		return nil
-	end
-	local nid = M.registry.order[i + 1]
-	return nid and M.registry.by_id[nid] or nil
+local function prev_block_of(S, b)
+	local pid = S.order.prev[b.id]
+	return pid and S.registry.by_id[pid] or nil
 end
 
-local function insert_blank_lines_at(row, count)
-	row = math.max(0, row or 0)
-	count = math.max(1, count or 1)
-	local blanks = {}
-	for i = 1, count do
-		blanks[i] = ""
-	end
-	return pcall(vim.api.nvim_buf_set_lines, M.buf, row, row, false, blanks)
+local function next_block_of(S, b)
+	local nid = S.order.next[b.id]
+	return nid and S.registry.by_id[nid] or nil
 end
 
-local function dedupe_order()
-	local seen, uniq = {}, {}
-	for _, id in ipairs(M.registry.order) do
-		if (not seen[id]) and M.registry.by_id[id] ~= nil then
-			seen[id] = true
-			uniq[#uniq + 1] = id
-		end
-	end
-	M.registry.order = uniq
-	reindex_order()
-end
-
-local function reorder_by_extmarks()
-	M.registry.order = ordered_ids_by_extmarks()
-	reindex_order()
-end
-
-local function block_at_row(row)
-	if not M.buf then
+-- ----- low-level buffer queries ----------------------------------------------
+local function block_at_row(S, row)
+	if not S.buf then
 		return nil
 	end
 	local got = vim.api.nvim_buf_get_extmarks(
-		M.buf,
+		S.buf,
 		Names.blocks,
 		{ row, 0 },
 		{ row, 0 },
@@ -134,22 +149,21 @@ local function block_at_row(row)
 		return nil
 	end
 	local mark = got[1][1]
-	local id = M._mark_to_id[mark]
-	return id and M.registry.by_id[id] or nil
+	local id = S._mark_to_id[mark]
+	return id and S.registry.by_id[id] or nil
 end
 
-function M.block_covering(sr, er)
-	local b = block_at_row(sr)
+function M.block_covering(sr, er, buf)
+	local S = ensure_state(buf)
+	local b = block_at_row(S, sr)
 	if not b then
 		return nil
 	end
 	local s, e = b:range()
-	if sr >= s and er <= e then
-		return b
-	end
-	return nil
+	return (sr >= s and er <= e) and b or nil
 end
 
+-- ----- header scanning --------------------------------------------------------
 local function compute_headers(buf)
 	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 	local headers = {}
@@ -157,7 +171,7 @@ local function compute_headers(buf)
 		local line = lines[i]
 		if Util.is_py_cell_start(line) then
 			headers[#headers + 1] = {
-				header_row = i - 1,
+				header_row = i,
 				type = Util.parse_header(line),
 				header_text = line,
 			}
@@ -167,11 +181,10 @@ local function compute_headers(buf)
 end
 
 local function pairs_from_headers(buf, headers)
-	local pairs_ = {}
-	local n = vim.api.nvim_buf_line_count(buf)
+	local pairs_, n = {}, vim.api.nvim_buf_line_count(buf)
 	for i, h in ipairs(headers) do
 		local content_start = h.header_row + 1
-		local e = (i < #headers) and (headers[i + 1].header_row - 1) or (n - 1)
+		local e = (i < #headers) and (headers[i + 1].header_row - 1) or n
 		pairs_[#pairs_ + 1] = {
 			s = content_start,
 			e = e,
@@ -183,10 +196,7 @@ local function pairs_from_headers(buf, headers)
 	return pairs_
 end
 
-local function virtualize_headers(buf, pairs)
-	table.sort(pairs, function(a, b)
-		return a.header_row > b.header_row
-	end)
+local function strip_headers(buf, pairs)
 	for _, p in ipairs(pairs) do
 		local line = Util.getline(buf, p.header_row)
 		if Util.is_py_cell_start(line) then
@@ -195,44 +205,58 @@ local function virtualize_headers(buf, pairs)
 	end
 end
 
-function M.scan_initial(buf)
-	M.buf = buf or 0
-	local headers = compute_headers(M.buf)
-
-	if #headers == 0 then
-		local last = math.max(0, vim.api.nvim_buf_line_count(M.buf) - 1)
-		local id = Util.new_ID()
-		local blk = Block.new(M.buf, 0, last, id, "python", nil, "# %%")
-		register_block(blk)
-		emit_blocks_changed()
-		return
+local function rebuild_order_from_extmarks(S)
+	order_clear(S)
+	local marks = vim.api.nvim_buf_get_extmarks(S.buf, Names.blocks, 0, -1, {})
+	for _, m in ipairs(marks) do
+		local id = S._mark_to_id[m[1]]
+		if id and S.registry.by_id[id] then
+			order_insert_after(S, S.order.tail, id)
+		end
 	end
-
-	local pairs = pairs_from_headers(M.buf, headers)
-	for _, p in ipairs(pairs) do
-		local id = Util.new_ID()
-		local blk = Block.new(M.buf, p.s, p.e, id, p.type, nil, p.header_text)
-		register_block(blk)
-	end
-
-	virtualize_headers(M.buf, pairs)
-	emit_blocks_changed()
 end
 
--- Normalizer
-function M.reflow_all()
-	if not M.buf or not vim.api.nvim_buf_is_loaded(M.buf) then
+-- ----- Public API -------------------------------------------------------------
+function M.scan_initial(buf)
+	local S = ensure_state(buf)
+	-- reset state for this buffer
+	S.registry.by_id = {}
+	S._mark_to_id = {}
+	order_clear(S)
+
+	local headers = compute_headers(S.buf)
+	if #headers == 0 then
+		local last = vim.api.nvim_buf_line_count(S.buf)
+		local id = Util.new_ID()
+		local blk = Block.new(S.buf, 0, last, id, "python", nil, "# %%")
+		register_block(S, blk, S.order.tail)
+		emit_blocks_changed(S)
 		return
 	end
-	dedupe_order()
 
-	-- Build items from extmarks (already sorted by position)
-	local items = {}
-	local marks = vim.api.nvim_buf_get_extmarks(M.buf, Names.blocks, 0, -1, { details = true })
+	local pairs = pairs_from_headers(S.buf, headers)
+	for _, hdr in ipairs(pairs) do
+		local id = Util.new_ID()
+		local blk = Block.new(S.buf, hdr.s, hdr.e, id, hdr.type, nil, hdr.header_text)
+		register_block(S, blk, S.order.tail)
+	end
+
+	strip_headers(S.buf, pairs)
+	emit_blocks_changed(S)
+end
+
+function M.reflow_all(buf)
+	local S = ensure_state(buf)
+	if not S.buf or not vim.api.nvim_buf_is_loaded(S.buf) then
+		return
+	end
+
+	-- Build items as ordered by extmarks
+	local items, marks =
+		{}, vim.api.nvim_buf_get_extmarks(S.buf, Names.blocks, 0, -1, { details = true })
 	for _, m in ipairs(marks) do
-		local mark_id = m[1]
-		local id = M._mark_to_id[mark_id]
-		local b = id and M.registry.by_id[id] or nil
+		local id = S._mark_to_id[m[1]]
+		local b = id and S.registry.by_id[id] or nil
 		if b then
 			local s, e = b:range()
 			items[#items + 1] = { id = id, s = s, e = e }
@@ -242,29 +266,29 @@ function M.reflow_all()
 		return
 	end
 
-	-- If extmark order differs from registry order, adopt it
-	local changed_order = (#items ~= #M.registry.order)
-	if not changed_order then
-		for i = 1, #items do
-			if M.registry.order[i] ~= items[i].id then
-				changed_order = true
+	-- Detect order mismatch
+	local changed = false
+	do
+		local i, id = 1, S.order.head
+		while id and i <= #items do
+			if id ~= items[i].id then
+				changed = true
 				break
 			end
+			id, i = S.order.next[id], i + 1
+		end
+		if id or i <= #items then
+			changed = true
 		end
 	end
-	if changed_order then
-		local new_order = {}
-		for i = 1, #items do
-			new_order[i] = items[i].id
-		end
-		M.registry.order = new_order
-		reindex_order()
+	if changed then
+		rebuild_order_from_extmarks(S)
 	end
 
-	-- Ensure starts are strictly increasing
+	-- Normalize starts strictly increasing
 	for i = 2, #items do
 		if items[i].s <= items[i - 1].s then
-			local b = M.registry.by_id[items[i].id]
+			local b = S.registry.by_id[items[i].id]
 			items[i].s = items[i - 1].s + 1
 			if b then
 				b:set_span(items[i].s, items[i].e)
@@ -272,8 +296,8 @@ function M.reflow_all()
 		end
 	end
 
-	-- Clamp ends to next start - 1 (and to buffer size)
-	local nlines = vim.api.nvim_buf_line_count(M.buf)
+	-- Clamp ends to next start - 1 and to buffer size
+	local nlines = vim.api.nvim_buf_line_count(S.buf)
 	for i = 1, #items do
 		local next_s = items[i + 1] and items[i + 1].s or nlines
 		local want_e = math.min(items[i].e, next_s - 1)
@@ -281,7 +305,7 @@ function M.reflow_all()
 			want_e = items[i].s
 		end
 		if want_e ~= items[i].e then
-			local b = M.registry.by_id[items[i].id]
+			local b = S.registry.by_id[items[i].id]
 			items[i].e = want_e
 			if b then
 				b:set_span(items[i].s, items[i].e)
@@ -291,97 +315,120 @@ function M.reflow_all()
 
 	-- Refresh visuals
 	for _, it in ipairs(items) do
-		local b = M.registry.by_id[it.id]
+		local b = S.registry.by_id[it.id]
 		if b and b.sync_decorations then
 			b:sync_decorations()
 		end
 	end
 
-	emit_blocks_changed()
+	emit_blocks_changed(S)
 end
 
--- Operations
-function M.new_block_above()
-	if not M.buf then
-		return
+-- Operations ------------------------------------------------------------------
+
+local function insert_blank_lines_at(S, row, count)
+	row = math.max(0, row or 0)
+	count = math.max(1, count or 1)
+	local blanks = {}
+	for i = 1, count do
+		blanks[i] = ""
 	end
-	local cur = M.block_at_cursor()
+	return pcall(vim.api.nvim_buf_set_lines, S.buf, row, row, false, blanks)
+end
+
+function M.new_block_above(buf)
+	local S = ensure_state(buf)
+	local cur = M.block_at_cursor(S.buf)
 	if not cur then
 		return
 	end
 	local s, e = cur:range()
 
-	M._mutating = true
-	insert_blank_lines_at(s, 2)
+	insert_blank_lines_at(S, s, 2)
 	cur:set_span(s + 2, e + 2)
 
 	local nid = Util.new_ID()
-	local nb = Block.new(M.buf, s, s + 1, nid, "python", nil, "# %%")
-	local idx = (block_index(cur.id) or 1)
-	register_block(nb, idx)
+	local nb = Block.new(S.buf, s, s + 1, nid, "python", nil, "# %%")
+
+	-- insert before current (i.e., after its prev id)
+	local prev_id = S.order.prev[cur.id]
+	register_block(S, nb, prev_id)
 
 	nb:show_header_virtual()
 	nb:sync_decorations()
-	M._mutating = false
 
-	M.reflow_all()
+	M.reflow_all(S.buf)
 	local ns = nb:range()
 	vim.api.nvim_win_set_cursor(0, { ns + 1, 0 })
 end
 
 function M.new_block_below_from(b)
-	b = b or M.block_at_cursor()
 	if not b then
-		return
+		return M.new_block_below(nil)
 	end
+	local S = ensure_state(b.buf)
 	local s, e = b:range()
 
-	M._mutating = true
-	insert_blank_lines_at(e, 2)
+	insert_blank_lines_at(S, e, 2)
 	b:set_span(s, e)
 
 	local nid = Util.new_ID()
-	local nb = Block.new(M.buf, e + 1, e + 2, nid, "python", nil, "# %%")
+	local nb = Block.new(S.buf, e + 1, e + 2, nid, "python", nil, "# %%")
 
-	local idx = (block_index(b.id) or #M.registry.order) + 1
-	register_block(nb, idx)
+	register_block(S, nb, b.id)
 
 	nb:show_header_virtual()
 	nb:sync_decorations()
-	M._mutating = false
 
-	M.reflow_all()
+	M.reflow_all(S.buf)
 	return nb
 end
 
-function M.new_block_below()
-	return M.new_block_below_from(nil)
-end
-
-function M.delete_block()
-	if not M.buf then
+function M.new_block_below(buf)
+	local S = ensure_state(buf)
+	local b = M.block_at_cursor(S.buf)
+	if not b then
 		return
 	end
-	local b = M.block_at_cursor()
+	local s, e = b:range()
+
+	insert_blank_lines_at(S, e, 2)
+	b:set_span(s, e)
+
+	local nid = Util.new_ID()
+	local nb = Block.new(S.buf, e + 1, e + 2, nid, "python", nil, "# %%")
+
+	register_block(S, nb, b.id)
+
+	nb:show_header_virtual()
+	nb:sync_decorations()
+
+	M.reflow_all(S.buf)
+	return nb
+end
+
+function M.delete_block(buf)
+	local S = ensure_state(buf)
+	local b = M.block_at_cursor(S.buf)
 	if not b then
 		return
 	end
 
-	local prev, nextb = prev_block_of(b), next_block_of(b)
+	local prev, nextb = prev_block_of(S, b), next_block_of(S, b)
 	local s, e = b:range()
 	e = e + 1
 
-	unregister_block(b)
+	unregister_block(S, b)
 
-	M._mutating = true
-	pcall(vim.api.nvim_buf_set_lines, M.buf, s, e, false, {})
+	pcall(vim.api.nvim_buf_set_lines, S.buf, s, e, false, {})
 	if prev and nextb then
-		if prev.set_end_row_exclusive then
-			prev:set_end_row_exclusive(s)
+		if prev.set_end_row then
+			prev:set_end_row(s)
 		end
-	elseif prev and prev.set_end_row_exclusive then
-		prev:set_end_row_exclusive(s)
+	elseif prev and prev.set_end_row then
+		prev:set_end_row(s)
 	end
+
 	b:destroy()
 	if prev and prev.sync_decorations then
 		prev:sync_decorations()
@@ -389,17 +436,17 @@ function M.delete_block()
 	if nextb and nextb.sync_decorations then
 		nextb:sync_decorations()
 	end
-	M._mutating = false
 
-	M.reflow_all()
+	M.reflow_all(S.buf)
 end
 
-function M.merge_below()
-	local b1 = M.block_at_cursor()
+function M.merge_below(buf)
+	local S = ensure_state(buf)
+	local b1 = M.block_at_cursor(S.buf)
 	if not b1 then
 		return
 	end
-	local b2 = next_block_of(b1)
+	local b2 = next_block_of(S, b1)
 	if not b2 then
 		return
 	end
@@ -407,8 +454,8 @@ function M.merge_below()
 	local _, e2 = b2:range()
 	local out = b2.output
 
-	b1:set_end_row_exclusive(e2)
-	unregister_block(b2)
+	b1:set_end_row(e2) -- note: end is exclusive
+	unregister_block(S, b2)
 	b2:destroy()
 
 	if out then
@@ -416,11 +463,12 @@ function M.merge_below()
 	end
 	b1:sync_decorations()
 
-	M.reflow_all()
+	M.reflow_all(S.buf)
 end
 
-function M.select_block()
-	local b = M.block_at_cursor()
+function M.select_block(buf)
+	local S = ensure_state(buf)
+	local b = M.block_at_cursor(S.buf)
 	if not b then
 		return
 	end
@@ -431,35 +479,28 @@ function M.select_block()
 	vim.api.nvim_win_set_cursor(0, { last + 1, 0 })
 end
 
-function M.set_block_type(t)
-	local b = M.block_at_cursor()
+function M.set_block_type(t, buf)
+	local S = ensure_state(buf)
+	local b = M.block_at_cursor(S.buf)
 	if not b then
 		return
 	end
 	b:set_type(t == "markdown" and "markdown" or "python")
 	b:sync_decorations()
-	emit_blocks_changed()
+	emit_blocks_changed(S)
 end
 
--- Encoding
-function M.block_at_cursor()
+-- Encoding / queries ----------------------------------------------------------
+
+function M.block_at_cursor(buf)
+	local S = ensure_state(buf)
 	local row = (vim.api.nvim_win_get_cursor(0)[1] - 1)
-	return block_at_row(row)
+	return block_at_row(S, row)
 end
 
-function M.materialize_pypercent()
-	local lines_out = {}
-	reorder_by_extmarks()
-	for _, id in ipairs(M.registry.order) do
-		local b = M.registry.by_id[id]
-		lines_out[#lines_out + 1] = b.header_text
-		local s, e = b:range()
-		local body = vim.api.nvim_buf_get_lines(M.buf, s, e, false)
-		for _, ln in ipairs(body) do
-			lines_out[#lines_out + 1] = ln
-		end
-	end
-	return lines_out
+-- Provide an array of block ids (for consumers expecting ipairs over order)
+function M.order_list(buf)
+	return order_as_list(ensure_state(buf))
 end
 
 return M

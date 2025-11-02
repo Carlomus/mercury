@@ -19,7 +19,6 @@ local header_config = function(header_text)
 end
 
 local Block = {}
-Block.__index = Block
 
 function Block.new(buf, start_row, end_row, id, type_, header_text)
 	if end_row < start_row then
@@ -34,7 +33,6 @@ function Block.new(buf, start_row, end_row, id, type_, header_text)
 		mark = mark,
 		type = type_ or "python",
 		header_text = header_text or (type_ == "markdown" and "# %% [markdown] " or "# %%"),
-
 		header_virt_mark = nil,
 		tail_mark = nil, -- anchor used by output module
 		_bg = nil,
@@ -44,7 +42,17 @@ function Block.new(buf, start_row, end_row, id, type_, header_text)
 	if self.show_header_virtual then
 		self:show_header_virtual()
 	end
+
 	return self
+end
+
+function Block:range()
+	local pos =
+		vim.api.nvim_buf_get_extmark_by_id(self.buf, Names.blocks, self.mark, { details = true })
+	local sr = (pos and pos[1]) or 0
+	local details = pos and pos[3] or nil
+	local er = (details and details.end_row) or sr
+	return sr, er
 end
 
 function Block:_tail_row()
@@ -61,21 +69,12 @@ function Block:_ensure_tail_anchor()
 	self.tail_mark = vim.api.nvim_buf_set_extmark(self.buf, Names.preview, row, 0, cfg)
 end
 
-function Block:range()
-	local pos =
-		vim.api.nvim_buf_get_extmark_by_id(self.buf, Names.blocks, self.mark, { details = true })
-	local sr = (pos and pos[1]) or 0
-	local details = pos and pos[3] or nil
-	local er = (details and details.end_row) or sr
-	return sr, er
-end
-
 function Block:text()
 	local s, e = self:range()
 	return vim.api.nvim_buf_get_lines(self.buf, s, e, false)
 end
 
-function Block:set_end_row_exclusive(e_excl)
+function Block:set_end_row(e_excl)
 	local s, _ = self:range()
 	local n = vim.api.nvim_buf_line_count(self.buf)
 	local e = math.min(e_excl, n)
@@ -112,6 +111,7 @@ end
 
 function Block:set_highlight(group)
 	local s, e = self:range()
+	local count = e - s
 	self._bg = self._bg or { group = nil, s = nil, e = nil, marks = {} }
 	local st = self._bg
 
@@ -119,35 +119,27 @@ function Block:set_highlight(group)
 		return
 	end
 
-	local is010 = (vim.fn.has("nvim-0.10") == 1)
-	if is010 then
-		local needed = e - s
-		local existing = #st.marks
-		for i = 1, needed do
-			local row = s + (i - 1)
-			local id = st.marks[i]
-			local opts = { line_hl_group = group, hl_mode = "combine", priority = 10 }
-			if id then
-				opts.id = id
-			end
-			st.marks[i] = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, opts)
-		end
-		for j = needed + 1, existing do
-			local id = st.marks[j]
-			if id then
-				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
-			end
-			st.marks[j] = nil
-		end
-	else
-		if st.s and st.e then
-			vim.api.nvim_buf_clear_namespace(self.buf, Names.block_cols, st.s, st.e + 1)
-		end
-		for row = s, e do
-			pcall(vim.api.nvim_buf_add_highlight, self.buf, Names.block_cols, group, row, 0, -1)
-		end
-		st.marks = {}
+	local have = #st.marks
+
+	for i = 1, count do
+		local row = s + (i - 1)
+		local id = st.marks[i]
+		st.marks[i] = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
+			id = id,
+			line_hl_group = group,
+			hl_mode = "combine",
+			priority = 10,
+		})
 	end
+
+	for j = have, count + 1, -1 do
+		local id = st.marks[j]
+		if id then
+			pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+		end
+		st.marks[j] = nil
+	end
+
 	st.group, st.s, st.e = group, s, e
 end
 
