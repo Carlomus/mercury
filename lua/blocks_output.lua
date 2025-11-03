@@ -5,11 +5,13 @@ local M = {}
 
 -- one-time temp-file tracker and exit cleanup
 local TMP_TRACKER = TMP_TRACKER or {}
+
 local function _track_tmp(path)
 	if path then
 		TMP_TRACKER[path] = true
 	end
 end
+
 local function _unlink_tmp(path)
 	if path then
 		pcall(os.remove, path)
@@ -335,7 +337,7 @@ function M.extend(Block)
 	function Block:set_running()
 		self.output = nil
 		self:_clear_images()
-		self._last_preview_virt = { { { "⏳ Running…", "Comment" } } }
+		self._last_preview_virt = { { { "Running…", "Comment" } } }
 		self:_ensure_tail_anchor()
 		local cfg = output_config(self._last_preview_virt)
 		cfg.id = self.tail_mark

@@ -39,9 +39,7 @@ function Block.new(buf, start_row, end_row, id, type_, header_text)
 	}, Block)
 
 	self:_ensure_tail_anchor()
-	if self.show_header_virtual then
-		self:show_header_virtual()
-	end
+	self:show_header_virtual()
 
 	return self
 end
@@ -92,9 +90,7 @@ end
 function Block:set_type(new_t)
 	self.type = new_t
 	self.header_text = (new_t == "markdown") and "# %% [markdown] " or "# %%"
-	if self.show_header_virtual then
-		self:show_header_virtual()
-	end
+	self:show_header_virtual()
 	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
 	self:set_highlight(group)
 end

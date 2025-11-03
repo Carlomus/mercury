@@ -5,7 +5,9 @@ local Util = require("mercury.lua.utils")
 local M = {}
 
 -- One state per buffer
--- [bufnr] -> { buf, registry={by_id={}}, _mark_to_id={}, order={head,tail,next={},prev={}} }
+-- [bufnr] -> {
+--      buf, registry={by_id={}}, _mark_to_id={}, order={head,tail,next={},prev={}}
+--      }
 local STATE = {}
 
 local function curbuf()
@@ -31,7 +33,6 @@ function M.registry_for(buf)
 	return ensure_state(buf).registry
 end
 
--- TODO Migrate this off registry
 setmetatable(M, {
 	__index = function(_, k)
 		if k == "registry" then
@@ -55,7 +56,6 @@ local function emit_blocks_changed(S)
 	end)
 end
 
--- ----- intrusive linked-list of block IDs (per buffer) -----------------------
 local function order_clear(S)
 	S.order.head, S.order.tail = nil, nil
 	S.order.next, S.order.prev = {}, {}

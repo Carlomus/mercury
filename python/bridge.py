@@ -11,8 +11,6 @@ from typing import Optional
 
 from jupyter_client import KernelManager
 
-# ---------------------------------------------------------------------
-# Thread-safe JSONL writer
 _write_lock = threading.Lock()
 
 
@@ -22,25 +20,21 @@ def jprint(obj):
         sys.stdout.flush()
 
 
-# ---------------------------------------------------------------------
-# Bridge
 class Bridge:
     def __init__(self):
-        self.km: Optional[KernelManager] = None
-        self.kc = None
+        self.kmanager: Optional[KernelManager] = None
+        self.kclient = None
         self.task_q: Queue = Queue()
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.current_cell_id: Optional[str] = None
 
-    # ---- lifecycle ----
     def start_kernel(self):
         """
         Start an ipykernel with the SAME interpreter as this bridge.
-        This avoids requiring a 'python3' kernelspec to exist.
         """
         try:
-            self.km = KernelManager(
+            self.kmanager = KernelManager(
                 kernel_cmd=[
                     sys.executable,
                     "-m",
@@ -49,12 +43,12 @@ class Bridge:
                     "{connection_file}",
                 ]
             )
-            self.km.start_kernel()
-            self.kc = self.km.client()
-            self.kc.start_channels()
-            self.kc.wait_for_ready(timeout=30)
+            self.kmanager.start_kernel()
+            self.kclient = self.kmanager.client()
+            self.kclient.start_channels()
+            self.kclient.wait_for_ready(timeout=30)
+
         except ModuleNotFoundError as e:
-            # Most common failure: ipykernel not installed in this interpreter.
             if getattr(e, "name", "") == "ipykernel":
                 jprint(
                     {
@@ -72,7 +66,6 @@ class Bridge:
             jprint({"type": "kernel_error", "error": f"{type(e).__name__}: {e}"})
             raise
 
-        # Spin up the worker once we have a live kernel
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
@@ -82,29 +75,27 @@ class Bridge:
         """
         try:
             try:
-                if self.kc:
-                    self.kc.stop_channels()
+                if self.kclient:
+                    self.kclient.stop_channels()
             except Exception:
                 pass
-            if self.km:
-                self.km.restart_kernel(now=True)
+            if self.kmanager:
+                self.kmanager.restart_kernel(now=True)
             else:
-                # If for some reason km is missing, start fresh
                 self.start_kernel()
                 jprint({"type": "restarted"})
                 return
 
-            self.kc = self.km.client()
-            self.kc.start_channels()
-            self.kc.wait_for_ready(timeout=30)
+            self.kclient = self.kmanager.client()
+            self.kclient.start_channels()
+            self.kclient.wait_for_ready(timeout=30)
             jprint({"type": "restarted"})
         except Exception as e:
             jprint({"type": "kernel_error", "error": f"{type(e).__name__}: {e}"})
 
     def is_alive(self) -> bool:
-        return bool(self.km and self.km.is_alive())
+        return bool(self.kmanager and self.kmanager.is_alive())
 
-    # ---- worker / execution ----
     def _worker_loop(self):
         while not self.stop_event.is_set():
             try:
@@ -133,7 +124,9 @@ class Bridge:
         started = time.time()
 
         try:
-            parent_id = self.kc.execute(code, stop_on_error=False, allow_stdin=False)
+            parent_id = self.kclient.execute(
+                code, stop_on_error=False, allow_stdin=False
+            )
         except Exception as e:
             jprint(
                 {
@@ -153,15 +146,13 @@ class Bridge:
             )
             return
 
-        # Try to pick up execution_count from the shell reply.
         exec_count = None
-        shell_deadline = time.time() + 30.0  # cap at 30s for the shell reply
-        while time.time() < shell_deadline:
+        while True:
             if not self.is_alive():
                 jprint({"type": "kernel_dead"})
                 return
             try:
-                rep = self.kc.get_shell_msg(timeout=0.1)
+                rep = self.kclient.get_shell_msg(timeout=0.1)
             except Empty:
                 continue
             except Exception:
@@ -178,14 +169,13 @@ class Bridge:
                 jprint({"type": "kernel_dead"})
                 return
             try:
-                msg = self.kc.get_iopub_msg(timeout=0.1)
+                msg = self.kclient.get_iopub_msg(timeout=0.1)
             except Empty:
                 continue
             except Exception:
                 continue
 
             if msg.get("parent_header", {}).get("msg_id") != parent_id:
-                # Not ours (could be display updates from earlier cells), skip.
                 continue
 
             mtype = msg["header"]["msg_type"]
@@ -199,7 +189,6 @@ class Bridge:
                 "clear_output",
                 "update_display_data",
             ):
-                # Normalize stream text if it's a list.
                 if mtype == "stream" and isinstance(content.get("text"), list):
                     content["text"] = "".join(content["text"])
                 item = {"type": mtype, **content}
@@ -225,14 +214,12 @@ class Bridge:
 
     def interrupt(self):
         try:
-            if self.km:
-                self.km.interrupt_kernel()
+            if self.kmanager:
+                self.kmanager.interrupt_kernel()
         finally:
-            # Let the UI know immediately; the execute_done will still arrive on idle.
             jprint({"type": "interrupted", "cell_id": self.current_cell_id})
 
     def close(self):
-        # Stop worker loop
         try:
             self.stop_event.set()
             self.task_q.put(None)
@@ -243,20 +230,18 @@ class Bridge:
 
         # Shutdown channels and kernel
         try:
-            if self.kc:
-                self.kc.stop_channels()
+            if self.kclient:
+                self.kclient.stop_channels()
         except Exception:
             pass
         try:
-            if self.km and self.km.is_alive():
-                self.km.shutdown_kernel(now=True)
+            if self.kmanager and self.kmanager.is_alive():
+                self.kmanager.shutdown_kernel(now=True)
         except Exception:
             pass
 
 
-# ---------------------------------------------------------------------
-# Main loop
-def main():
+if __name__ == "__main__":
     bridge = Bridge()
     try:
         bridge.start_kernel()
@@ -280,11 +265,6 @@ def main():
             elif typ == "restart":
                 bridge.restart_kernel()
             else:
-                # ignore unknown types
                 pass
     finally:
         bridge.close()
-
-
-if __name__ == "__main__":
-    main()

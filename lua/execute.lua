@@ -21,7 +21,7 @@ local state = {
 	json_buf = "",
 }
 
--- --- helpers to find a working Python ---------------------------------------
+-- helpers to find a working Python
 local function _exepath(bin)
 	local p = vim.fn.exepath(bin)
 	if p and p ~= "" then
@@ -35,11 +35,6 @@ local function _is_file(p)
 end
 
 local function resolve_python()
-	local gpy = vim.g.python3_host_prog
-	if _is_file(gpy) then
-		return gpy
-	end
-
 	-- venv / conda
 	local sep = package.config:sub(1, 1) -- '/' or '\'
 	local env = vim.env.VIRTUAL_ENV or vim.env.CONDA_PREFIX
@@ -50,7 +45,12 @@ local function resolve_python()
 		end
 	end
 
-	-- 4) PATH fallbacks
+	local gpy = vim.g.python3_host_prog
+	if _is_file(gpy) then
+		return gpy
+	end
+
+	-- PATH fallbacks
 	local p3 = _exepath("python3")
 	if p3 then
 		return p3
@@ -63,7 +63,7 @@ local function resolve_python()
 	return nil
 end
 
--- --- locate bridge and build argv ------------------------------------------
+-- locate bridge and build argv
 local function default_bridge_cmd()
 	local src = debug.getinfo(1, "S").source
 	local this = (src:sub(1, 1) == "@") and src:sub(2) or src
@@ -86,10 +86,7 @@ local function default_bridge_cmd()
 	end
 
 	if not bridge then
-		vim.notify(
-			"mercury: bridge.py not found. Set execute.setup{ bridge_cmd = { '/path/to/python', '-u', '/abs/bridge.py' } }",
-			vim.log.levels.ERROR
-		)
+		vim.notify("mercury: bridge.py not found.", vim.log.levels.ERROR)
 		return nil
 	end
 
@@ -97,7 +94,7 @@ local function default_bridge_cmd()
 	if not py then
 		vim.notify(
 			"mercury: no Python interpreter found (tried venv/conda/python3/python). "
-				.. "Either set vim.g.mercury_python = '/path/to/python' or pass execute.setup{ bridge_cmd = {...} }.",
+				.. "Either set vim.g.mercury_python = '/path/to/python'",
 			vim.log.levels.ERROR
 		)
 		return nil
@@ -105,15 +102,6 @@ local function default_bridge_cmd()
 
 	bridge = vim.fn.fnamemodify(bridge, ":p")
 
-	-- If resolve_python() returned a launcher argv (e.g. {'py','-3'}), append flags
-	if type(py) == "table" then
-		local cmd = vim.deepcopy(py)
-		table.insert(cmd, "-u")
-		table.insert(cmd, bridge)
-		return cmd
-	end
-
-	-- Normal case: absolute python path
 	return { py, "-u", bridge }
 end
 
@@ -151,6 +139,7 @@ end
 local function apply_item(b, item)
 	ensure_block_output(b)
 	local t = item.type
+
 	if t == "clear_output" then
 		b.output.items = {}
 		return
@@ -163,7 +152,6 @@ local function apply_item(b, item)
 	if t == "update_display_data" and display_id then
 		for idx, it in ipairs(b.output.items) do
 			if it._display_id == display_id then
-				-- replace data/metadata of the existing entry
 				b.output.items[idx].data = item.data or b.output.items[idx].data
 				b.output.items[idx].metadata = item.metadata or b.output.items[idx].metadata
 				return
@@ -209,7 +197,6 @@ local function on_bridge_msg(msg)
 	local typ = msg.type
 
 	if typ == "execute_start" then
-		-- nothing special (we already set b:set_running() on send)
 		return
 	elseif typ == "output" then
 		local bid = msg.cell_id
@@ -218,7 +205,6 @@ local function on_bridge_msg(msg)
 			return
 		end
 		apply_item(b, msg.item or {})
-		-- re-render incrementally
 		b:insert_output(b.output)
 		return
 	elseif typ == "execute_done" then
@@ -313,7 +299,7 @@ local function ensure_bridge()
 	local job = vim.fn.jobstart(cmd, {
 		cwd = cwd,
 		stdout_buffered = false,
-		stderr_buffered = false, -- flush errors immediately (fix)
+		stderr_buffered = false,
 		on_stdout = function(_, d, _)
 			if d then
 				handle_stdout_chunk(d)
@@ -368,7 +354,6 @@ end
 function E.exec_current()
 	local b = Mgr.block_at_cursor()
 	if not b then
-		vim.notify("No block under cursor", vim.log.levels.INFO)
 		return
 	end
 	send_block(b)
@@ -428,7 +413,6 @@ function E.restart()
 	if not ensure_bridge() then
 		return
 	end
-	-- locally mark & clear immediately for deterministic UX
 	mark_head_killed()
 	clear_queues()
 	vim.fn.chansend(state.chan_id, vim.json.encode({ type = "restart" }) .. "\n")
