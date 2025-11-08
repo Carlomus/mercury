@@ -110,6 +110,30 @@ local function order_as_list(S)
 	return out
 end
 
+-- --- Header sanitation: keep headers virtual-only ----------------------------
+local function _strip_literal_headers(buf)
+	-- Delete any real '# %%' lines; they are rendered virtually already.
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local dels = {}
+	for i, line in ipairs(lines) do
+		if Util.is_py_cell_start(line) then
+			dels[#dels + 1] = i - 1 -- 0-based
+		end
+	end
+	-- delete from bottom to top to keep indices correct
+	for idx = #dels, 1, -1 do
+		local row0 = dels[idx]
+		pcall(vim.api.nvim_buf_set_lines, buf, row0, row0 + 1, false, {})
+	end
+end
+
+-- Public: sanitize buffer and reflow extmarks if needed
+function M.sanitize_headers(buf)
+	buf = buf or M.buf
+	_strip_literal_headers(buf)
+	M.reflow_all(buf)
+end
+
 -- ----- registry ops ----------------------------------------------------------
 local function register_block(S, b, insert_after_id)
 	S.registry.by_id[b.id] = b
@@ -131,6 +155,27 @@ end
 local function next_block_of(S, b)
 	local nid = S.order.next[b.id]
 	return nid and S.registry.by_id[nid] or nil
+end
+
+-- Turn current block structure into py:percent lines for Jupytext encode
+function M.materialize_pypercent(buf)
+	buf = buf or M.buf
+	local out = {}
+	for _, id in ipairs(M.order_list(buf)) do
+		local b = M.registry.by_id[id]
+		local s, e = b:range()
+		local header = (b.type == "markdown") and "# %% [markdown]" or "# %%"
+		table.insert(out, header)
+		local body = vim.api.nvim_buf_get_lines(buf, s, e, false)
+		for i = 1, #body do
+			out[#out + 1] = body[i]
+		end
+		-- ensure a blank line between cells in the serialized form (nice to have)
+		if #out > 0 and out[#out] ~= "" then
+			out[#out + 1] = ""
+		end
+	end
+	return out
 end
 
 -- ----- low-level buffer queries ----------------------------------------------

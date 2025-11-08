@@ -76,6 +76,13 @@ function M.setup(opts)
 			end
 		end,
 	})
+
+	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
+		callback = function(args)
+			Mgr.sanitize_headers(args.buf)
+		end,
+	})
 end
 
 -- TS predicate
