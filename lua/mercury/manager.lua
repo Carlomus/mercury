@@ -171,7 +171,7 @@ local function compute_headers(buf)
 		local line = lines[i]
 		if Util.is_py_cell_start(line) then
 			headers[#headers + 1] = {
-				header_row = i,
+				header_row = i - 1,
 				type = Util.parse_header(line),
 				header_text = line,
 			}
@@ -181,7 +181,7 @@ local function compute_headers(buf)
 end
 
 local function pairs_from_headers(buf, headers)
-	local pairs_, n = {}, vim.api.nvim_buf_line_count(buf)
+	local pairs_, n = {}, vim.api.nvim_buf_line_count(buf) - 1
 	for i, h in ipairs(headers) do
 		local content_start = h.header_row + 1
 		local e = (i < #headers) and (headers[i + 1].header_row - 1) or n
