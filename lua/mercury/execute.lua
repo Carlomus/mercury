@@ -360,7 +360,7 @@ function E.exec_current()
 end
 
 function E.exec_all()
-	for _, id in ipairs(Mgr.registry.order) do
+	for _, id in ipairs(Mgr.order_list()) do
 		local b = Mgr.registry.by_id[id]
 		send_block(b)
 	end
@@ -374,7 +374,7 @@ function E.exec_and_next()
 	send_block(b)
 	local s, _ = b:range()
 	local next_b = nil
-	for _, id in ipairs(Mgr.registry.order) do
+	for _, id in ipairs(Mgr.order_list()) do
 		local bb = Mgr.registry.by_id[id]
 		local bs, _ = bb:range()
 		if bs > s then
@@ -420,7 +420,7 @@ end
 
 function E.restart_and_clear()
 	E.restart()
-	for _, id in ipairs(Mgr.registry.order) do
+	for _, id in ipairs(Mgr.order_list()) do
 		local b = Mgr.registry.by_id[id]
 		if b then
 			b:clear_output()
@@ -447,7 +447,7 @@ function E.interrupt()
 end
 
 function E.clear_output()
-	for _, id in ipairs(Mgr.registry.order) do
+	for _, id in ipairs(Mgr.order_list()) do
 		local b = Mgr.registry.by_id[id]
 		if b then
 			b:clear_output()
