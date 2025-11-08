@@ -1,3 +1,5 @@
+local Mgr = require("mercury.manager")
+
 local BG = {}
 local OPTS = {
 	python_hl = "NotebookPythonBlock",
@@ -15,13 +17,13 @@ local function ensure_default_hls()
 	ensure(OPTS.markdown_hl, "#3a2b3a")
 end
 
-function BG.highlight(buf, registry)
+function BG.highlight(buf)
 	buf = buf or 0
-	for _, id in ipairs(registry.order or {}) do
-		local block = registry.by_id[id]
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local block = Mgr.registry.by_id[id]
 		if block then
-			local block_type = block.type or block.t or "python"
-			local group = (block_type == "markdown") and OPTS.markdown_hl or OPTS.python_hl
+			local t = block.type or "python"
+			local group = (t == "markdown") and OPTS.markdown_hl or OPTS.python_hl
 			if block.set_highlight then
 				block:set_highlight(group)
 			end
@@ -29,8 +31,7 @@ function BG.highlight(buf, registry)
 	end
 end
 
-function BG.setup(opts)
-	local _ = opts
+function BG.setup(_)
 	ensure_default_hls()
 	vim.api.nvim_create_autocmd("ColorScheme", { callback = ensure_default_hls })
 end

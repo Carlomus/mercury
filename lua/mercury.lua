@@ -17,7 +17,7 @@ function M.setup(opts)
 			if vim.bo[args.buf].filetype ~= "python" then
 				return
 			end
-			Bg.highlight(args.buf, Mgr.registry)
+			Bg.highlight(args.buf)
 		end,
 	})
 
