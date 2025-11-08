@@ -85,6 +85,15 @@ function M.setup_autocmds(spec)
 			end
 			vim.api.nvim_buf_set_name(buf, path)
 			vim.bo[buf].modified = false
+
+			vim.schedule(function()
+				if vim.api.nvim_buf_is_valid(buf) then
+					-- this should remove any real '# %%' / '# %% [markdown]' lines
+					-- and keep only the virtual (ghost) header via extmarks
+					pcall(Mgr.sanitize_headers, buf)
+					pcall(Mgr.reflow_all, buf)
+				end
+			end)
 		end,
 	})
 
