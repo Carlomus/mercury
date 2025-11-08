@@ -1,4 +1,4 @@
-local Mgr = require("mercury.lua.manager")
+local Mgr = require("mercury.manager")
 
 local E = {}
 local state = {

@@ -1,7 +1,7 @@
-local Mgr = require("mercury.lua.manager")
-local Bg = require("mercury.lua.background")
-local Auto = require("mercury.lua.autocommands")
-local Run = require("mercury.lua.execute")
+local Mgr = require("mercury.manager")
+local Bg = require("mercury.background")
+local Auto = require("mercury.autocommands")
+local Run = require("mercury.execute")
 
 local M = {}
 
@@ -21,6 +21,7 @@ function M.setup(opts)
 		end,
 	})
 
+	vim.notify("Starting")
 	local lenses = { Auto.jupytext_lens() }
 	for _, s in ipairs(lenses) do
 		Auto.setup_autocmds(s)

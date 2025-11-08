@@ -1,6 +1,6 @@
-local Names = require("mercury.lua.names")
-local Block = require("mercury.lua.blocks")
-local Util = require("mercury.lua.utils")
+local Names = require("mercury.names")
+local Block = require("mercury.blocks")
+local Util = require("mercury.utils")
 
 local M = {}
 

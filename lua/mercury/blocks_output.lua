@@ -1,5 +1,5 @@
-local Names = require("mercury.lua.names")
-local U = require("mercury.lua.utils")
+local Names = require("mercury.names")
+local U = require("mercury.utils")
 
 local M = {}
 

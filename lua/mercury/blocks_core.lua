@@ -1,4 +1,4 @@
-local Names = require("mercury.lua.names")
+local Names = require("mercury.names")
 
 local marks_config = function(end_row)
 	return {
