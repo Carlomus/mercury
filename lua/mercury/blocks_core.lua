@@ -19,6 +19,7 @@ local header_config = function(header_text)
 end
 
 local Block = {}
+Block.__index = Block
 
 function Block.new(buf, start_row, end_row, id, type_, header_text)
 	if end_row < start_row then

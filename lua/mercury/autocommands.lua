@@ -22,7 +22,6 @@ local function run_cmd(cmd, input)
 end
 
 function M.jupytext_lens()
-	vim.notify("Starting lense")
 	return {
 		pattern = { "*.ipynb" },
 		decode = function(path, buf)

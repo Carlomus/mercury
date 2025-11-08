@@ -21,7 +21,6 @@ function M.setup(opts)
 		end,
 	})
 
-	vim.notify("Starting")
 	local lenses = { Auto.jupytext_lens() }
 	for _, s in ipairs(lenses) do
 		Auto.setup_autocmds(s)
