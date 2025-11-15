@@ -1,5 +1,5 @@
 local Mgr = require("mercury.manager")
-local Krn = require("mercury.kernels")
+local Kern = require("mercury.kernels")
 
 local E = {}
 
@@ -240,7 +240,7 @@ local function ensure_bridge(bufnr)
 		return true
 	end
 
-	local cmd = Krn.default_bridge_cmd()
+	local cmd = Kern.default_bridge_cmd()
 	if not cmd then
 		return false
 	end

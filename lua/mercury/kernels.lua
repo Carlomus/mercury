@@ -247,3 +247,5 @@ function M.default_bridge_cmd()
 	bridge = vim.fn.fnamemodify(bridge, ":p")
 	return { py, "-u", bridge }
 end
+
+return M
