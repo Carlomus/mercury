@@ -2,7 +2,7 @@ local Mgr = require("mercury.manager")
 local Bg = require("mercury.background")
 local Auto = require("mercury.autocommands")
 local Run = require("mercury.execute")
-
+local Kern = require("mercury.kernels")
 local M = {}
 
 function M.setup(opts)
@@ -82,6 +82,39 @@ function M.setup(opts)
 		callback = function(args)
 			Mgr.sanitize_headers(args.buf)
 		end,
+	})
+
+	vim.api.nvim_create_user_command("NotebookKernelSelect", function()
+		Kern.select_kernel_for_buf()
+	end, {
+		desc = "Select Python kernel for the current Mercury notebook buffer",
+	})
+
+	vim.api.nvim_create_user_command("NotebookKernelClear", function()
+		Kern.clear_kernel_for_buf()
+		vim.notify(
+			"mercury: cleared kernel selection for current buffer (will prompt on next exec)",
+			vim.log.levels.INFO
+		)
+	end, {
+		desc = "Clear kernel selection for the current Mercury notebook buffer",
+	})
+
+	vim.api.nvim_create_user_command("NotebookKernelInfo", function()
+		local info = Kern.kernel_info_for_buf()
+		if info then
+			vim.notify(
+				string.format("mercury: current buffer uses %s", info.label or info.python),
+				vim.log.levels.INFO
+			)
+		else
+			vim.notify(
+				"mercury: no kernel selected yet for this buffer (execution will prompt).",
+				vim.log.levels.INFO
+			)
+		end
+	end, {
+		desc = "Show Python kernel used by current Mercury notebook buffer",
 	})
 end
 

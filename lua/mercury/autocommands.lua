@@ -13,7 +13,6 @@ local function run_cmd(cmd, input)
 		local ok = (result.code == 0)
 		return ok, result.stdout or "", result.stderr or ""
 	else
-		-- Fallback: best-effort shell join (older Neovim). Kept as-is for compatibility.
 		local joined = table.concat(cmd, " ")
 		local out = vim.fn.system(joined, input)
 		local ok = (vim.v.shell_error == 0)

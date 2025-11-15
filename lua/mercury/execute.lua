@@ -1,127 +1,66 @@
 local Mgr = require("mercury.manager")
+local Krn = require("mercury.kernels")
 
 local E = {}
-local state = {
-	job_id = nil,
-	chan_id = nil,
 
-	conf = {
-		output = {
-			style = "float",
-			split = { pos = "botright", size = 12 },
-			float = { width = 0.5, height = 0.45, border = "rounded" },
-		},
-		show_virtual_preview = true,
-		virtual_preview_lines = 12,
-	},
-
-	-- queue & streaming state
-	capture = {}, -- { { block_id = ... } }   -- head is the active cell
-	pending = {}, -- { { block_id = ..., payload = ... } }
-	json_buf = "",
+local CONF = {
+	show_virtual_preview = true,
+	virtual_preview_lines = 12,
 }
 
--- helpers to find a working Python
-local function _exepath(bin)
-	local p = vim.fn.exepath(bin)
-	if p and p ~= "" then
-		return p
-	end
-	return nil
+-- Per-buffer state:
+-- STATE[bufnr] = {
+--   buf = bufnr,
+--   job_id = nil,
+--   chan_id = nil,
+--   capture = {},
+--   pending = {},
+--   json_buf = "",
+-- }
+local STATE = {}
+
+-- Map job_id → bufnr so callbacks can find the right buffer
+local JOB_TO_BUF = {}
+
+local function curbuf()
+	return vim.api.nvim_get_current_buf()
 end
 
-local function _is_file(p)
-	return p and p ~= "" and (vim.fn.filereadable(p) == 1 or vim.fn.executable(p) == 1)
-end
-
-local function resolve_python()
-	-- venv / conda
-	local sep = package.config:sub(1, 1) -- '/' or '\'
-	local env = vim.env.VIRTUAL_ENV or vim.env.CONDA_PREFIX
-	if env and env ~= "" then
-		local cand = env .. (sep == "\\" and "\\Scripts\\python.exe" or "/bin/python")
-		if _is_file(cand) then
-			return cand
-		end
-	end
-
-	local gpy = vim.g.python3_host_prog
-	if _is_file(gpy) then
-		return gpy
-	end
-
-	-- PATH fallbacks
-	local p3 = _exepath("python3")
-	if p3 then
-		return p3
-	end
-	local p = _exepath("python")
-	if p then
-		return p
-	end
-
-	return nil
-end
-
--- locate bridge and build argv
-local function default_bridge_cmd()
-	local src = debug.getinfo(1, "S").source
-	local this = (src:sub(1, 1) == "@") and src:sub(2) or src
-	local this_dir = vim.fn.fnamemodify(this, ":p:h")
-
-	local hits = vim.api.nvim_get_runtime_file("mercury/python/bridge.py", false)
-	local bridge = hits and hits[1]
-	if not bridge then
-		local candidates = {
-			this_dir .. "/../../python/bridge.py",
-			this_dir .. "/../python/bridge.py",
-			this_dir .. "/../../../python/bridge.py",
+local function get_buf_state(bufnr)
+	local buf = bufnr or curbuf()
+	local S = STATE[buf]
+	if not S then
+		S = {
+			buf = buf,
+			job_id = nil,
+			chan_id = nil,
+			capture = {},
+			pending = {},
+			json_buf = "",
 		}
-		for _, pth in ipairs(candidates) do
-			if vim.loop.fs_stat(pth) then
-				bridge = pth
-				break
-			end
-		end
+		STATE[buf] = S
 	end
-
-	if not bridge then
-		vim.notify("mercury: bridge.py not found.", vim.log.levels.ERROR)
-		return nil
-	end
-
-	local py = resolve_python()
-	if not py then
-		vim.notify(
-			"mercury: no Python interpreter found (tried venv/conda/python3/python). "
-				.. "Either set vim.g.mercury_python = '/path/to/python'",
-			vim.log.levels.ERROR
-		)
-		return nil
-	end
-
-	bridge = vim.fn.fnamemodify(bridge, ":p")
-
-	return { py, "-u", bridge }
+	return S
 end
 
-local function head_capture()
-	return state.capture[1]
+local function head_capture(S)
+	return S.capture[1]
 end
 
-local function mark_head_killed()
-	local head = head_capture()
+local function mark_head_killed(S)
+	local head = head_capture(S)
 	if head then
-		local b = Mgr.registry.by_id[head.block_id]
+		local reg = Mgr.registry_for(S.buf)
+		local b = reg.by_id[head.block_id]
 		if b and b.set_killed then
 			b:set_killed()
 		end
 	end
 end
 
-local function clear_queues()
-	state.capture = {}
-	state.pending = {}
+local function clear_queues(S)
+	S.capture = {}
+	S.pending = {}
 end
 
 local function ensure_block_output(b)
@@ -130,7 +69,7 @@ local function ensure_block_output(b)
 			exec_count = 0,
 			ms = 0,
 			items = {},
-			max_preview_lines = state.conf.virtual_preview_lines,
+			max_preview_lines = CONF.virtual_preview_lines,
 		}
 	end
 end
@@ -192,15 +131,16 @@ local function apply_item(b, item)
 	table.insert(b.output.items, item)
 end
 
--- bridge lifecycle
-local function on_bridge_msg(msg)
+local function on_bridge_msg(bufnr, msg)
+	local S = get_buf_state(bufnr)
+	local reg = Mgr.registry_for(bufnr)
 	local typ = msg.type
 
 	if typ == "execute_start" then
 		return
 	elseif typ == "output" then
 		local bid = msg.cell_id
-		local b = bid and Mgr.registry.by_id[bid]
+		local b = bid and reg.by_id[bid]
 		if not b then
 			return
 		end
@@ -209,9 +149,9 @@ local function on_bridge_msg(msg)
 		return
 	elseif typ == "execute_done" then
 		local bid = msg.cell_id
-		local b = bid and Mgr.registry.by_id[bid]
+		local b = bid and reg.by_id[bid]
 		-- pop head capture
-		table.remove(state.capture, 1)
+		table.remove(S.capture, 1)
 
 		if b then
 			ensure_block_output(b)
@@ -224,62 +164,67 @@ local function on_bridge_msg(msg)
 				end
 			end
 			b:insert_output(b.output)
-		elseif typ == "interrupted" then
-			-- mark head, but DO NOT pop here.
-			local head = state.capture[1]
-			if head and msg.cell_id == head.block_id then
-				mark_head_killed()
-			end
-			return
 		end
 
 		-- start next pending
-		if #state.capture == 0 and #state.pending > 0 then
-			local p = table.remove(state.pending, 1)
-			table.insert(state.capture, { block_id = p.block_id })
-			vim.fn.chansend(state.chan_id, vim.json.encode(p.payload) .. "\n")
+		if #S.capture == 0 and #S.pending > 0 then
+			local p = table.remove(S.pending, 1)
+			table.insert(S.capture, { block_id = p.block_id })
+			vim.fn.chansend(S.chan_id, vim.json.encode(p.payload) .. "\n")
 		end
 		return
 	elseif typ == "interrupted" then
-		mark_head_killed()
-		-- allow next pending to run (drop head)
-		table.remove(state.capture, 1)
-		if #state.capture == 0 and #state.pending > 0 then
-			local p = table.remove(state.pending, 1)
-			table.insert(state.capture, { block_id = p.block_id })
-			vim.fn.chansend(state.chan_id, vim.json.encode(p.payload) .. "\n")
+		-- mark head, but DO NOT pop here – then allow next pending
+		local head = S.capture[1]
+		if head and msg.cell_id == head.block_id then
+			local b = reg.by_id[head.block_id]
+			if b and b.set_killed then
+				b:set_killed()
+			end
+		end
+		table.remove(S.capture, 1)
+		if #S.capture == 0 and #S.pending > 0 then
+			local p = table.remove(S.pending, 1)
+			table.insert(S.capture, { block_id = p.block_id })
+			vim.fn.chansend(S.chan_id, vim.json.encode(p.payload) .. "\n")
 		end
 		return
 	elseif typ == "restarted" then
 		-- clean queues; mark killed for good UX
-		mark_head_killed()
-		clear_queues()
+		mark_head_killed(S)
+		clear_queues(S)
 		return
 	elseif typ == "kernel_dead" or typ == "kernel_error" then
-		mark_head_killed()
-		clear_queues()
+		mark_head_killed(S)
+		clear_queues(S)
 		vim.notify("Jupyter kernel died: " .. (msg.error or typ), vim.log.levels.ERROR)
+		-- mark bridge as gone; ensure_bridge will recreate
+		if S.job_id then
+			JOB_TO_BUF[S.job_id] = nil
+		end
+		S.job_id, S.chan_id = nil, nil
 		return
 	end
 end
 
-local function handle_stdout_chunk(lines)
+local function handle_stdout_chunk(bufnr, lines)
+	local S = get_buf_state(bufnr)
 	for _, line in ipairs(lines or {}) do
 		if line == "" then
 			goto continue
 		end
-		state.json_buf = state.json_buf .. line .. "\n"
+		S.json_buf = S.json_buf .. line .. "\n"
 		while true do
-			local nl = state.json_buf:find("\n", 1, true)
+			local nl = S.json_buf:find("\n", 1, true)
 			if not nl then
 				break
 			end
-			local one = state.json_buf:sub(1, nl - 1)
-			state.json_buf = state.json_buf:sub(nl + 1)
+			local one = S.json_buf:sub(1, nl - 1)
+			S.json_buf = S.json_buf:sub(nl + 1)
 			if one ~= "" then
 				local ok, msg = pcall(vim.json.decode, one)
 				if ok and msg then
-					on_bridge_msg(msg)
+					on_bridge_msg(bufnr, msg)
 				else
 					vim.notify("Bridge decode failed: " .. one, vim.log.levels.WARN)
 				end
@@ -289,27 +234,41 @@ local function handle_stdout_chunk(lines)
 	end
 end
 
-local function ensure_bridge()
-	if state.job_id and vim.fn.jobwait({ state.job_id }, 0)[1] == -1 then
+local function ensure_bridge(bufnr)
+	local S = get_buf_state(bufnr)
+	if S.job_id and vim.fn.jobwait({ S.job_id }, 0)[1] == -1 then
 		return true
 	end
-	local cmd = default_bridge_cmd()
-	local cwd = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(Mgr.buf or 0), ":p:h")
+
+	local cmd = Krn.default_bridge_cmd()
+	if not cmd then
+		return false
+	end
+
+	local cwd = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(S.buf or 0), ":p:h")
+	if cwd == "" then
+		cwd = nil
+	end
 
 	local job = vim.fn.jobstart(cmd, {
 		cwd = cwd,
 		stdout_buffered = false,
 		stderr_buffered = false,
-		on_stdout = function(_, d, _)
+		on_stdout = function(job_id, d, _)
 			if d then
-				handle_stdout_chunk(d)
+				local buf = JOB_TO_BUF[job_id]
+				if buf then
+					handle_stdout_chunk(buf, d)
+				end
 			end
 		end,
-		on_stderr = function(_, d, _)
+		on_stderr = function(job_id, d, _)
 			if d then
 				for _, ln in ipairs(d) do
 					if ln ~= "" then
-						vim.notify(ln, vim.log.levels.WARN)
+						local buf = JOB_TO_BUF[job_id]
+						local prefix = buf and ("[buf " .. buf .. "] ") or ""
+						vim.notify(prefix .. ln, vim.log.levels.WARN)
 					end
 				end
 			end
@@ -320,18 +279,22 @@ local function ensure_bridge()
 		vim.notify("Failed to start Jupyter kernel bridge", vim.log.levels.ERROR)
 		return false
 	end
-	state.job_id, state.chan_id = job, job
-	state.json_buf = ""
+
+	S.job_id, S.chan_id = job, job
+	S.json_buf = ""
+	JOB_TO_BUF[job] = S.buf
 	return true
 end
-
--- ---------- sending ----------
 
 local function send_block(b)
 	if not b or b.type ~= "python" then
 		return
 	end
-	if not ensure_bridge() then
+
+	local buf = b.buf
+	local S = get_buf_state(buf)
+
+	if not ensure_bridge(buf) then
 		return
 	end
 
@@ -340,16 +303,14 @@ local function send_block(b)
 	local code = table.concat(b:text(), "\n")
 	local payload = { type = "execute", cell_id = b.id, code = code }
 
-	if #state.capture > 0 then
-		table.insert(state.pending, { block_id = b.id, payload = payload })
+	if #S.capture > 0 then
+		table.insert(S.pending, { block_id = b.id, payload = payload })
 		return
 	end
 
-	table.insert(state.capture, { block_id = b.id })
-	vim.fn.chansend(state.chan_id, vim.json.encode(payload) .. "\n")
+	table.insert(S.capture, { block_id = b.id })
+	vim.fn.chansend(S.chan_id, vim.json.encode(payload) .. "\n")
 end
-
--- ---------- public API ----------
 
 function E.exec_current()
 	local b = Mgr.block_at_cursor()
@@ -360,8 +321,10 @@ function E.exec_current()
 end
 
 function E.exec_all()
-	for _, id in ipairs(Mgr.order_list()) do
-		local b = Mgr.registry.by_id[id]
+	local buf = curbuf()
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local reg = Mgr.registry_for(buf)
+		local b = reg.by_id[id]
 		send_block(b)
 	end
 end
@@ -374,8 +337,10 @@ function E.exec_and_next()
 	send_block(b)
 	local s, _ = b:range()
 	local next_b = nil
-	for _, id in ipairs(Mgr.order_list()) do
-		local bb = Mgr.registry.by_id[id]
+	local buf = b.buf
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local reg = Mgr.registry_for(buf)
+		local bb = reg.by_id[id]
 		local bs, _ = bb:range()
 		if bs > s then
 			next_b = bb
@@ -410,18 +375,22 @@ function E.toggle_showing_full_output()
 end
 
 function E.restart()
-	if not ensure_bridge() then
+	local buf = curbuf()
+	local S = get_buf_state(buf)
+	if not ensure_bridge(buf) then
 		return
 	end
-	mark_head_killed()
-	clear_queues()
-	vim.fn.chansend(state.chan_id, vim.json.encode({ type = "restart" }) .. "\n")
+	mark_head_killed(S)
+	clear_queues(S)
+	vim.fn.chansend(S.chan_id, vim.json.encode({ type = "restart" }) .. "\n")
 end
 
 function E.restart_and_clear()
 	E.restart()
-	for _, id in ipairs(Mgr.order_list()) do
-		local b = Mgr.registry.by_id[id]
+	local buf = curbuf()
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local reg = Mgr.registry_for(buf)
+		local b = reg.by_id[id]
 		if b then
 			b:clear_output()
 		end
@@ -429,26 +398,33 @@ function E.restart_and_clear()
 end
 
 function E.stop()
-	mark_head_killed()
-	clear_queues()
-	if state.job_id then
-		pcall(vim.fn.chanclose, state.chan_id)
-		pcall(vim.fn.jobstop, state.job_id)
+	local buf = curbuf()
+	local S = get_buf_state(buf)
+	mark_head_killed(S)
+	clear_queues(S)
+	if S.job_id then
+		pcall(vim.fn.chanclose, S.chan_id)
+		pcall(vim.fn.jobstop, S.job_id)
+		JOB_TO_BUF[S.job_id] = nil
 	end
-	state.job_id, state.chan_id = nil, nil
-	state.json_buf = ""
+	S.job_id, S.chan_id = nil, nil
+	S.json_buf = ""
 end
 
 function E.interrupt()
-	if not state.job_id then
+	local buf = curbuf()
+	local S = get_buf_state(buf)
+	if not S.job_id then
 		return
 	end
-	vim.fn.chansend(state.chan_id, vim.json.encode({ type = "interrupt" }) .. "\n")
+	vim.fn.chansend(S.chan_id, vim.json.encode({ type = "interrupt" }) .. "\n")
 end
 
 function E.clear_output()
-	for _, id in ipairs(Mgr.order_list()) do
-		local b = Mgr.registry.by_id[id]
+	local buf = curbuf()
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local reg = Mgr.registry_for(buf)
+		local b = reg.by_id[id]
 		if b then
 			b:clear_output()
 		end
@@ -456,7 +432,7 @@ function E.clear_output()
 end
 
 function E.setup(opts)
-	state.conf = vim.tbl_deep_extend("force", state.conf, opts or {})
+	CONF = vim.tbl_deep_extend("force", CONF, opts or {})
 end
 
 return E
