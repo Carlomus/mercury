@@ -170,7 +170,7 @@ function M.extend(Block)
 		if not ok or not api or (api.is_enabled and not api.is_enabled()) then
 			return
 		end
-		if not self.output or not self.output.items then
+		if not self.output or not self.output.image_slots or #self.output.image_slots == 0 then
 			return
 		end
 
@@ -199,21 +199,16 @@ function M.extend(Block)
 			end
 		end
 
-		local nvirt = 0
-		if self._last_preview_virt and #self._last_preview_virt > 0 then
-			nvirt = #self._last_preview_virt
-		elseif self.output.virt_lines and #self.output.virt_lines > 0 then
-			nvirt = #self.output.virt_lines
-		end
+		for _, slot in ipairs(self.output.image_slots or {}) do
+			local it = slot.item
+			local virt_index = slot.virt_index or 1 -- 1-based index into virt_lines (header=1)
 
-		local y = base_row + nvirt
-
-		for _, it in ipairs(self.output.items) do
-			if (it.type == "display_data" or it.type == "execute_result") and it.data then
+			if it and it.data then
 				local has_img = it.data["image/png"] or it.data["image/svg+xml"]
 				if has_img then
 					local path = write_image_tmp_from_data(it.data)
 					if path then
+						local y = base_row + (virt_index - 1)
 						local img = Image.from_file(path, {
 							window = win,
 							buffer = self.buf,
@@ -227,7 +222,6 @@ function M.extend(Block)
 							img:render()
 							table.insert(self._images, img)
 							table.insert(self._image_paths, path)
-							y = y + 1
 						else
 							_unlink_tmp(path)
 						end
@@ -240,29 +234,57 @@ function M.extend(Block)
 	function Block:generate_output(output)
 		local items = output.items or {}
 		local body = {}
+		local image_slots = {}
+
+		local row_cursor = 1 -- header = row 1
 
 		for _, it in ipairs(items) do
 			local t = it.type
 			if t == "clear_output" then
 				body = {}
+				image_slots = {}
+				row_cursor = 1
 			elseif t == "stream" then
-				for _, ln in ipairs(stream_lines(it)) do
+				local lines = stream_lines(it)
+				for _, ln in ipairs(lines) do
 					body[#body + 1] = ln
+					row_cursor = row_cursor + 1
 				end
 			elseif t == "error" then
-				body[#body + 1] = ("Error: %s: %s"):format(it.ename or "", it.evalue or "")
+				local head = ("Error: %s: %s"):format(it.ename or "", it.evalue or "")
+				body[#body + 1] = head
+				row_cursor = row_cursor + 1
 				for _, ln in ipairs(it.traceback or {}) do
 					local cleaned = U.clean_line(ln)
 					for _, part in ipairs(U.split_lines(cleaned)) do
 						body[#body + 1] = part
+						row_cursor = row_cursor + 1
 					end
 				end
 			elseif t == "display_data" or t == "execute_result" then
-				for _, ln in ipairs(mime_text_lines(it.data)) do
+				local text_lines = mime_text_lines(it.data)
+				for _, ln in ipairs(text_lines) do
 					body[#body + 1] = ln
+					row_cursor = row_cursor + 1
+				end
+
+				local has_img = it.data and (it.data["image/png"] or it.data["image/svg+xml"])
+				if has_img then
+					-- Insert an empty logical line as the slot for this image
+					local slot_idx_in_body = #body + 1
+					body[slot_idx_in_body] = ""
+					row_cursor = row_cursor + 1
+
+					-- virt_index is header(1) + this body index
+					local virt_index = 1 + slot_idx_in_body
+					table.insert(image_slots, {
+						item = it,
+						virt_index = virt_index,
+					})
 				end
 			else
 				body[#body + 1] = ("[%s output unsupported]"):format(t or "unknown")
+				row_cursor = row_cursor + 1
 			end
 		end
 
@@ -275,6 +297,7 @@ function M.extend(Block)
 
 		self.output = output
 		self.output.virt_lines = virt
+		self.output.image_slots = image_slots
 	end
 
 	function Block:attach_output()

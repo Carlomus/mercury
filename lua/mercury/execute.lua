@@ -90,6 +90,51 @@ local function block_output_lines(b)
 	return out
 end
 
+local function block_at_or_next_or_new()
+	local buf = curbuf()
+
+	local b = Mgr.block_at_cursor(buf)
+	if b then
+		return b
+	end
+
+	local cur_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+	local reg = Mgr.registry_for(buf)
+
+	local next_b = nil
+	local next_s = nil
+	local last_b = nil
+
+	for _, id in ipairs(Mgr.order_list(buf)) do
+		local bb = reg.by_id[id]
+		if bb then
+			local s, _ = bb:range()
+			last_b = bb
+			if s > cur_row and (not next_s or s < next_s) then
+				next_b = bb
+				next_s = s
+			end
+		end
+	end
+
+	if next_b then
+		local s, _ = next_b:range()
+		pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
+		return next_b
+	end
+
+	if last_b then
+		local nb = Mgr.new_block_below_from(last_b)
+		if nb then
+			local s, _ = nb:range()
+			pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
+			return nb
+		end
+	end
+
+	return nil
+end
+
 -- Apply a single JMP item incrementally to a block's output
 local function apply_item(b, item)
 	ensure_block_output(b)
@@ -329,7 +374,7 @@ local function send_block(b)
 end
 
 function E.exec_current()
-	local b = Mgr.block_at_cursor()
+	local b = block_at_or_next_or_new()
 	if not b then
 		return
 	end
@@ -346,28 +391,32 @@ function E.exec_all()
 end
 
 function E.exec_and_next()
-	local b = Mgr.block_at_cursor()
+	local b = block_at_or_next_or_new()
 	if not b then
 		return
 	end
 	send_block(b)
 	local s, _ = b:range()
-	local next_b = nil
 	local buf = b.buf
+	local reg = Mgr.registry_for(buf)
+	local next_b = nil
+
 	for _, id in ipairs(Mgr.order_list(buf)) do
-		local reg = Mgr.registry_for(buf)
 		local bb = reg.by_id[id]
-		local bs, _ = bb:range()
-		if bs > s then
-			next_b = bb
-			break
+		if bb then
+			local bs, _ = bb:range()
+			if bs > s then
+				next_b = bb
+				break
+			end
 		end
 	end
+
 	if not next_b then
 		next_b = Mgr.new_block_below_from(b)
 	end
 	if next_b then
-		local ns = next_b:range()
+		local ns, _ = next_b:range()
 		vim.api.nvim_win_set_cursor(0, { ns + 1, 0 })
 	end
 end
