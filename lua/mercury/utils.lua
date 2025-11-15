@@ -35,6 +35,12 @@ function U.parse_header(line)
 	return U.py_cell_type(line)
 end
 
+function U.strip_ansi(s)
+	s = s or ""
+	s = s:gsub("\27%[[0-9;]*m", "")
+	return s
+end
+
 function U.clean_line(s)
 	s = U.strip_ansi(s or "")
 	s = s:gsub("\r", "")
