@@ -26,6 +26,8 @@ function M.setup(opts)
 		Auto.setup_autocmds(s)
 	end
 
+	require("mercury.qol")
+
 	-- Block management commands
 	vim.api.nvim_create_user_command("NotebookBlockNewAbove", function()
 		Mgr.new_block_above()

@@ -37,7 +37,11 @@ end
 
 function U.strip_ansi(s)
 	s = s or ""
-	s = s:gsub("\27%[[0-9;]*m", "")
+
+	s = s:gsub("\27%[[0-9;?]*[ -/]*[@-~]", "")
+	s = s:gsub("\27%].-\7", "")
+	s = s:gsub("\27.", "")
+
 	return s
 end
 
@@ -45,6 +49,47 @@ function U.clean_line(s)
 	s = U.strip_ansi(s or "")
 	s = s:gsub("\r", "")
 	return s
+end
+
+function U.b64decode(data)
+	data = data or ""
+	if data == "" then
+		return ""
+	end
+
+	data = data:gsub("[^A-Za-z0-9%+/%=]", "")
+
+	local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local decode_map = {}
+	for i = 1, #b64chars do
+		decode_map[b64chars:sub(i, i)] = i - 1
+	end
+
+	local bytes = {}
+	local bitbuf = 0
+	local bitlen = 0
+
+	for i = 1, #data do
+		local c = data:sub(i, i)
+		if c == "=" then
+			-- Padding; stop processing
+			break
+		end
+		local val = decode_map[c]
+		if val ~= nil then
+			bitbuf = bitbuf * 64 + val
+			bitlen = bitlen + 6
+
+			while bitlen >= 8 do
+				bitlen = bitlen - 8
+				local byte = math.floor(bitbuf / (2 ^ bitlen))
+				bitbuf = bitbuf % (2 ^ bitlen)
+				bytes[#bytes + 1] = string.char(byte)
+			end
+		end
+	end
+
+	return table.concat(bytes)
 end
 
 function U.split_lines(s)
