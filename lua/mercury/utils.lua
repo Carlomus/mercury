@@ -41,7 +41,7 @@ function U.strip_ansi(s)
 	s = s:gsub("\27%[[0-9;?]*[ -/]*[@-~]", "")
 	s = s:gsub("\27%].-\7", "")
 	s = s:gsub("\27.", "")
-
+	s = s:gsub("%z", "")
 	return s
 end
 

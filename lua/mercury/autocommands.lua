@@ -41,9 +41,8 @@ function M.jupytext_lens()
 			-- Materialize py:percent from extmarks and write back to .ipynb
 			local percent_lines = Mgr.materialize_pypercent()
 			local input = table.concat(percent_lines, "\n")
-			local ok, _, err = run_cmd({
+			local args = {
 				"jupytext",
-				"--update",
 				"--from",
 				"py:percent",
 				"--to",
@@ -51,7 +50,12 @@ function M.jupytext_lens()
 				"-o",
 				path,
 				"-",
-			}, input)
+			}
+			if vim.loop.fs_stat(path) then
+				table.insert(args, 2, "--update")
+			end
+
+			local ok, _, err = run_cmd(args, input)
 			if not ok then
 				return false, ("jupytext encode failed: %s"):format(err)
 			end

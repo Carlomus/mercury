@@ -179,7 +179,16 @@ function M.extend(Block)
 
 		local win = vim.api.nvim_get_current_win()
 		local win_w = vim.api.nvim_win_get_width(win)
-		local y = self:_tail_row() + 1
+
+		local base_row = self:_tail_row()
+		local nvirt = 0
+		if self._last_preview_virt and #self._last_preview_virt > 0 then
+			nvirt = #self._last_preview_virt
+		elseif self.output and self.output.virt_lines and #self.output.virt_lines > 0 then
+			nvirt = #self.output.virt_lines
+		end
+
+		local y = base_row + nvirt
 
 		for _, it in ipairs(self.output.items) do
 			if (it.type == "display_data" or it.type == "execute_result") and it.data then
@@ -225,9 +234,15 @@ function M.extend(Block)
 			elseif t == "error" then
 				body[#body + 1] = ("Error: %s: %s"):format(it.ename or "", it.evalue or "")
 				for _, ln in ipairs(it.traceback or {}) do
-					body[#body + 1] = U.clean_line(ln)
+					local cleaned = U.clean_line(ln)
+					for _, part in ipairs(U.split_lines(cleaned)) do
+						body[#body + 1] = part
+					end
 				end
 			elseif t == "display_data" or t == "execute_result" then
+				if it.data and (it.data["image/png"] or it.data["image/svg+xml"]) then
+					body[#body + 1] = "[image output]"
+				end
 				for _, ln in ipairs(mime_text_lines(it.data)) do
 					body[#body + 1] = ln
 				end
