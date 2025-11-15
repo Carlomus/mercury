@@ -177,14 +177,32 @@ function M.extend(Block)
 		self:_clear_images()
 		Image = Image or api
 
-		local win = vim.api.nvim_get_current_win()
+		local wins = vim.fn.win_findbuf(self.buf)
+		local win = wins[1]
+		if not win or not vim.api.nvim_win_is_valid(win) then
+			return
+		end
+
 		local win_w = vim.api.nvim_win_get_width(win)
 
 		local base_row = self:_tail_row()
+		if self.tail_mark then
+			local ok_pos, pos = pcall(
+				vim.api.nvim_buf_get_extmark_by_id,
+				self.buf,
+				Names.preview,
+				self.tail_mark,
+				{ details = false }
+			)
+			if ok_pos and pos and pos[1] then
+				base_row = pos[1]
+			end
+		end
+
 		local nvirt = 0
 		if self._last_preview_virt and #self._last_preview_virt > 0 then
 			nvirt = #self._last_preview_virt
-		elseif self.output and self.output.virt_lines and #self.output.virt_lines > 0 then
+		elseif self.output.virt_lines and #self.output.virt_lines > 0 then
 			nvirt = #self.output.virt_lines
 		end
 
@@ -240,9 +258,6 @@ function M.extend(Block)
 					end
 				end
 			elseif t == "display_data" or t == "execute_result" then
-				if it.data and (it.data["image/png"] or it.data["image/svg+xml"]) then
-					body[#body + 1] = "[image output]"
-				end
 				for _, ln in ipairs(mime_text_lines(it.data)) do
 					body[#body + 1] = ln
 				end
@@ -308,10 +323,12 @@ function M.extend(Block)
 		self.showing_full_output = false
 		self:attach_output()
 	end
+
 	function Block:show_full_output()
 		self.showing_full_output = true
 		self:attach_output()
 	end
+
 	function Block:toggle_full_output()
 		if self.showing_full_output then
 			self:truncate_output()

@@ -28,7 +28,6 @@ function M.setup(opts)
 
 	require("mercury.qol")
 
-	-- Block management commands
 	vim.api.nvim_create_user_command("NotebookBlockNewAbove", function()
 		Mgr.new_block_above()
 	end, {})
@@ -119,28 +118,16 @@ function M.setup(opts)
 		desc = "Show Python kernel used by current Mercury notebook buffer",
 	})
 
-	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
-		callback = function(args)
-			Mgr.sanitize_headers(args.buf)
-		end,
+	vim.api.nvim_create_user_command("NotebookYankOutput", function()
+		Run.yank_output()
+	end, {
+		desc = "Yank current notebook cell output",
 	})
 
-	-- ▶ On entering a notebook buffer, jump to first code cell (skip markdown preamble)
-	vim.api.nvim_create_autocmd("BufEnter", {
-		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
-		callback = function(args)
-			local buf = args.buf
-			local reg = Mgr.registry_for(buf)
-			for _, id in ipairs(Mgr.order_list(buf)) do
-				local b = reg.by_id[id]
-				if b and b.type == "python" then
-					local s, _ = b:range()
-					pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
-					break
-				end
-			end
-		end,
+	vim.api.nvim_create_user_command("NotebookScratchOutput", function()
+		Run.scratch_output()
+	end, {
+		desc = "Open current notebook cell output in a scratch buffer",
 	})
 end
 

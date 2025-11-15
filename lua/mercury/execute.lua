@@ -74,6 +74,22 @@ local function ensure_block_output(b)
 	end
 end
 
+local function block_output_lines(b)
+	if not b or not b.output or not b.output.virt_lines then
+		return nil
+	end
+	local out = {}
+	for _, row in ipairs(b.output.virt_lines) do
+		local parts = {}
+		for _, chunk in ipairs(row) do
+			-- chunk = { text, hl_group }
+			parts[#parts + 1] = chunk[1] or ""
+		end
+		out[#out + 1] = table.concat(parts)
+	end
+	return out
+end
+
 -- Apply a single JMP item incrementally to a block's output
 local function apply_item(b, item)
 	ensure_block_output(b)
@@ -433,6 +449,68 @@ end
 
 function E.setup(opts)
 	CONF = vim.tbl_deep_extend("force", CONF, opts or {})
+end
+
+function E.yank_output()
+	local b = Mgr.block_at_cursor()
+	if not b then
+		vim.notify("mercury: no notebook cell at cursor", vim.log.levels.INFO)
+		return
+	end
+	local lines = block_output_lines(b)
+	if not lines or #lines == 0 then
+		vim.notify("mercury: current cell has no output to yank", vim.log.levels.INFO)
+		return
+	end
+	local text = table.concat(lines, "\n")
+	-- unnamed register
+	vim.fn.setreg('"', text)
+	-- try also system clipboard if available
+	pcall(vim.fn.setreg, "+", text)
+	vim.notify("mercury: yanked cell output", vim.log.levels.INFO)
+end
+
+function E.scratch_output()
+	local b = Mgr.block_at_cursor()
+	if not b then
+		vim.notify("mercury: no notebook cell at cursor", vim.log.levels.INFO)
+		return
+	end
+	local lines = block_output_lines(b)
+	if not lines or #lines == 0 then
+		vim.notify("mercury: current cell has no output to open", vim.log.levels.INFO)
+		return
+	end
+
+	-- create a scratch buffer with content
+	local buf = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].filetype = "markdown" -- or "text"
+
+	-- floating window dimensions
+	local cols = vim.o.columns
+	local rows = vim.o.lines
+	local width = math.floor(cols * 0.7)
+	local height = math.floor(rows * 0.6)
+	local row = math.floor((rows - height) / 2)
+	local col = math.floor((cols - width) / 2)
+
+	-- open floating window
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = width,
+		height = height,
+		row = row,
+		col = col,
+		style = "minimal",
+		border = "rounded",
+	})
+
+	-- better UX
+	vim.api.nvim_set_option_value("wrap", true, { win = win })
+	vim.api.nvim_set_option_value("cursorline", false, { win = win })
+
+	vim.notify("mercury: opened cell output in floating scratch window", vim.log.levels.INFO)
 end
 
 return E

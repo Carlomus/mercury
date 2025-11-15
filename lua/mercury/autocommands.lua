@@ -113,6 +113,30 @@ function M.setup_autocmds(spec)
 			vim.bo[buf].modified = false
 		end,
 	})
+
+	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
+		callback = function(args)
+			Mgr.sanitize_headers(args.buf)
+		end,
+	})
+
+	-- ▶ On entering a notebook buffer, jump to first code cell (skip markdown preamble)
+	vim.api.nvim_create_autocmd("BufEnter", {
+		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
+		callback = function(args)
+			local buf = args.buf
+			local reg = Mgr.registry_for(buf)
+			for _, id in ipairs(Mgr.order_list(buf)) do
+				local b = reg.by_id[id]
+				if b and b.type == "python" then
+					local s, _ = b:range()
+					pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
+					break
+				end
+			end
+		end,
+	})
 end
 
 return M
