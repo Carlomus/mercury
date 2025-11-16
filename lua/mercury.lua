@@ -3,6 +3,8 @@ local Bg = require("mercury.background")
 local Auto = require("mercury.autocommands")
 local Run = require("mercury.execute")
 local Kern = require("mercury.kernels")
+local OutGuard = require("mercury.output_guard")
+
 local M = {}
 
 function M.setup(opts)
@@ -10,6 +12,7 @@ function M.setup(opts)
 
 	Run.setup(opts)
 	Bg.setup(opts)
+	OutGuard.setup()
 
 	vim.api.nvim_create_autocmd("User", {
 		pattern = "NotebookBlocksChanged",
@@ -50,7 +53,6 @@ function M.setup(opts)
 		Mgr.merge_below()
 	end, {})
 
-	-- Execution commands
 	vim.api.nvim_create_user_command("NotebookExecBlock", Run.exec_current, {})
 	vim.api.nvim_create_user_command("NotebookExecAll", Run.exec_all, {})
 	vim.api.nvim_create_user_command("NotebookExecAndNext", Run.exec_and_next, {})
@@ -67,7 +69,7 @@ function M.setup(opts)
 
 	vim.keymap.set("n", "<S-CR>", ":NotebookExecAndNext<CR>", { desc = "Notebook: exec + next" })
 
-	-- Keep Treesitter highlights in sync with block type
+	-- When block layout changes, re-run the Python Treesitter parser for that buffer
 	vim.api.nvim_create_autocmd("User", {
 		pattern = "NotebookBlocksChanged",
 		callback = function(args)
@@ -78,13 +80,7 @@ function M.setup(opts)
 		end,
 	})
 
-	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
-		callback = function(args)
-			Mgr.sanitize_headers(args.buf)
-		end,
-	})
-
+	-- Kernel selection commands
 	vim.api.nvim_create_user_command("NotebookKernelSelect", function()
 		Kern.select_kernel_for_buf()
 	end, {
@@ -116,18 +112,6 @@ function M.setup(opts)
 		end
 	end, {
 		desc = "Show Python kernel used by current Mercury notebook buffer",
-	})
-
-	vim.api.nvim_create_user_command("NotebookYankOutput", function()
-		Run.yank_output()
-	end, {
-		desc = "Yank current notebook cell output",
-	})
-
-	vim.api.nvim_create_user_command("NotebookScratchOutput", function()
-		Run.scratch_output()
-	end, {
-		desc = "Open current notebook cell output in a scratch buffer",
 	})
 end
 

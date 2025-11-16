@@ -19,8 +19,9 @@ end
 
 function BG.highlight(buf)
 	buf = buf or 0
+	local reg = Mgr.registry_for(buf)
 	for _, id in ipairs(Mgr.order_list(buf)) do
-		local block = Mgr.registry.by_id[id]
+		local block = reg.by_id[id]
 		if block then
 			local t = block.type or "python"
 			local group = (t == "markdown") and OPTS.markdown_hl or OPTS.python_hl

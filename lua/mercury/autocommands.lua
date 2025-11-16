@@ -7,16 +7,15 @@ local function has_vim_system()
 end
 
 local function run_cmd(cmd, input)
-	-- Prefer vim.system when available (robust argv, correct quoting).
 	if has_vim_system() then
 		local result = vim.system(cmd, { text = true, stdin = input }):wait()
 		local ok = (result.code == 0)
 		return ok, result.stdout or "", result.stderr or ""
 	else
-		local joined = table.concat(cmd, " ")
-		local out = vim.fn.system(joined, input)
+		-- Fallback: pass list of args directly to system() to avoid manual shell-escaping.
+		local out = vim.fn.system(cmd, input)
 		local ok = (vim.v.shell_error == 0)
-		return ok, out, ok and "" or out
+		return ok, out or "", ok and "" or out or ""
 	end
 end
 
@@ -24,7 +23,6 @@ function M.jupytext_lens()
 	return {
 		pattern = { "*.ipynb" },
 		decode = function(path, buf)
-			-- Drop mismatched CELL_MARKERS metadata; py:percent doesn't use it.
 			local ok, out, err = run_cmd({ "jupytext", "--to", "py:percent", "-o", "-", path })
 			if not ok then
 				return false, ("jupytext decode failed: %s"):format(err)
@@ -38,8 +36,7 @@ function M.jupytext_lens()
 		end,
 
 		encode = function(path, buf)
-			-- Materialize py:percent from extmarks and write back to .ipynb
-			local percent_lines = Mgr.materialize_pypercent()
+			local percent_lines = Mgr.materialize_pypercent(buf)
 			local input = table.concat(percent_lines, "\n")
 			local args = {
 				"jupytext",
@@ -91,8 +88,6 @@ function M.setup_autocmds(spec)
 
 			vim.schedule(function()
 				if vim.api.nvim_buf_is_valid(buf) then
-					-- this should remove any real '# %%' / '# %% [markdown]' lines
-					-- and keep only the virtual (ghost) header via extmarks
 					pcall(Mgr.sanitize_headers, buf)
 					pcall(Mgr.reflow_all, buf)
 				end
@@ -114,6 +109,7 @@ function M.setup_autocmds(spec)
 		end,
 	})
 
+	-- Single TextChanged / TextChangedI autocmd (no duplicates).
 	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
 		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
 		callback = function(args)
@@ -121,16 +117,28 @@ function M.setup_autocmds(spec)
 		end,
 	})
 
-	-- ▶ On entering a notebook buffer, jump to first code cell (skip markdown preamble)
+	-- Softer BufEnter: only jump to first code block if we're not already in any block.
 	vim.api.nvim_create_autocmd("BufEnter", {
 		pattern = { "*.ipynb", "*.[iI][pP][yY][nN][bB]" },
 		callback = function(args)
 			local buf = args.buf
+			-- Ensure current window is actually showing this buffer
+			if vim.api.nvim_get_current_buf() ~= buf then
+				return
+			end
+
+			-- If cursor is already inside a notebook block (input or output), don't move it.
+			local cur_block = Mgr.block_at_cursor(buf)
+			if cur_block then
+				return
+			end
+
+			-- Otherwise, jump to first python block input (notebook-style "focus top cell").
 			local reg = Mgr.registry_for(buf)
 			for _, id in ipairs(Mgr.order_list(buf)) do
 				local b = reg.by_id[id]
 				if b and b.type == "python" then
-					local s, _ = b:range()
+					local s, _ = b:input_range()
 					pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
 					break
 				end

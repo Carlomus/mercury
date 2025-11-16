@@ -1,15 +1,27 @@
 local Names = require("mercury.names")
 
-local marks_config = function(end_row)
+local Block = {}
+Block.__index = Block
+
+local function input_mark_cfg(row)
 	return {
-		end_row = end_row,
+		end_row = row,
 		end_col = 0,
 		right_gravity = false,
 		end_right_gravity = true,
 	}
 end
 
-local header_config = function(header_text)
+local function output_mark_cfg(row)
+	return {
+		end_row = row,
+		end_col = 0,
+		right_gravity = false,
+		end_right_gravity = true,
+	}
+end
+
+local function header_config(header_text)
 	return {
 		virt_lines = { { { header_text, "Comment" } } },
 		virt_lines_above = true,
@@ -18,82 +30,164 @@ local header_config = function(header_text)
 	}
 end
 
-local Block = {}
-Block.__index = Block
-
 function Block.new(buf, start_row, end_row, id, type_, header_text)
 	if end_row < start_row then
 		end_row = start_row
 	end
-	local mark =
-		vim.api.nvim_buf_set_extmark(buf, Names.blocks, start_row, 0, marks_config(end_row))
+
+	-- INPUT region extmark
+	local input_mark =
+		vim.api.nvim_buf_set_extmark(buf, Names.blocks, start_row, 0, input_mark_cfg(end_row))
+
+	-- OUTPUT region extmark: initially empty, placed immediately after input.
+	local output_mark =
+		vim.api.nvim_buf_set_extmark(buf, Names.blocks_output, end_row, 0, output_mark_cfg(end_row))
 
 	local self = setmetatable({
 		id = id,
 		buf = buf,
-		mark = mark,
 		type = type_ or "python",
-		header_text = header_text or (type_ == "markdown" and "# %% [markdown] " or "# %%"),
+		header_text = header_text or (type_ == "markdown" and "# %% [markdown]" or "# %%"),
+
+		-- extmarks
+		input_mark = input_mark,
+		output_mark = output_mark,
 		header_virt_mark = nil,
-		tail_mark = nil, -- anchor used by output module
+
+		-- background highlight extmarks
 		_bg = nil,
 	}, Block)
 
-	self:_ensure_tail_anchor()
 	self:show_header_virtual()
+	self:set_highlight(
+		(self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
+	)
 
 	return self
 end
 
-function Block:range()
-	local pos =
-		vim.api.nvim_buf_get_extmark_by_id(self.buf, Names.blocks, self.mark, { details = true })
-	local sr = (pos and pos[1]) or 0
-	local details = pos and pos[3] or nil
-	local er = (details and details.end_row) or sr
-	return sr, er
-end
-
-function Block:_tail_row()
-	local s, e = self:range()
-	return math.max(s, e)
-end
-
-function Block:_ensure_tail_anchor()
-	local row = self:_tail_row()
-	local cfg = { right_gravity = false, hl_mode = "combine" }
-	if self.tail_mark then
-		cfg.id = self.tail_mark
+function Block:input_range()
+	local pos = vim.api.nvim_buf_get_extmark_by_id(
+		self.buf,
+		Names.blocks,
+		self.input_mark,
+		{ details = true }
+	)
+	if not pos then
+		return 0, 0
 	end
-	self.tail_mark = vim.api.nvim_buf_set_extmark(self.buf, Names.preview, row, 0, cfg)
+	local s = pos[1]
+	local details = pos[3] or {}
+	local e = details.end_row or s
+	return s, e
+end
+
+function Block:output_range()
+	local pos = vim.api.nvim_buf_get_extmark_by_id(
+		self.buf,
+		Names.blocks_output,
+		self.output_mark,
+		{ details = true }
+	)
+	if not pos then
+		local _, in_e = self:input_range()
+		return in_e, in_e
+	end
+	local s = pos[1]
+	local details = pos[3] or {}
+	local e = details.end_row or s
+	return s, e
+end
+
+function Block:range()
+	local in_s, in_e = self:input_range()
+	local _, out_e = self:output_range()
+	local s = in_s
+	local e = math.max(in_e, out_e)
+	return s, e
 end
 
 function Block:text()
-	local s, e = self:range()
+	local s, e = self:input_range()
 	return vim.api.nvim_buf_get_lines(self.buf, s, e, false)
 end
 
-function Block:set_end_row(e_excl)
-	local s, _ = self:range()
+function Block:output_text()
+	local s, e = self:output_range()
+	if e <= s then
+		return {}
+	end
+	return vim.api.nvim_buf_get_lines(self.buf, s, e, false)
+end
+
+function Block:output_insert_row()
+	local _, in_e = self:input_range()
+	return in_e
+end
+
+function Block:set_input_span(new_s, new_e)
 	local n = vim.api.nvim_buf_line_count(self.buf)
-	local e = math.min(e_excl, n)
-	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, s, 0, {
-		id = self.mark,
-		end_row = e,
+	new_s = math.max(0, math.min(new_s or 0, n))
+	new_e = math.max(new_s, math.min(new_e or new_s, n))
+
+	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, new_s, 0, {
+		id = self.input_mark,
+		end_row = new_e,
 		end_col = 0,
 		right_gravity = false,
 		end_right_gravity = true,
 	})
-	self:_ensure_tail_anchor()
+
+	-- If output is empty, keep it immediately after input
+	local out_s, out_e = self:output_range()
+	if out_s == out_e then
+		local row = new_e
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, row, 0, {
+			id = self.output_mark,
+			end_row = row,
+			end_col = 0,
+			right_gravity = false,
+			end_right_gravity = true,
+		})
+	end
+
 	self:sync_decorations()
 end
 
-function Block:set_type(new_t)
-	self.type = new_t
-	self.header_text = (new_t == "markdown") and "# %% [markdown] " or "# %%"
-	self:show_header_virtual()
-	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
-	self:set_highlight(group)
+function Block:set_end_row(e_excl)
+	local s, _ = self:input_range()
+	self:set_input_span(s, e_excl)
+end
+
+-- Replace output region in the buffer with fresh lines
+function Block:replace_output_lines(lines)
+	lines = lines or {}
+	local out_s, out_e = self:output_range()
+	local insert_at = out_s
+
+	if out_e > out_s then
+		vim.api.nvim_buf_set_lines(self.buf, out_s, out_e, false, {})
+	end
+
+	if #lines > 0 then
+		vim.api.nvim_buf_set_lines(self.buf, insert_at, insert_at, false, lines)
+		local new_e = insert_at + #lines
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, {
+			id = self.output_mark,
+			end_row = new_e,
+			end_col = 0,
+			right_gravity = false,
+			end_right_gravity = true,
+		})
+	else
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, {
+			id = self.output_mark,
+			end_row = insert_at,
+			end_col = 0,
+			right_gravity = false,
+			end_right_gravity = true,
+		})
+	end
 end
 
 function Block:show_header_virtual()
@@ -101,14 +195,23 @@ function Block:show_header_virtual()
 		pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.headers, self.header_virt_mark)
 		self.header_virt_mark = nil
 	end
-	local s, _ = self:range()
+	local s, _ = self:input_range()
 	self.header_virt_mark =
 		vim.api.nvim_buf_set_extmark(self.buf, Names.headers, s, 0, header_config(self.header_text))
 end
 
+function Block:set_type(new_t)
+	self.type = new_t
+	self.header_text = (new_t == "markdown") and "# %% [markdown]" or "# %%"
+	self:show_header_virtual()
+	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
+	self:set_highlight(group)
+end
+
+-- Background highlight over block input rows
 function Block:set_highlight(group)
-	local s, e = self:range()
-	local count = e - s
+	local s, e = self:input_range()
+	local count = math.max(e - s, 1)
 	self._bg = self._bg or { group = nil, s = nil, e = nil, marks = {} }
 	local st = self._bg
 
@@ -141,41 +244,21 @@ function Block:set_highlight(group)
 end
 
 function Block:sync_decorations()
-	local s, _ = self:range()
+	local s, _ = self:input_range()
 
 	if self.header_virt_mark then
-		local cfg = {
-			virt_lines = { { { self.header_text, "Comment" } } },
-			virt_lines_above = true,
-			hl_mode = "combine",
-			right_gravity = false,
-			id = self.header_virt_mark,
-		}
+		local cfg = header_config(self.header_text)
+		cfg.id = self.header_virt_mark
 		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.headers, s, 0, cfg)
 	end
-
-	self:_ensure_tail_anchor()
 
 	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
 	self:set_highlight(group)
 end
 
-function Block:set_span(new_s, new_e)
-	local n = vim.api.nvim_buf_line_count(self.buf)
-	new_s = math.max(0, math.min(new_s or 0, n))
-	new_e = math.max(new_s, math.min(new_e or new_s, n))
-
-	local cfg = marks_config(new_e)
-	cfg.id = self.mark
-	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, new_s, 0, cfg)
-	self:sync_decorations()
-end
-
 function Block:destroy()
-	pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.blocks, self.mark)
-	if self.tail_mark then
-		pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.preview, self.tail_mark)
-	end
+	pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.blocks, self.input_mark)
+	pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.blocks_output, self.output_mark)
 	if self.header_virt_mark then
 		pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.headers, self.header_virt_mark)
 	end

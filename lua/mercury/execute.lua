@@ -22,6 +22,9 @@ local STATE = {}
 -- Map job_id → bufnr so callbacks can find the right buffer
 local JOB_TO_BUF = {}
 
+-- Track clear_output(wait=True) semantics per block
+local CLEAR_WAIT = {}
+
 local function curbuf()
 	return vim.api.nvim_get_current_buf()
 end
@@ -75,19 +78,10 @@ local function ensure_block_output(b)
 end
 
 local function block_output_lines(b)
-	if not b or not b.output or not b.output.virt_lines then
+	if not b then
 		return nil
 	end
-	local out = {}
-	for _, row in ipairs(b.output.virt_lines) do
-		local parts = {}
-		for _, chunk in ipairs(row) do
-			-- chunk = { text, hl_group }
-			parts[#parts + 1] = chunk[1] or ""
-		end
-		out[#out + 1] = table.concat(parts)
-	end
-	return out
+	return b:output_text()
 end
 
 local function block_at_or_next_or_new()
@@ -118,7 +112,7 @@ local function block_at_or_next_or_new()
 	end
 
 	if next_b then
-		local s, _ = next_b:range()
+		local s, _ = next_b:input_range()
 		pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
 		return next_b
 	end
@@ -126,7 +120,7 @@ local function block_at_or_next_or_new()
 	if last_b then
 		local nb = Mgr.new_block_below_from(last_b)
 		if nb then
-			local s, _ = nb:range()
+			local s, _ = nb:input_range()
 			pcall(vim.api.nvim_win_set_cursor, 0, { s + 1, 0 })
 			return nb
 		end
@@ -135,17 +129,24 @@ local function block_at_or_next_or_new()
 	return nil
 end
 
--- Apply a single JMP item incrementally to a block's output
 local function apply_item(b, item)
 	ensure_block_output(b)
 	local t = item.type
 
 	if t == "clear_output" then
-		b.output.items = {}
+		if item.wait then
+			CLEAR_WAIT[b.id] = true
+		else
+			b.output.items = {}
+		end
 		return
 	end
 
-	-- map update_display_data by transient.display_id
+	if CLEAR_WAIT[b.id] then
+		b.output.items = {}
+		CLEAR_WAIT[b.id] = nil
+	end
+
 	local transient = item.transient or {}
 	local display_id = transient.display_id
 
@@ -172,10 +173,11 @@ local function apply_item(b, item)
 	end
 
 	if t == "stream" then
-		table.insert(
-			b.output.items,
-			{ type = "stream", name = item.name or "stdout", text = item.text or "" }
-		)
+		table.insert(b.output.items, {
+			type = "stream",
+			name = item.name or "stdout",
+			text = item.text or "",
+		})
 		return
 	end
 
@@ -211,14 +213,12 @@ local function on_bridge_msg(bufnr, msg)
 	elseif typ == "execute_done" then
 		local bid = msg.cell_id
 		local b = bid and reg.by_id[bid]
-		-- pop head capture
 		table.remove(S.capture, 1)
 
 		if b then
 			ensure_block_output(b)
 			b.output.exec_count = msg.exec_count or (b.output.exec_count or 0)
 			b.output.ms = msg.ms or 0
-			-- If bridge sent a one-shot error (no prior streaming), merge those outputs
 			if msg.outputs and #msg.outputs > 0 and (#b.output.items == 0) then
 				for _, it in ipairs(msg.outputs) do
 					apply_item(b, it)
@@ -227,7 +227,6 @@ local function on_bridge_msg(bufnr, msg)
 			b:insert_output(b.output)
 		end
 
-		-- start next pending
 		if #S.capture == 0 and #S.pending > 0 then
 			local p = table.remove(S.pending, 1)
 			table.insert(S.capture, { block_id = p.block_id })
@@ -235,7 +234,6 @@ local function on_bridge_msg(bufnr, msg)
 		end
 		return
 	elseif typ == "interrupted" then
-		-- mark head, but DO NOT pop here – then allow next pending
 		local head = S.capture[1]
 		if head and msg.cell_id == head.block_id then
 			local b = reg.by_id[head.block_id]
@@ -251,7 +249,6 @@ local function on_bridge_msg(bufnr, msg)
 		end
 		return
 	elseif typ == "restarted" then
-		-- clean queues; mark killed for good UX
 		mark_head_killed(S)
 		clear_queues(S)
 		return
@@ -259,7 +256,6 @@ local function on_bridge_msg(bufnr, msg)
 		mark_head_killed(S)
 		clear_queues(S)
 		vim.notify("Jupyter kernel died: " .. (msg.error or typ), vim.log.levels.ERROR)
-		-- mark bridge as gone; ensure_bridge will recreate
 		if S.job_id then
 			JOB_TO_BUF[S.job_id] = nil
 		end
@@ -396,7 +392,8 @@ function E.exec_and_next()
 		return
 	end
 	send_block(b)
-	local s, _ = b:range()
+
+	local s, _ = b:input_range()
 	local buf = b.buf
 	local reg = Mgr.registry_for(buf)
 	local next_b = nil
@@ -404,7 +401,7 @@ function E.exec_and_next()
 	for _, id in ipairs(Mgr.order_list(buf)) do
 		local bb = reg.by_id[id]
 		if bb then
-			local bs, _ = bb:range()
+			local bs, _ = bb:input_range()
 			if bs > s then
 				next_b = bb
 				break
@@ -416,7 +413,7 @@ function E.exec_and_next()
 		next_b = Mgr.new_block_below_from(b)
 	end
 	if next_b then
-		local ns, _ = next_b:range()
+		local ns, _ = next_b:input_range()
 		vim.api.nvim_win_set_cursor(0, { ns + 1, 0 })
 	end
 end
@@ -498,68 +495,6 @@ end
 
 function E.setup(opts)
 	CONF = vim.tbl_deep_extend("force", CONF, opts or {})
-end
-
-function E.yank_output()
-	local b = Mgr.block_at_cursor()
-	if not b then
-		vim.notify("mercury: no notebook cell at cursor", vim.log.levels.INFO)
-		return
-	end
-	local lines = block_output_lines(b)
-	if not lines or #lines == 0 then
-		vim.notify("mercury: current cell has no output to yank", vim.log.levels.INFO)
-		return
-	end
-	local text = table.concat(lines, "\n")
-	-- unnamed register
-	vim.fn.setreg('"', text)
-	-- try also system clipboard if available
-	pcall(vim.fn.setreg, "+", text)
-	vim.notify("mercury: yanked cell output", vim.log.levels.INFO)
-end
-
-function E.scratch_output()
-	local b = Mgr.block_at_cursor()
-	if not b then
-		vim.notify("mercury: no notebook cell at cursor", vim.log.levels.INFO)
-		return
-	end
-	local lines = block_output_lines(b)
-	if not lines or #lines == 0 then
-		vim.notify("mercury: current cell has no output to open", vim.log.levels.INFO)
-		return
-	end
-
-	-- create a scratch buffer with content
-	local buf = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.bo[buf].filetype = "markdown" -- or "text"
-
-	-- floating window dimensions
-	local cols = vim.o.columns
-	local rows = vim.o.lines
-	local width = math.floor(cols * 0.7)
-	local height = math.floor(rows * 0.6)
-	local row = math.floor((rows - height) / 2)
-	local col = math.floor((cols - width) / 2)
-
-	-- open floating window
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = row,
-		col = col,
-		style = "minimal",
-		border = "rounded",
-	})
-
-	-- better UX
-	vim.api.nvim_set_option_value("wrap", true, { win = win })
-	vim.api.nvim_set_option_value("cursorline", false, { win = win })
-
-	vim.notify("mercury: opened cell output in floating scratch window", vim.log.levels.INFO)
 end
 
 return E

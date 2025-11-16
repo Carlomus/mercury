@@ -1,4 +1,3 @@
-local Names = require("mercury.names")
 local U = require("mercury.utils")
 
 local M = {}
@@ -107,15 +106,6 @@ local function write_image_tmp_from_data(data)
 	return nil
 end
 
-local function output_config(virt_txt)
-	return {
-		virt_lines = virt_txt,
-		virt_lines_above = false,
-		hl_mode = "combine",
-		right_gravity = false,
-	}
-end
-
 function M.extend(Block)
 	if Block.__output_extended then
 		return Block
@@ -128,13 +118,12 @@ function M.extend(Block)
 	-- wrap constructor to initialize output fields
 	local old_new = Block.new
 	Block.new = function(buf, start_row, end_row, id, type_, output_, header_text)
-		local self = old_new(buf, start_row, end_row, id, type_, output_, header_text)
+		local self = old_new(buf, start_row, end_row, id, type_, header_text)
 
 		-- output state
 		self.output = nil
 		self.is_collapsed = false
 		self.showing_full_output = true
-		self._last_preview_virt = nil
 		self._images = {}
 		self._image_paths = {}
 
@@ -144,7 +133,6 @@ function M.extend(Block)
 		return self
 	end
 
-	-- helpers
 	function Block:_clear_images()
 		if self._images then
 			for _, img in ipairs(self._images) do
@@ -165,16 +153,63 @@ function M.extend(Block)
 		self._image_paths = {}
 	end
 
-	function Block:_render_images_from_output()
+	-- Turn current self.output.items into flat text lines + image anchors
+	function Block:_materialize_output_lines()
+		local out = self.output or {}
+		local items = out.items or {}
+		local lines = {}
+		local anchors = {}
+
+		local header = ("Out[%d] (%d ms):"):format(out.exec_count or 0, out.ms or 0)
+		lines[#lines + 1] = header
+
+		-- Clear any stale paths
+		self._image_paths = {}
+
+		for _, it in ipairs(items) do
+			local t = it.type
+			if t == "clear_output" then
+				lines = { header }
+				anchors = {}
+			elseif t == "stream" then
+				for _, ln in ipairs(stream_lines(it)) do
+					lines[#lines + 1] = ln
+				end
+			elseif t == "error" then
+				lines[#lines + 1] = ("Error: %s: %s"):format(it.ename or "", it.evalue or "")
+				for _, ln in ipairs(it.traceback or {}) do
+					local cleaned = U.clean_line(ln)
+					for _, part in ipairs(U.split_lines(cleaned)) do
+						lines[#lines + 1] = part
+					end
+				end
+			elseif t == "display_data" or t == "execute_result" then
+				for _, ln in ipairs(mime_text_lines(it.data)) do
+					lines[#lines + 1] = ln
+				end
+
+				local path = write_image_tmp_from_data(it.data)
+				if path then
+					lines[#lines + 1] = ""
+					anchors[#anchors + 1] = {
+						line_index = #lines,
+						path = path,
+					}
+					self._image_paths[#self._image_paths + 1] = path
+				end
+			else
+				lines[#lines + 1] = ("[%s output unsupported]"):format(t or "unknown")
+			end
+		end
+
+		return lines, anchors
+	end
+
+	function Block:_render_images_at(out_start, anchors)
 		local ok, api = pcall(require, "image")
 		if not ok or not api or (api.is_enabled and not api.is_enabled()) then
 			return
 		end
-		if not self.output or not self.output.items then
-			return
-		end
-
-		self:_clear_images()
 		Image = Image or api
 
 		local wins = vim.fn.win_findbuf(self.buf)
@@ -184,150 +219,92 @@ function M.extend(Block)
 		end
 
 		local win_w = vim.api.nvim_win_get_width(win)
+		self._images = {}
 
-		local base_row = self:_tail_row()
-		if self.tail_mark then
-			local ok_pos, pos = pcall(
-				vim.api.nvim_buf_get_extmark_by_id,
-				self.buf,
-				Names.preview,
-				self.tail_mark,
-				{ details = false }
-			)
-			if ok_pos and pos and pos[1] then
-				base_row = pos[1]
-			end
-		end
-
-		local nlines = vim.api.nvim_buf_line_count(self.buf)
-		if nlines > 0 then
-			if base_row < 0 then
-				base_row = 0
-			elseif base_row > nlines - 1 then
-				base_row = nlines - 1
-			end
-		end
-
-		for _, it in ipairs(self.output.items) do
-			if (it.type == "display_data" or it.type == "execute_result") and it.data then
-				local has_img = it.data["image/png"] or it.data["image/svg+xml"]
-				if has_img then
-					local path = write_image_tmp_from_data(it.data)
-					if path then
-						local img = Image.from_file(path, {
-							window = win,
-							buffer = self.buf,
-							inline = true,
-							with_virtual_padding = true,
-							x = 0,
-							y = base_row,
-							width = math.floor(0.9 * win_w),
-						})
-						if img and img.render then
-							img:render()
-							table.insert(self._images, img)
-							table.insert(self._image_paths, path)
-						else
-							_unlink_tmp(path)
-						end
-					end
+		for _, a in ipairs(anchors or {}) do
+			if a.path then
+				local row = out_start + (a.line_index - 1)
+				local img = Image.from_file(a.path, {
+					window = win,
+					buffer = self.buf,
+					inline = true,
+					with_virtual_padding = false,
+					x = 0,
+					y = row,
+					width = math.floor(0.9 * win_w),
+				})
+				if img and img.render then
+					img:render()
+					table.insert(self._images, img)
 				end
 			end
 		end
 	end
 
-	function Block:generate_output(output)
-		local items = output.items or {}
-		local body = {}
+	function Block:_render_output_lines()
+		self:_clear_images()
 
-		for _, it in ipairs(items) do
-			local t = it.type
-			if t == "clear_output" then
-				body = {}
-			elseif t == "stream" then
-				for _, ln in ipairs(stream_lines(it)) do
-					body[#body + 1] = ln
-				end
-			elseif t == "error" then
-				body[#body + 1] = ("Error: %s: %s"):format(it.ename or "", it.evalue or "")
-				for _, ln in ipairs(it.traceback or {}) do
-					local cleaned = U.clean_line(ln)
-					for _, part in ipairs(U.split_lines(cleaned)) do
-						body[#body + 1] = part
-					end
-				end
-			elseif t == "display_data" or t == "execute_result" then
-				for _, ln in ipairs(mime_text_lines(it.data)) do
-					body[#body + 1] = ln
-				end
-				-- NOTE: we do NOT append a fake "[image]" line here; images are
-				-- rendered visually by image.nvim, but the text stream stays as-is.
-			else
-				body[#body + 1] = ("[%s output unsupported]"):format(t or "unknown")
-			end
-		end
-
-		local virt = {}
-		virt[#virt + 1] =
-			{ { ("Out[%d] (%d ms):"):format(output.exec_count or 0, output.ms or 0), "Comment" } }
-		for i = 1, #body do
-			virt[#virt + 1] = { { body[i], "Comment" } }
-		end
-
-		self.output = output
-		self.output.virt_lines = virt
-	end
-
-	function Block:attach_output()
-		if not self.output then
+		if not self.output or not self.output.items then
+			self:replace_output_lines({})
 			return
 		end
-		if self.is_collapsed then
-			self.is_collapsed = false
+
+		local all_lines, anchors = self:_materialize_output_lines()
+		local lines = all_lines
+		local used_anchors = anchors
+		local hidden = 0
+
+		local max_preview = self.output.max_preview_lines
+		if max_preview and not self.showing_full_output then
+			local limit = max_preview + 1 -- header + N lines
+			if #lines > limit then
+				hidden = #lines - limit
+				lines = {}
+				for i = 1, limit do
+					lines[i] = all_lines[i]
+				end
+				used_anchors = {}
+				for _, a in ipairs(anchors) do
+					if a.line_index <= limit then
+						used_anchors[#used_anchors + 1] = a
+					end
+				end
+			end
 		end
 
-		local lines_shown = (self.output.max_preview_lines or 9999) + 1 -- header
-		local lines = self.output.virt_lines or {}
-		self._last_preview_virt = nil
-
-		local n = self.showing_full_output and #lines or math.min(lines_shown, #lines)
-
-		local virt = {}
-		for i = 1, n do
-			virt[#virt + 1] = lines[i]
+		if hidden > 0 then
+			lines[#lines + 1] = ("... (cont) %d lines hidden"):format(hidden)
 		end
-		if #lines > n then
-			virt[#virt + 1] = { { ("... (cont) %d lines hidden"):format(#lines - n), "Comment" } }
+
+		self:replace_output_lines(lines)
+
+		if #used_anchors > 0 then
+			local out_s, _ = self:output_range()
+			self:_render_images_at(out_s, used_anchors)
 		end
-		self._last_preview_virt = virt
-
-		self:_ensure_tail_anchor()
-		local cfg = output_config(self._last_preview_virt)
-		cfg.id = self.tail_mark
-		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, cfg)
-
-		self:_render_images_from_output()
 	end
 
 	function Block:insert_output(output)
-		if output.max_preview_lines then
+		self.output = output
+		if output and output.max_preview_lines then
 			self.showing_full_output = false
 		else
 			self.showing_full_output = true
-			output.virtual_preview_lines = 9999
 		end
-		self:generate_output(output)
-		self:attach_output()
+		self.is_collapsed = false
+		self:_render_output_lines()
 	end
 
 	function Block:truncate_output()
 		self.showing_full_output = false
-		self:attach_output()
+		self.is_collapsed = false
+		self:_render_output_lines()
 	end
 
 	function Block:show_full_output()
 		self.showing_full_output = true
-		self:attach_output()
+		self.is_collapsed = false
+		self:_render_output_lines()
 	end
 
 	function Block:toggle_full_output()
@@ -342,21 +319,17 @@ function M.extend(Block)
 		if not self.output then
 			return
 		end
-		self:_clear_images()
-		self._last_preview_virt = { { { "Output collapsed...", "Comment" } } }
-		self:_ensure_tail_anchor()
-		local cfg = output_config(self._last_preview_virt)
-		cfg.id = self.tail_mark
-		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, cfg)
 		self.is_collapsed = true
+		self:_clear_images()
+		self:replace_output_lines({ "Output collapsed..." })
 	end
 
 	function Block:expand_output()
 		if not self.output then
 			return
 		end
-		self:attach_output()
 		self.is_collapsed = false
+		self:_render_output_lines()
 	end
 
 	function Block:toggle_collapse_output()
@@ -369,48 +342,31 @@ function M.extend(Block)
 
 	function Block:set_running()
 		self.output = nil
+		self.is_collapsed = false
+		self.showing_full_output = true
 		self:_clear_images()
-		self._last_preview_virt = { { { "Running…", "Comment" } } }
-		self:_ensure_tail_anchor()
-		local cfg = output_config(self._last_preview_virt)
-		cfg.id = self.tail_mark
-		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, cfg)
+		self:replace_output_lines({ "Running…" })
 	end
 
 	function Block:set_killed()
 		self.output = nil
+		self.is_collapsed = false
+		self.showing_full_output = true
 		self:_clear_images()
-		self._last_preview_virt = { { { "󱚢 Killed cell", "Comment" } } }
-		self:_ensure_tail_anchor()
-		local cfg = output_config(self._last_preview_virt)
-		cfg.id = self.tail_mark
-		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, cfg)
+		self:replace_output_lines({ "󱚢 Killed cell" })
 	end
 
 	function Block:clear_output()
-		self:_clear_images()
-		self._last_preview_virt = nil
 		self.output = nil
-		if self.tail_mark then
-			pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, {
-				id = self.tail_mark,
-				virt_lines = {},
-				virt_lines_above = false,
-				hl_mode = "combine",
-				right_gravity = false,
-			})
-		end
+		self.is_collapsed = false
+		self.showing_full_output = true
+		self:_clear_images()
+		self:replace_output_lines({})
 	end
 
-	-- augment sync_decorations to also re-apply preview virt lines
 	local old_sync = Block.sync_decorations
 	Block.sync_decorations = function(self)
 		old_sync(self)
-		if self._last_preview_virt then
-			local cfg = output_config(self._last_preview_virt)
-			cfg.id = self.tail_mark
-			pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.preview, self:_tail_row(), 0, cfg)
-		end
 	end
 
 	-- ensure images/temp files are removed on destroy
