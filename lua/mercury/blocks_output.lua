@@ -329,6 +329,9 @@ function M.extend(Block)
 		self.is_collapsed = true
 		self:_clear_images()
 		self:replace_output_lines({ "Output collapsed..." })
+		if self.sync_decorations then
+			self:sync_decorations()
+		end
 	end
 
 	function Block:expand_output()
@@ -353,6 +356,9 @@ function M.extend(Block)
 		self.showing_full_output = true
 		self:_clear_images()
 		self:replace_output_lines({ "Running…" })
+		if self.sync_decorations then
+			self:sync_decorations()
+		end
 	end
 
 	function Block:set_killed()
@@ -361,6 +367,9 @@ function M.extend(Block)
 		self.showing_full_output = true
 		self:_clear_images()
 		self:replace_output_lines({ "󱚢 Killed cell" })
+		if self.sync_decorations then
+			self:sync_decorations()
+		end
 	end
 
 	function Block:clear_output()
@@ -369,6 +378,9 @@ function M.extend(Block)
 		self.showing_full_output = true
 		self:_clear_images()
 		self:replace_output_lines({})
+		if self.sync_decorations then
+			self:sync_decorations()
+		end
 	end
 
 	local old_sync = Block.sync_decorations
