@@ -60,7 +60,8 @@ function Block.new(buf, start_row, end_row, id, type_, header_text)
 
 	self:show_header_virtual()
 	self:set_highlight(
-		(self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
+		(self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock",
+		"NotebookOutputBlock"
 	)
 
 	return self
@@ -205,42 +206,69 @@ function Block:set_type(new_t)
 	self.header_text = (new_t == "markdown") and "# %% [markdown]" or "# %%"
 	self:show_header_virtual()
 	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
-	self:set_highlight(group)
+	self:set_highlight(group, "NotebookOutputBlock")
 end
 
 -- Background highlight over block input rows
-function Block:set_highlight(group)
-	local s, e = self:input_range()
-	local count = math.max(e - s, 1)
-	self._bg = self._bg or { group = nil, s = nil, e = nil, marks = {} }
-	local st = self._bg
+function Block:set_highlight(input_group, output_group)
+	local in_s, in_e = self:input_range()
+	local out_s, out_e = self:output_range()
 
-	if st.group == group and st.s == s and st.e == e then
-		return
-	end
+	output_group = output_group or input_group
 
-	local have = #st.marks
-
-	for i = 1, count do
-		local row = s + (i - 1)
-		local id = st.marks[i]
-		st.marks[i] = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
-			id = id,
-			line_hl_group = group,
-			hl_mode = "combine",
-			priority = 10,
-		})
-	end
-
-	for j = have, count + 1, -1 do
-		local id = st.marks[j]
-		if id then
-			pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+	self._bg = self._bg
+		or {
+			input = { group = nil, s = nil, e = nil, marks = {} },
+			output = { group = nil, s = nil, e = nil, marks = {} },
+		}
+	local function apply(st, group, s, e)
+		if not group or not s or not e then
+			return
 		end
-		st.marks[j] = nil
+		local count = math.max(e - s, 1)
+
+		if st.group == group and st.s == s and st.e == e then
+			return
+		end
+
+		local have = #st.marks
+
+		for i = 1, count do
+			local row = s + (i - 1)
+			local id = st.marks[i]
+			st.marks[i] = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
+				id = id,
+				line_hl_group = group,
+				hl_mode = "combine",
+				priority = 10,
+			})
+		end
+
+		for j = have, count + 1, -1 do
+			local id = st.marks[j]
+			if id then
+				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+			end
+			st.marks[j] = nil
+		end
+
+		st.group, st.s, st.e = group, s, e
 	end
 
-	st.group, st.s, st.e = group, s, e
+	apply(self._bg.input, input_group, in_s, in_e)
+
+	if out_e > out_s then
+		apply(self._bg.output, output_group, out_s, out_e)
+	else
+		local st = self._bg.output
+		if st and st.marks then
+			for _, id in ipairs(st.marks) do
+				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+			end
+			st.marks = {}
+		end
+		st.group, st.s, st.e = nil, nil, nil
+	end
 end
 
 function Block:sync_decorations()
@@ -252,8 +280,8 @@ function Block:sync_decorations()
 		pcall(vim.api.nvim_buf_set_extmark, self.buf, Names.headers, s, 0, cfg)
 	end
 
-	local group = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
-	self:set_highlight(group)
+	local group_in = (self.type == "markdown") and "NotebookMarkdownBlock" or "NotebookPythonBlock"
+	self:set_highlight(group_in, "NotebookOutputBlock")
 end
 
 function Block:destroy()
@@ -262,10 +290,17 @@ function Block:destroy()
 	if self.header_virt_mark then
 		pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.headers, self.header_virt_mark)
 	end
-	if self._bg and self._bg.marks then
-		for _, id in ipairs(self._bg.marks) do
-			pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+	if self._bg then
+		local function clear(st)
+			if not st or not st.marks then
+				return
+			end
+			for _, id in ipairs(st.marks) do
+				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+			end
 		end
+		clear(self._bg.input)
+		clear(self._bg.output)
 	end
 	self._bg = nil
 end

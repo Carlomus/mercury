@@ -4,6 +4,7 @@ local BG = {}
 local OPTS = {
 	python_hl = "NotebookPythonBlock",
 	markdown_hl = "NotebookMarkdownBlock",
+	output_hl = "NotebookOutputBlock",
 }
 
 local function ensure_default_hls()
@@ -15,6 +16,7 @@ local function ensure_default_hls()
 	end
 	ensure(OPTS.python_hl, "#253340")
 	ensure(OPTS.markdown_hl, "#3a2b3a")
+	ensure(OPTS.output_hl, "#2e2620")
 end
 
 function BG.highlight(buf)

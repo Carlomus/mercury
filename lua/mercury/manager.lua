@@ -122,24 +122,24 @@ function M.sanitize_headers(buf)
 		return
 	end
 
-	local dels = {}
-	local reg = S.registry
-	for _, id in ipairs(order_as_list(S)) do
-		local b = reg.by_id[id]
-		if b then
-			local s_in, _ = b:input_range()
-			local line = Util.getline(buf, s_in)
-			if Util.is_py_cell_start(line) then
-				dels[#dels + 1] = s_in
-			end
+	-- Find all header lines (# %% / # %% [markdown] etc.)
+	local headers = {}
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	for i, line in ipairs(lines) do
+		if Util.is_py_cell_start(line) then
+			headers[#headers + 1] = i - 1 -- 0-based row
 		end
 	end
 
-	table.sort(dels, function(a, b2)
-		return a > b2
+	if #headers == 0 then
+		return
+	end
+
+	table.sort(headers, function(a, b)
+		return a > b
 	end)
 
-	for _, row in ipairs(dels) do
+	for _, row in ipairs(headers) do
 		pcall(vim.api.nvim_buf_set_lines, buf, row, row + 1, false, {})
 	end
 

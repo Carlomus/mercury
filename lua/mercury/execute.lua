@@ -355,10 +355,10 @@ local function send_block(b)
 		return
 	end
 
-	b:set_running()
-
 	local code = table.concat(b:text(), "\n")
 	local payload = { type = "execute", cell_id = b.id, code = code }
+
+	b:set_running()
 
 	if #S.capture > 0 then
 		table.insert(S.pending, { block_id = b.id, payload = payload })
