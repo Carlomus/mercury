@@ -392,6 +392,33 @@ function M.reflow_all(buf)
 		end
 	end
 
+	-- Enforce at least one blank line between consecutive blocks ("islands of safety").
+	do
+		local reg = S.registry
+		local order = order_as_list(S)
+		for idx = 1, #order - 1 do
+			local id = order[idx]
+			local next_id = order[idx + 1]
+			local b = reg.by_id[id]
+			local nb = reg.by_id[next_id]
+			if b and nb then
+				local _, b_end = b:range()
+				local nb_start, _ = nb:range()
+				-- b:range() / nb:range() are [s, e), so gap is nb_start - b_end.
+				if nb_start - b_end < 1 then
+					-- Insert a blank line before the next block and re-run reflow once.
+					vim.api.nvim_buf_set_lines(S.buf, nb_start, nb_start, false, { "" })
+					vim.schedule(function()
+						if vim.api.nvim_buf_is_valid(S.buf) then
+							M.reflow_all(S.buf)
+						end
+					end)
+					return
+				end
+			end
+		end
+	end
+
 	for _, it in ipairs(items) do
 		local b = S.registry.by_id[it.id]
 		if b and b.sync_decorations then
@@ -446,7 +473,7 @@ function M.new_block_below_from(b)
 	local S = ensure_state(b.buf)
 	local _, e_full = b:range()
 
-	insert_blank_lines_at(S, e_full, 3)
+	insert_blank_lines_at(S, e_full, 2)
 
 	local nid = Util.new_ID()
 	local nb = Block.new(S.buf, e_full + 1, e_full + 2, nid, "python", "# %%")
@@ -468,7 +495,7 @@ function M.new_block_below(buf)
 	end
 	local _, e_full = b:range()
 
-	insert_blank_lines_at(S, e_full, 3)
+	insert_blank_lines_at(S, e_full, 2)
 
 	local nid = Util.new_ID()
 	local nb = Block.new(S.buf, e_full + 1, e_full + 2, nid, "python", "# %%")

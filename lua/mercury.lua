@@ -4,6 +4,7 @@ local Auto = require("mercury.autocommands")
 local Run = require("mercury.execute")
 local Kern = require("mercury.kernels")
 local OutGuard = require("mercury.output_guard")
+local InputGuard = require("mercury.input_guard")
 
 local M = {}
 
@@ -13,6 +14,7 @@ function M.setup(opts)
 	Run.setup(opts)
 	Bg.setup(opts)
 	OutGuard.setup()
+	InputGuard.setup()
 
 	require("mercury.debug").setup_commands()
 

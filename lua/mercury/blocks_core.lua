@@ -8,7 +8,8 @@ local function input_mark_cfg(row)
 		end_row = row,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = false,
+		-- When inserting at the end of the input region, let the end move down
+		end_right_gravity = true,
 	}
 end
 
@@ -16,7 +17,8 @@ local function output_mark_cfg(row)
 	return {
 		end_row = row,
 		end_col = 0,
-		right_gravity = false,
+		-- Output extmarks should move down when text is inserted before them
+		right_gravity = true,
 		end_right_gravity = true,
 	}
 end
@@ -132,7 +134,9 @@ end
 function Block:set_input_span(new_s, new_e)
 	local n = vim.api.nvim_buf_line_count(self.buf)
 
-	new_s = math.max(0, math.min(new_s or 0, n))
+	-- Clamp start to [0, n-1] so that new_s + 1 is always <= n
+	new_s = math.max(0, math.min(new_s or 0, math.max(n - 1, 0)))
+	-- end must be within [new_s+1, n]
 	new_e = math.max(new_s + 1, math.min(new_e or (new_s + 1), n))
 
 	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, new_s, 0, {
@@ -140,7 +144,7 @@ function Block:set_input_span(new_s, new_e)
 		end_row = new_e,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = false,
+		end_right_gravity = true,
 	})
 
 	local out_s, out_e = self:output_range()
@@ -218,7 +222,6 @@ function Block:set_highlight(input_group, output_group)
 			output = { group = nil, s = nil, e = nil, marks = {} },
 		}
 
-	-- Helper: clear all extmarks in Names.block_cols that we track in st.marks
 	local function clear_marks(st)
 		if not st or not st.marks then
 			return
@@ -229,12 +232,10 @@ function Block:set_highlight(input_group, output_group)
 			end
 		end
 		st.marks = {}
-		st.group, st.s, st.e = nil, nil, nil
 	end
 
 	-- Helper: re-create marks for [s, e) with full-line highlight
-	local function apply(st, group, s, e, hl_mode, priority)
-		-- No highlight group or invalid range -> just clear
+	local function apply(st, group, s, e, hl_mode)
 		if not group or not s or not e or e <= s then
 			clear_marks(st)
 			return
@@ -243,14 +244,11 @@ function Block:set_highlight(input_group, output_group)
 		clear_marks(st)
 		st.marks = {}
 
-		hl_mode = hl_mode or "combine"
-		priority = priority or 10
-
 		for row = s, e - 1 do
 			local id = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
 				line_hl_group = group,
-				hl_mode = hl_mode,
-				priority = priority,
+				hl_mode = hl_mode or "combine",
+				priority = 50,
 			})
 			table.insert(st.marks, id)
 		end
@@ -258,12 +256,12 @@ function Block:set_highlight(input_group, output_group)
 		st.group, st.s, st.e = group, s, e
 	end
 
-	-- Input region: highlight but still allow TS/LSP colours
-	apply(self._bg.input, input_group, in_s, in_e, "combine", 10)
+	-- Input region: combine with syntax highlighting
+	apply(self._bg.input, input_group, in_s, in_e, "combine")
 
-	-- Output region: override syntax/LSP/diagnostics completely
+	-- Output region (only if non-empty): replace syntax/diagnostics with plain output bg
 	if out_e > out_s then
-		apply(self._bg.output, output_group, out_s, out_e, "replace", 20)
+		apply(self._bg.output, output_group, out_s, out_e, "replace")
 	else
 		clear_marks(self._bg.output)
 	end

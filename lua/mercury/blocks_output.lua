@@ -228,9 +228,9 @@ function M.extend(Block)
 					window = win,
 					buffer = self.buf,
 					inline = true,
-					with_virtual_padding = false,
-					x = 0,
-					y = row,
+					-- Reserve virtual space so images don't overlap text or each other
+					with_virtual_padding = true,
+					row = row,
 					width = math.floor(0.9 * win_w),
 				})
 				if img and img.render then
