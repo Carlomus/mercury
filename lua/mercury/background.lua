@@ -26,9 +26,10 @@ function BG.highlight(buf)
 		local block = reg.by_id[id]
 		if block then
 			local t = block.type or "python"
-			local group = (t == "markdown") and OPTS.markdown_hl or OPTS.python_hl
+			local in_group = (t == "markdown") and OPTS.markdown_hl or OPTS.python_hl
+			local out_group = OPTS.output_hl
 			if block.set_highlight then
-				block:set_highlight(group)
+				block:set_highlight(in_group, out_group)
 			end
 		end
 	end

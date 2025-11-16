@@ -5,6 +5,8 @@ local Run = require("mercury.execute")
 local Kern = require("mercury.kernels")
 local OutGuard = require("mercury.output_guard")
 
+require("mercury.debug")
+
 local M = {}
 
 function M.setup(opts)

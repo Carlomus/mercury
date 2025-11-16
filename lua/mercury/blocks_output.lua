@@ -246,6 +246,9 @@ function M.extend(Block)
 
 		if not self.output or not self.output.items then
 			self:replace_output_lines({})
+			if self.sync_decorations then
+				self:sync_decorations()
+			end
 			return
 		end
 
@@ -256,7 +259,7 @@ function M.extend(Block)
 
 		local max_preview = self.output.max_preview_lines
 		if max_preview and not self.showing_full_output then
-			local limit = max_preview + 1 -- header + N lines
+			local limit = max_preview + 1
 			if #lines > limit then
 				hidden = #lines - limit
 				lines = {}
@@ -277,6 +280,10 @@ function M.extend(Block)
 		end
 
 		self:replace_output_lines(lines)
+
+		if self.sync_decorations then
+			self:sync_decorations()
+		end
 
 		if #used_anchors > 0 then
 			local out_s, _ = self:output_range()

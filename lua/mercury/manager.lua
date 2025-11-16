@@ -264,10 +264,11 @@ local function compute_headers(buf)
 end
 
 local function pairs_from_headers(buf, headers)
-	local pairs_, n = {}, vim.api.nvim_buf_line_count(buf) - 1
+	local pairs_ = {}
+	local n = vim.api.nvim_buf_line_count(buf) -- end-exclusive top
 	for i, h in ipairs(headers) do
 		local content_start = h.header_row + 1
-		local e = (i < #headers) and (headers[i + 1].header_row - 1) or n
+		local e = (i < #headers) and headers[i + 1].header_row or n
 		pairs_[#pairs_ + 1] = {
 			s = content_start,
 			e = e,
