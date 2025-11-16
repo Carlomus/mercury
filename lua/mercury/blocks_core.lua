@@ -17,7 +17,7 @@ local function output_mark_cfg(row)
 		end_row = row,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = true,
+		end_right_gravity = false,
 	}
 end
 
@@ -133,7 +133,6 @@ function Block:set_input_span(new_s, new_e)
 	local n = vim.api.nvim_buf_line_count(self.buf)
 
 	new_s = math.max(0, math.min(new_s or 0, n))
-
 	new_e = math.max(new_s + 1, math.min(new_e or (new_s + 1), n))
 
 	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, new_s, 0, {
@@ -147,13 +146,9 @@ function Block:set_input_span(new_s, new_e)
 	local out_s, out_e = self:output_range()
 	if out_s == out_e then
 		local row = new_e
-		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, row, 0, {
-			id = self.output_mark,
-			end_row = row,
-			end_col = 0,
-			right_gravity = false,
-			end_right_gravity = true,
-		})
+		local cfg = output_mark_cfg(row)
+		cfg.id = self.output_mark
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, row, 0, cfg)
 	end
 
 	self:sync_decorations()
@@ -167,7 +162,7 @@ end
 function Block:replace_output_lines(lines)
 	lines = lines or {}
 
-	local in_s, in_e = self:input_range()
+	local _, in_e = self:input_range()
 	local out_s, out_e = self:output_range()
 
 	if out_e > out_s then
@@ -182,21 +177,14 @@ function Block:replace_output_lines(lines)
 	if #lines > 0 then
 		vim.api.nvim_buf_set_lines(self.buf, insert_at, insert_at, false, lines)
 		local new_e = insert_at + #lines
-		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, {
-			id = self.output_mark,
-			end_row = new_e,
-			end_col = 0,
-			right_gravity = false,
-			end_right_gravity = true,
-		})
+		local cfg = output_mark_cfg(insert_at)
+		cfg.id = self.output_mark
+		cfg.end_row = new_e
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, cfg)
 	else
-		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, {
-			id = self.output_mark,
-			end_row = insert_at,
-			end_col = 0,
-			right_gravity = false,
-			end_right_gravity = true,
-		})
+		local cfg = output_mark_cfg(insert_at)
+		cfg.id = self.output_mark
+		vim.api.nvim_buf_set_extmark(self.buf, Names.blocks_output, insert_at, 0, cfg)
 	end
 end
 
@@ -218,7 +206,7 @@ function Block:set_type(new_t)
 	self:set_highlight(group, "NotebookOutputBlock")
 end
 
--- Background highlight over block input rows
+-- Background highlight over block input/output rows
 function Block:set_highlight(input_group, output_group)
 	local in_s, in_e = self:input_range()
 	local out_s, out_e = self:output_range()
