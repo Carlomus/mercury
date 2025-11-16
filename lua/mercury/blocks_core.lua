@@ -206,7 +206,6 @@ function Block:set_type(new_t)
 	self:set_highlight(group, "NotebookOutputBlock")
 end
 
--- Background highlight over block input/output rows
 function Block:set_highlight(input_group, output_group)
 	local in_s, in_e = self:input_range()
 	local out_s, out_e = self:output_range()
@@ -218,55 +217,54 @@ function Block:set_highlight(input_group, output_group)
 			input = { group = nil, s = nil, e = nil, marks = {} },
 			output = { group = nil, s = nil, e = nil, marks = {} },
 		}
+
+	-- Helper: clear all extmarks in Names.block_cols that we track in st.marks
+	local function clear_marks(st)
+		if not st or not st.marks then
+			return
+		end
+		for _, id in ipairs(st.marks) do
+			if id then
+				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
+			end
+		end
+		st.marks = {}
+		st.group, st.s, st.e = nil, nil, nil
+	end
+
+	-- Helper: re-create marks for [s, e) with full-line highlight
 	local function apply(st, group, s, e)
-		if not group or s == nil or e == nil then
-			return
-		end
-		local count = math.max(e - s, 1)
-
-		if st.group == group and st.s == s and st.e == e then
+		-- No highlight group or invalid range -> just clear
+		if not group or not s or not e or e <= s then
+			clear_marks(st)
 			return
 		end
 
-		local have = #st.marks
+		-- Fully rebuild for simplicity and correctness.
+		clear_marks(st)
 
-		for i = 1, count do
-			local row = s + (i - 1)
-			local id = st.marks[i]
-			st.marks[i] = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
-				id = id,
+		st.marks = {}
+
+		for row = s, e - 1 do
+			local id = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
 				line_hl_group = group,
 				hl_mode = "combine",
 				priority = 10,
 			})
-		end
-
-		for j = have, count + 1, -1 do
-			local id = st.marks[j]
-			if id then
-				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
-			end
-			st.marks[j] = nil
+			table.insert(st.marks, id)
 		end
 
 		st.group, st.s, st.e = group, s, e
 	end
 
+	-- Input region
 	apply(self._bg.input, input_group, in_s, in_e)
 
+	-- Output region (only if non-empty)
 	if out_e > out_s then
 		apply(self._bg.output, output_group, out_s, out_e)
 	else
-		local st = self._bg.output
-		if st and st.marks then
-			for _, id in ipairs(st.marks) do
-				pcall(vim.api.nvim_buf_del_extmark, self.buf, Names.block_cols, id)
-			end
-			st.marks = {}
-		end
-		if st then
-			st.group, st.s, st.e = nil, nil, nil
-		end
+		clear_marks(self._bg.output)
 	end
 end
 
