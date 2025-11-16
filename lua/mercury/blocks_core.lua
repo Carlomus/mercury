@@ -8,7 +8,7 @@ local function input_mark_cfg(row)
 		end_row = row,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = true,
+		end_right_gravity = false,
 	}
 end
 
@@ -33,6 +33,9 @@ end
 function Block.new(buf, start_row, end_row, id, type_, header_text)
 	if end_row < start_row then
 		end_row = start_row
+	end
+	if end_row < start_row + 1 then
+		end_row = start_row + 1
 	end
 
 	-- INPUT region extmark
@@ -138,7 +141,7 @@ function Block:set_input_span(new_s, new_e)
 		end_row = new_e,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = true,
+		end_right_gravity = false,
 	})
 
 	local out_s, out_e = self:output_range()
