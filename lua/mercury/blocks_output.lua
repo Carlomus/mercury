@@ -117,7 +117,7 @@ function M.extend(Block)
 
 	-- wrap constructor to initialize output fields
 	local old_new = Block.new
-	Block.new = function(buf, start_row, end_row, id, type_, output_, header_text)
+	Block.new = function(buf, start_row, end_row, id, type_, header_text, output_)
 		local self = old_new(buf, start_row, end_row, id, type_, header_text)
 
 		-- output state

@@ -170,9 +170,11 @@ function Block:replace_output_lines(lines)
 	local in_s, in_e = self:input_range()
 	local out_s, out_e = self:output_range()
 
-	if out_e > out_s and out_e > in_e then
+	if out_e > out_s then
 		local del_s = math.max(out_s, in_e)
-		vim.api.nvim_buf_set_lines(self.buf, del_s, out_e, false, {})
+		if del_s < out_e then
+			vim.api.nvim_buf_set_lines(self.buf, del_s, out_e, false, {})
+		end
 	end
 
 	local insert_at = in_e
