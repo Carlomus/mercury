@@ -5,8 +5,6 @@ local Run = require("mercury.execute")
 local Kern = require("mercury.kernels")
 local OutGuard = require("mercury.output_guard")
 
-require("mercury.debug")
-
 local M = {}
 
 function M.setup(opts)
@@ -15,6 +13,8 @@ function M.setup(opts)
 	Run.setup(opts)
 	Bg.setup(opts)
 	OutGuard.setup()
+
+	require("mercury.debug").setup_commands()
 
 	vim.api.nvim_create_autocmd("User", {
 		pattern = "NotebookBlocksChanged",

@@ -128,8 +128,10 @@ end
 
 function Block:set_input_span(new_s, new_e)
 	local n = vim.api.nvim_buf_line_count(self.buf)
+
 	new_s = math.max(0, math.min(new_s or 0, n))
-	new_e = math.max(new_s, math.min(new_e or new_s, n))
+
+	new_e = math.max(new_s + 1, math.min(new_e or (new_s + 1), n))
 
 	vim.api.nvim_buf_set_extmark(self.buf, Names.blocks, new_s, 0, {
 		id = self.input_mark,
@@ -139,7 +141,6 @@ function Block:set_input_span(new_s, new_e)
 		end_right_gravity = true,
 	})
 
-	-- If output is empty, keep it immediately after input
 	local out_s, out_e = self:output_range()
 	if out_s == out_e then
 		local row = new_e
@@ -160,15 +161,18 @@ function Block:set_end_row(e_excl)
 	self:set_input_span(s, e_excl)
 end
 
--- Replace output region in the buffer with fresh lines
 function Block:replace_output_lines(lines)
 	lines = lines or {}
-	local out_s, out_e = self:output_range()
-	local insert_at = out_s
 
-	if out_e > out_s then
-		vim.api.nvim_buf_set_lines(self.buf, out_s, out_e, false, {})
+	local in_s, in_e = self:input_range()
+	local out_s, out_e = self:output_range()
+
+	if out_e > out_s and out_e > in_e then
+		local del_s = math.max(out_s, in_e)
+		vim.api.nvim_buf_set_lines(self.buf, del_s, out_e, false, {})
 	end
+
+	local insert_at = in_e
 
 	if #lines > 0 then
 		vim.api.nvim_buf_set_lines(self.buf, insert_at, insert_at, false, lines)
