@@ -16,7 +16,18 @@ local function ensure_default_hls()
 	end
 	ensure(OPTS.python_hl, "#253340")
 	ensure(OPTS.markdown_hl, "#3a2b3a")
-	ensure(OPTS.output_hl, "#2e2620")
+
+	local ok_norm, normal = pcall(vim.api.nvim_get_hl, 0, { name = "Normal", link = false })
+	local normal_fg = (ok_norm and normal and normal.fg) or nil
+
+	local ok_out, out_hl = pcall(vim.api.nvim_get_hl, 0, { name = OPTS.output_hl, link = false })
+	local new = out_hl or {}
+	new.bg = new.bg or "#2e2620"
+	if normal_fg and not new.fg then
+		new.fg = normal_fg
+	end
+
+	vim.api.nvim_set_hl(0, OPTS.output_hl, new)
 end
 
 function BG.highlight(buf)

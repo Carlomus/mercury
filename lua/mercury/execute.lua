@@ -355,7 +355,20 @@ local function send_block(b)
 		return
 	end
 
-	local code = table.concat(b:text(), "\n")
+	local s, e = b:input_range()
+	if e <= s then
+		e = s + 1
+		b:set_input_span(s, e)
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(buf, s, e, false)
+	local code
+	if #lines == 0 then
+		code = ""
+	else
+		code = table.concat(lines, "\n")
+	end
+
 	local payload = { type = "execute", cell_id = b.id, code = code }
 
 	b:set_running()

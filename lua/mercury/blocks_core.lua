@@ -233,23 +233,24 @@ function Block:set_highlight(input_group, output_group)
 	end
 
 	-- Helper: re-create marks for [s, e) with full-line highlight
-	local function apply(st, group, s, e)
+	local function apply(st, group, s, e, hl_mode, priority)
 		-- No highlight group or invalid range -> just clear
 		if not group or not s or not e or e <= s then
 			clear_marks(st)
 			return
 		end
 
-		-- Fully rebuild for simplicity and correctness.
 		clear_marks(st)
-
 		st.marks = {}
+
+		hl_mode = hl_mode or "combine"
+		priority = priority or 10
 
 		for row = s, e - 1 do
 			local id = vim.api.nvim_buf_set_extmark(self.buf, Names.block_cols, row, 0, {
 				line_hl_group = group,
-				hl_mode = "combine",
-				priority = 10,
+				hl_mode = hl_mode,
+				priority = priority,
 			})
 			table.insert(st.marks, id)
 		end
@@ -257,12 +258,12 @@ function Block:set_highlight(input_group, output_group)
 		st.group, st.s, st.e = group, s, e
 	end
 
-	-- Input region
-	apply(self._bg.input, input_group, in_s, in_e)
+	-- Input region: highlight but still allow TS/LSP colours
+	apply(self._bg.input, input_group, in_s, in_e, "combine", 10)
 
-	-- Output region (only if non-empty)
+	-- Output region: override syntax/LSP/diagnostics completely
 	if out_e > out_s then
-		apply(self._bg.output, output_group, out_s, out_e)
+		apply(self._bg.output, output_group, out_s, out_e, "replace", 20)
 	else
 		clear_marks(self._bg.output)
 	end

@@ -130,17 +130,14 @@ function M.sanitize_headers(buf)
 			headers[#headers + 1] = i - 1 -- 0-based row
 		end
 	end
+	if #headers > 0 then
+		table.sort(headers, function(a, b)
+			return a > b
+		end)
 
-	if #headers == 0 then
-		return
-	end
-
-	table.sort(headers, function(a, b)
-		return a > b
-	end)
-
-	for _, row in ipairs(headers) do
-		pcall(vim.api.nvim_buf_set_lines, buf, row, row + 1, false, {})
+		for _, row in ipairs(headers) do
+			pcall(vim.api.nvim_buf_set_lines, buf, row, row + 1, false, {})
+		end
 	end
 
 	M.reflow_all(buf)
@@ -449,7 +446,7 @@ function M.new_block_below_from(b)
 	local S = ensure_state(b.buf)
 	local _, e_full = b:range()
 
-	insert_blank_lines_at(S, e_full, 2)
+	insert_blank_lines_at(S, e_full, 3)
 
 	local nid = Util.new_ID()
 	local nb = Block.new(S.buf, e_full + 1, e_full + 2, nid, "python", "# %%")
@@ -471,7 +468,7 @@ function M.new_block_below(buf)
 	end
 	local _, e_full = b:range()
 
-	insert_blank_lines_at(S, e_full, 2)
+	insert_blank_lines_at(S, e_full, 3)
 
 	local nid = Util.new_ID()
 	local nb = Block.new(S.buf, e_full + 1, e_full + 2, nid, "python", "# %%")
