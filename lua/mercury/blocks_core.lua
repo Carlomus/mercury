@@ -17,7 +17,7 @@ local function output_mark_cfg(row)
 		end_row = row,
 		end_col = 0,
 		right_gravity = false,
-		end_right_gravity = false,
+		end_right_gravity = true,
 	}
 end
 
@@ -219,7 +219,7 @@ function Block:set_highlight(input_group, output_group)
 			output = { group = nil, s = nil, e = nil, marks = {} },
 		}
 	local function apply(st, group, s, e)
-		if not group or not s or not e then
+		if not group or s == nil or e == nil then
 			return
 		end
 		local count = math.max(e - s, 1)
@@ -264,7 +264,9 @@ function Block:set_highlight(input_group, output_group)
 			end
 			st.marks = {}
 		end
-		st.group, st.s, st.e = nil, nil, nil
+		if st then
+			st.group, st.s, st.e = nil, nil, nil
+		end
 	end
 end
 
