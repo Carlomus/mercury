@@ -1,0 +1,550 @@
+local Cfg = require("mercury.config")
+local Ipynb = require("mercury.ipynb")
+local Notebook = require("mercury.notebook")
+local UI = require("mercury.ui")
+local Kernel = require("mercury.kernel")
+local Output = require("mercury.output")
+local Util = require("mercury.util")
+
+local M = {}
+
+-- foldexpr: each cell folds at its `# %%` separator line.
+function M.foldexpr(lnum)
+  lnum = lnum or vim.v.lnum
+  local line = vim.fn.getline(lnum)
+  if line:match("^#%s*%%%%") then return ">1" end
+  return "1"
+end
+
+local WO_KEYS = { "foldmethod", "foldexpr", "foldtext", "conceallevel", "concealcursor" }
+
+local function setup_folding(buf)
+  -- Save and restore window-local opts so leaving the notebook in the same
+  -- window doesn't leak foldexpr/conceal to the next buffer.
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "BufEnter" }, {
+    buffer = buf,
+    callback = function()
+      if vim.w._mercury_saved_wo == nil then
+        local saved = {}
+        for _, k in ipairs(WO_KEYS) do saved[k] = vim.wo[k] end
+        vim.w._mercury_saved_wo = saved
+      end
+      vim.wo.foldmethod = "expr"
+      vim.wo.foldexpr = "v:lua.require('mercury').foldexpr(v:lnum)"
+      vim.wo.foldtext = "v:lua.require('mercury').foldtext()"
+      vim.wo.conceallevel = 2
+      vim.wo.concealcursor = ""
+    end,
+  })
+  local function restore()
+    local saved = vim.w._mercury_saved_wo
+    if not saved then return end
+    for _, k in ipairs(WO_KEYS) do vim.wo[k] = saved[k] end
+    vim.w._mercury_saved_wo = nil
+  end
+  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, callback = restore })
+  -- BufLeave doesn't fire on :bd / :bw, so a window left holding a wiped
+  -- mercury buffer would keep mercury's foldexpr / conceallevel applied to
+  -- whatever buffer nvim swapped in. Restore on wipeout too. We use a
+  -- different group so the per-buffer BufWipeout in attach_buffer (which
+  -- detaches the notebook) can keep its callback.
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    callback = function()
+      -- Restore opts in EVERY window that's currently saved — there may be
+      -- more than one if the user had the notebook open in splits.
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) then
+          local saved = pcall(vim.api.nvim_win_get_var, win, "_mercury_saved_wo")
+          if saved then
+            local ok, wo = pcall(vim.api.nvim_win_get_var, win, "_mercury_saved_wo")
+            if ok and type(wo) == "table" then
+              for _, k in ipairs(WO_KEYS) do
+                pcall(function() vim.wo[win][k] = wo[k] end)
+              end
+              pcall(vim.api.nvim_win_del_var, win, "_mercury_saved_wo")
+            end
+          end
+        end
+      end
+    end,
+  })
+end
+
+function M.foldtext()
+  local first = vim.fn.getline(vim.v.foldstart)
+  local lines = vim.v.foldend - vim.v.foldstart + 1
+  return ("%s  ── %d lines"):format(first, lines)
+end
+
+local function attach_buffer(buf, opts)
+  opts = opts or {}
+  local nb = Notebook.attach(buf, opts)
+  local renderer = UI.new(nb)
+  nb:set_renderer(renderer)
+  local kernel_opts = (opts.config and opts.config.kernel) or Cfg.get().kernel
+  local kernel = Kernel.new(nb, {
+    kernel = kernel_opts,
+    on_change = function() vim.schedule(function() renderer:render() end) end,
+  })
+  nb:set_kernel(kernel)
+  nb._on_change = function() renderer:render() end
+
+  nb:rescan()
+  renderer:render()
+
+  -- Pre-warm the bridge so the first Shift-Enter doesn't pay the startup cost.
+  if kernel_opts and kernel_opts.eager then
+    vim.schedule(function() pcall(function() kernel:_ensure_started() end) end)
+  end
+
+  local debounced = Util.debounce(30, function()
+    if not vim.api.nvim_buf_is_loaded(buf) then return end
+    if nb._suppress_rescan then return end
+    nb:rescan()
+    renderer:render()
+  end)
+
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
+    buffer = buf,
+    callback = function()
+      if nb._suppress_rescan then return end
+      debounced()
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    callback = function() Notebook.detach(buf) end,
+  })
+
+  -- image.nvim's render path requires a window currently showing the buffer.
+  -- Without this, images disappear when the buffer is hidden and don't come
+  -- back when it's revealed in another window. Re-rendering on BufWinEnter
+  -- is idempotent — text decorations are skipped if nothing changed, and
+  -- image handles are looked up by content hash in the cache.
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    buffer = buf,
+    callback = function()
+      if vim.api.nvim_buf_is_loaded(buf) then renderer:render() end
+    end,
+  })
+
+  M._setup_buffer_keymaps(buf)
+  setup_folding(buf)
+
+  -- Let users hook into post-attach setup (statusline refresh, lazy keymaps,
+  -- per-buffer LSP wiring, etc.) without monkey-patching Mercury.
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_exec_autocmds, "User",
+        { pattern = "MercuryAttached", modeline = false,
+          data = { buf = buf } })
+    end
+  end)
+
+  return nb
+end
+
+M._attach_buffer = attach_buffer
+
+local function blank_notebook()
+  return {
+    meta = {
+      kernelspec = { name = "python3", display_name = "Python 3", language = "python" },
+      language_info = { name = "python" },
+    },
+    nbformat = 4,
+    nbformat_minor = 5,
+    cells = {
+      { id = Util.short_id(), kind = "code", source = {}, outputs = {}, metadata = {} },
+    },
+  }
+end
+
+local function decode_ipynb_or_blank(path)
+  local data = Util.read_file(path)
+  if not data or data:gsub("%s", "") == "" then
+    return blank_notebook(), true   -- fresh: file missing or empty
+  end
+  local nb = Ipynb.decode(data)
+  if not nb or not nb.cells or #nb.cells == 0 then
+    -- Existing file is unreadable; bail out so we don't clobber it.
+    if nb and nb.cells then
+      return blank_notebook(), true
+    end
+    return nil, false
+  end
+  return nb, false
+end
+
+local function load_ipynb(buf, path)
+  local doc, fresh = decode_ipynb_or_blank(path)
+  if not doc then
+    -- Parsing failed: show the raw bytes readonly so the user can diagnose
+    -- without us clobbering their file.
+    local raw = Util.read_file(path) or ""
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(raw, "\n", { plain = true }))
+    vim.api.nvim_buf_set_name(buf, path)
+    vim.bo[buf].modified = false
+    vim.bo[buf].modifiable = false
+    vim.notify("[mercury] could not parse " .. path
+      .. " (showing raw bytes readonly; fix or remove the file)",
+      vim.log.levels.ERROR)
+    return false
+  end
+  local lines = Ipynb.to_buffer_lines(doc)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].buftype = "acwrite"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "python"
+  vim.bo[buf].modified = fresh   -- mark dirty so :w persists the new file
+  vim.api.nvim_buf_set_name(buf, path)
+
+  -- Record the on-disk mtime so :w can detect external modifications and
+  -- refuse to clobber them without an explicit :w! — same contract vim's
+  -- default write path enforces (we replace it with BufWriteCmd, so we have
+  -- to enforce this ourselves).
+  local stat = vim.loop.fs_stat(path)
+  if stat then vim.b[buf].mercury_file_mtime = stat.mtime.sec end
+
+  local nb = attach_buffer(buf, {
+    path = path,
+    meta = doc.meta,
+    nbformat = doc.nbformat,
+    nbformat_minor = doc.nbformat_minor,
+  })
+  -- Seed outputs, cell metadata, and attachments from the loaded ipynb.
+  for _, c in ipairs(doc.cells) do
+    nb.cell_metadata[c.id] = c.metadata
+    if c.attachments then nb.cell_attachments[c.id] = c.attachments end
+    if #c.outputs > 0 then
+      local out = nb:ensure_output(c.id)
+      out.items = c.outputs
+      out.exec_count = c.exec_count
+      out.status = "idle"
+    end
+  end
+  if nb._renderer then nb._renderer:render() end
+
+  return true
+end
+
+-- Count cells whose execution is in flight (running or queued). Save treats
+-- these as "not yet executed" in the JSON — their in-memory partial state is
+-- preserved, but it doesn't land on disk until the user saves again after
+-- the cell finishes. This is what keeps :w / :wq non-blocking.
+local function in_flight_count(nb)
+  if not nb.kernel then return 0 end
+  local n = 0
+  if nb.kernel.running then n = n + 1 end
+  n = n + #(nb.kernel.queue or {})
+  return n
+end
+
+local function save_ipynb(buf, path, force)
+  local nb = Notebook.get(buf)
+  if not nb then return false, "notebook not attached" end
+
+  -- External-modification guard. If the file on disk has changed since we
+  -- loaded it (or last saved), refuse to clobber unless the user used :w!.
+  local stat = vim.loop.fs_stat(path)
+  local stored = vim.b[buf].mercury_file_mtime
+  if not force and stat and stored and stat.mtime.sec > stored then
+    return false, "file changed on disk since load (use :w! to overwrite)"
+  end
+
+  -- Snapshot in-flight count BEFORE serializing, so the notify below reflects
+  -- the state we actually skipped. to_ipynb_struct reads kernel.running /
+  -- kernel.queue to know which cells to write as "not yet executed".
+  local skipped = in_flight_count(nb)
+  local struct = nb:to_ipynb_struct()
+  local json = Ipynb.encode(struct)
+  local ok, err = Util.write_file(path, json)
+  if not ok then return false, err end
+  vim.bo[buf].modified = false
+  if skipped > 0 then
+    vim.notify(
+      ("[mercury] saved; %d cell%s still running/queued were written without output "
+       .. "(save again after they finish to capture)"):format(
+        skipped, skipped == 1 and "" or "s"),
+      vim.log.levels.INFO)
+  end
+  local new_stat = vim.loop.fs_stat(path)
+  if new_stat then
+    vim.b[buf].mercury_file_mtime = new_stat.mtime.sec
+  else
+    -- fs_stat failed post-write (rare; transient filesystem issue). Fall
+    -- back to wall-clock so the next save's guard doesn't refuse with
+    -- "file changed on disk" because the stored mtime is older than the
+    -- on-disk one we just wrote.
+    vim.b[buf].mercury_file_mtime = os.time()
+  end
+  return true
+end
+
+-- Treesitter predicate `mercury_in_markdown_cell?`: filters `(comment)`
+-- captures (from queries/python/injections.scm) down to ones inside a
+-- markdown cell, so markdown-prefixed comments get highlighted as markdown.
+local function register_ts_predicate()
+  local add = vim.treesitter
+    and vim.treesitter.query
+    and vim.treesitter.query.add_predicate
+  if not add then return end
+  local handler = function(match, _, source, predicate)
+    local buf = (type(source) == "number") and source or vim.api.nvim_get_current_buf()
+    local nb = Notebook.get(buf)
+    if not nb or not nb.cells or #nb.cells == 0 then return false end
+    local cap = match[predicate[2]]
+    local node = (type(cap) == "table") and cap[1] or cap
+    if not node then return false end
+    local start_row = node:start()
+    for _, c in ipairs(nb.cells) do
+      local first = (c.header_row >= 0) and c.header_row or c.body_start
+      if start_row >= first and start_row <= c.body_end then
+        return c.kind == "markdown"
+      end
+    end
+    return false
+  end
+  -- Neovim ≥0.10 accepts an opts table; older builds want a boolean.
+  if not pcall(add, "mercury_in_markdown_cell?", handler,
+               { force = true, all = false }) then
+    pcall(add, "mercury_in_markdown_cell?", handler, true)
+  end
+end
+
+function M.setup(opts)
+  Cfg.setup(opts)
+  math.randomseed((os.time() * 1000 + (vim.loop.hrtime() % 1000000)) % 2147483647)
+  UI.setup_highlights()
+  require("mercury.lsp").setup()
+
+  -- Sweep stale entries from the image / latex caches (>30 days). Both are
+  -- keyed by content hash, so eviction never loses data — a future render
+  -- recreates the file from source bytes. Scheduled to keep startup fast.
+  vim.schedule(function()
+    local root = vim.fn.stdpath("cache")
+    Util.gc_cache_dir(root .. "/mercury_images")
+    Util.gc_cache_dir(root .. "/mercury_latex")
+  end)
+  register_ts_predicate()
+
+  local aug = vim.api.nvim_create_augroup("Mercury", { clear = true })
+
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = aug,
+    callback = UI.setup_highlights,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufReadCmd", "BufNewFile" }, {
+    group = aug,
+    pattern = "*.ipynb",
+    callback = function(args)
+      local path = vim.fn.fnamemodify(args.match or vim.api.nvim_buf_get_name(args.buf), ":p")
+      load_ipynb(args.buf, path)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = aug,
+    pattern = "*.ipynb",
+    callback = function(args)
+      local path = vim.fn.fnamemodify(args.match or vim.api.nvim_buf_get_name(args.buf), ":p")
+      -- v:cmdbang is set by vim to 1 when the matching write was :w! — used
+      -- here to bypass the mtime guard the same way it bypasses vim's own
+      -- "file changed on disk" refusal.
+      local force = vim.v.cmdbang == 1
+      local ok, err = save_ipynb(args.buf, path, force)
+      if not ok then
+        vim.notify("[mercury] save failed: " .. tostring(err), vim.log.levels.ERROR)
+      end
+    end,
+  })
+
+  M._register_commands()
+end
+
+-- ---------- commands ----------
+
+local function with_nb(fn)
+  return function()
+    local nb = Notebook.get(vim.api.nvim_get_current_buf())
+    if not nb then
+      vim.notify("[mercury] no notebook on this buffer", vim.log.levels.WARN)
+      return
+    end
+    fn(nb)
+  end
+end
+
+function M._register_commands()
+  local cmd = vim.api.nvim_create_user_command
+
+  cmd("NotebookExec", with_nb(function(nb)
+    local cell = nb:cell_at_row()
+    if not cell then return end
+    nb.kernel:execute(cell)
+    -- advance to next cell, or create one
+    local idx = nb:cell_index(cell.id)
+    local nxt = nb.cells[idx + 1]
+    if not nxt then nxt = nb:new_cell_below(cell) end
+    if nxt then vim.api.nvim_win_set_cursor(0, { nxt.body_start + 1, 0 }) end
+  end), {})
+
+  cmd("NotebookExecAlone", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if cell then nb.kernel:execute(cell) end
+  end), {})
+
+  cmd("NotebookExecAll", with_nb(function(nb)
+    for _, c in ipairs(nb.cells) do
+      if c.kind == "code" then nb.kernel:execute(c) end
+    end
+  end), {})
+
+  cmd("NotebookExecAbove", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if not cell then return end
+    for _, c in ipairs(nb.cells) do
+      if c.kind == "code" then nb.kernel:execute(c) end
+      if c.id == cell.id then break end
+    end
+  end), {})
+
+  cmd("NotebookExecBelow", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if not cell then return end
+    local started = false
+    for _, c in ipairs(nb.cells) do
+      if c.id == cell.id then started = true end
+      if started and c.kind == "code" then nb.kernel:execute(c) end
+    end
+  end), {})
+
+  cmd("NotebookCellNewBelow",   with_nb(function(nb) nb:new_cell_below() end),  {})
+  cmd("NotebookCellNewAbove",   with_nb(function(nb) nb:new_cell_above() end),  {})
+  cmd("NotebookCellDelete",     with_nb(function(nb) nb:delete_cell() end),     {})
+  cmd("NotebookCellMergeBelow", with_nb(function(nb) nb:merge_below() end),     {})
+  cmd("NotebookCellMoveUp",     with_nb(function(nb) nb:move_up() end),         {})
+  cmd("NotebookCellMoveDown",   with_nb(function(nb) nb:move_down() end),       {})
+  cmd("NotebookCellToCode",     with_nb(function(nb) nb:set_kind(nil, "code") end), {})
+  cmd("NotebookCellToMarkdown", with_nb(function(nb) nb:set_kind(nil, "markdown") end), {})
+  cmd("NotebookCellSelect",     with_nb(function(nb) nb:select_cell() end),     {})
+  cmd("NotebookCellCopy",       with_nb(function(nb) nb:copy_cell() end),       {})
+  cmd("NotebookCellPaste",      with_nb(function(nb) nb:paste_cell() end),      {})
+  cmd("NotebookCellDuplicate",  with_nb(function(nb) nb:duplicate_cell() end),  {})
+
+  cmd("NotebookOutputClear", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if cell then nb:clear_output(cell.id); nb._on_change() end
+  end), {})
+
+  cmd("NotebookOutputClearAll", with_nb(function(nb)
+    nb:clear_all_outputs(); nb._on_change()
+  end), {})
+
+  cmd("NotebookOutputToggle", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if not cell then return end
+    local out = nb.outputs[cell.id]; if not out then return end
+    out._collapsed = not out._collapsed
+    nb._on_change()
+  end), {})
+
+  cmd("NotebookOutputCopy", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if not cell then return end
+    local out = nb.outputs[cell.id]; if not out then return end
+    local lines = Output.to_plain_text(out)
+    vim.fn.setreg("+", table.concat(lines, "\n"))
+    vim.fn.setreg('"', table.concat(lines, "\n"))
+    Util.notify(("copied %d lines"):format(#lines))
+  end), {})
+
+  cmd("NotebookOutputView", with_nb(function(nb)
+    local cell = nb:cell_at_row(); if not cell then return end
+    local out = nb.outputs[cell.id]
+    local lines = out and Output.to_plain_text(out) or { "(no output)" }
+    vim.cmd("botright new")
+    local b = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    vim.bo[b].buftype = "nofile"
+    vim.bo[b].bufhidden = "wipe"
+    vim.bo[b].modifiable = false
+    vim.bo[b].filetype = "mercury_output"
+  end), {})
+
+  cmd("NotebookKernelSelect", with_nb(function(nb)
+    nb.kernel:list_kernels(function(kernels)
+      vim.schedule(function()
+        local Discover = require("mercury.discover")
+        local start_dir = nb._path
+          and vim.fn.fnamemodify(nb._path, ":h") or vim.fn.getcwd()
+        local pythons = Discover.pythons({ start_dir = start_dir })
+
+        -- Compose a unified picker from three sources. Order is by signal
+        -- strength: registered kernelspecs first (the user installed them
+        -- intentionally), discovered venvs next (likely-correct guess),
+        -- then a manual-entry escape hatch.
+        local options = {}
+        for _, k in ipairs(kernels or {}) do
+          options[#options + 1] = {
+            kind = "spec", name = k.name,
+            display_name = k.display_name, language = k.language,
+          }
+        end
+        for _, p in ipairs(pythons) do
+          options[#options + 1] = {
+            kind = "python", python = p.path,
+            display_name = Discover.short_label(p.path),
+            source = p.source,
+          }
+        end
+        options[#options + 1] = { kind = "browse",
+          display_name = "Enter python or kernelspec path…" }
+
+        vim.ui.select(options, {
+          prompt = "Select kernel",
+          format_item = function(o)
+            if o.kind == "spec" then
+              return ("[kernelspec] %s (%s)"):format(o.display_name, o.name)
+            elseif o.kind == "python" then
+              return ("[python] %s — %s"):format(o.display_name, o.source)
+            else
+              return o.display_name
+            end
+          end,
+        }, function(choice)
+          if not choice then return end
+          if choice.kind == "browse" then
+            vim.ui.input({ prompt = "Path (python exe or kernelspec dir): ",
+                           completion = "file" }, function(path)
+              if not path or path == "" then return end
+              path = vim.fn.expand(path)
+              if vim.fn.isdirectory(path) == 1 then
+                nb.kernel:select_kernel({ spec_path = path })
+                Util.notify("kernel set: spec_path=" .. path)
+              else
+                nb.kernel:select_kernel({ python = path })
+                Util.notify("kernel set: python=" .. path)
+              end
+            end)
+            return
+          end
+          nb.kernel:select_kernel(choice)
+          Util.notify("kernel set: " ..
+            (choice.name or choice.python or "?"))
+        end)
+      end)
+    end)
+  end), {})
+
+  cmd("NotebookKernelRestart",      with_nb(function(nb) nb.kernel:restart() end), {})
+  cmd("NotebookKernelRestartClear", with_nb(function(nb) nb.kernel:restart({ clear = true }) end), {})
+  cmd("NotebookKernelInterrupt",    with_nb(function(nb) nb.kernel:interrupt() end), {})
+  cmd("NotebookKernelStop",         with_nb(function(nb) nb.kernel:stop() end), {})
+end
+
+function M._setup_buffer_keymaps(buf)
+  if not Cfg.get().keymaps.enabled then return end
+  require("mercury.keymaps").apply(buf)
+end
+
+return M
