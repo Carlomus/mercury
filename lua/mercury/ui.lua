@@ -75,7 +75,9 @@ function Renderer:render()
         priority = 90,
       })
       local line = vim.api.nvim_buf_get_lines(buf, c.header_row, c.header_row + 1, false)[1] or ""
-      local id_s, id_e = line:find("%s+id=[%w%-_]+")
+      -- Match the same id key-class parse_meta uses: [%w_%-%.]. A dotted id
+      -- (vendor-prefixed) must conceal the whole token.
+      local id_s, id_e = line:find("%s+id=[%w_%-%.]+")
       if id_s then
         vim.api.nvim_buf_set_extmark(buf, Notebook.ns(NS_SEP), c.header_row, id_s - 1, {
           end_col = id_e,

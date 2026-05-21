@@ -23,27 +23,11 @@ local function check_nvim()
   end
 end
 
--- Resolve the python interpreter the same way kernel.lua does. Returns the
--- path or nil; we keep this in sync with default_python() in kernel.lua —
--- divergence would mean :checkhealth tests a different interpreter than the
--- bridge actually uses.
-local function resolved_python()
-  local cfg = require("mercury.config").get()
-  if cfg.python and vim.fn.executable(cfg.python) == 1 then return cfg.python end
-  local g = vim.g.mercury_python or vim.g.python3_host_prog
-  if g and vim.fn.executable(g) == 1 then return g end
-  local env = vim.env.VIRTUAL_ENV or vim.env.CONDA_PREFIX
-  if env and env ~= "" then
-    local sep = package.config:sub(1, 1)
-    local cand = env .. (sep == "\\" and "\\Scripts\\python.exe" or "/bin/python")
-    if vim.fn.executable(cand) == 1 then return cand end
-  end
-  for _, name in ipairs({ "python3", "python" }) do
-    local p = vim.fn.exepath(name)
-    if p ~= "" then return p end
-  end
-  return nil
-end
+-- Delegate to util.resolve_python so checkhealth tests the same interpreter
+-- that kernel.lua actually launches the bridge with — divergence would mean
+-- :checkhealth reports green while the bridge fails to start under a
+-- different python. SPEC § "Health".
+local resolved_python = require("mercury.util").resolve_python
 
 local function check_python()
   start("Python bridge")

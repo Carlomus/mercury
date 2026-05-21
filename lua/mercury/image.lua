@@ -1,10 +1,18 @@
 -- Inline image rendering via image.nvim. Caches handles by content hash so we
 -- only re-create images when their content actually changes.
 
+local Cfg = require("mercury.config")
 local Output = require("mercury.output")
 local Util = require("mercury.util")
 
 local M = {}
+
+-- Read config at call time (not load time) so users can hot-reload settings
+-- without restarting nvim. Returns the output section, which is all image.lua
+-- cares about (cell pixel size + max_rows clamp).
+local function _cfg()
+  return (Cfg.get() or {}).output or {}
+end
 
 local function api()
   local ok, mod = pcall(require, "image")
@@ -53,6 +61,18 @@ function Renderer:clear_all()
   for id, _ in pairs(self.cache) do self:_clear_handles(id) end
 end
 
+-- GC handles for cell ids not in the `present` set. Called at the end of
+-- each ui render pass so handles for deleted / merged / converted-to-
+-- markdown cells don't survive forever in memory (and as ghost extmarks on
+-- platforms where image.nvim keeps the placement alive after the source
+-- cell is gone). SPEC Invariant 17.
+function Renderer:gc(present)
+  present = present or {}
+  for id, _ in pairs(self.cache) do
+    if not present[id] then self:_clear_handles(id) end
+  end
+end
+
 function Renderer:render(cell, anchor_row, images)
   local mod = api()
   if not mod then return 0 end
@@ -93,7 +113,7 @@ function Renderer:render(cell, anchor_row, images)
   for i, img in ipairs(images) do
     local img_cols = available_cols
     local rows = max_rows
-    if img.kind == "png" or img.kind == "jpeg" then
+    if img.kind == "png" or img.kind == "jpeg" or img.kind == "svg" then
       local data = Util.read_file(img.path)
       local w, h = Output.image_dimensions(img.kind, data or "")
       if w and h then
@@ -122,7 +142,7 @@ function Renderer:render(cell, anchor_row, images)
       with_virtual_padding = is_last,
       x = i - 1,                        -- distinct extmark col per image
       y = anchor_row,
-      width = target_cols,
+      width = widths[i],
       render_offset_top = cumulative,
     }
     local handle = entry.handles[img.hash]

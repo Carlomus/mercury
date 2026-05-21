@@ -24,6 +24,17 @@ local function kind_from_cell_type(ct)
   return "code"
 end
 
+-- parse_meta(rest) — rest is the substring after "# %%". Returns
+--   { id?, kind = "code"|"markdown"|"raw", extras = { ... }, raw = rest }
+-- extras is a string-keyed dict of every non-id, non-flag token.
+--
+-- Key class is [%w_%-%.]+ — alphanumerics plus underscore, hyphen, and dot.
+-- (`%w` alone excludes underscore, which would silently drop common
+-- snake_case keys like `vscode.cell_id` on rescan.)
+--
+-- Value class is [^%s%]]+ matched DIRECTLY after `=` (no `%s*` between `=`
+-- and value): `id=abc tags= foo=bar` must produce tags=nil, foo=bar, not
+-- tags="foo=bar" via whitespace-skipping (H4).
 local function parse_meta(meta_str)
   local meta = { kind = "code", extras = {}, raw = meta_str or "" }
   meta_str = meta_str or ""
@@ -33,15 +44,29 @@ local function parse_meta(meta_str)
   elseif lower:find("%[raw%]") then
     meta.kind = "raw"
   end
-  for k, v in meta_str:gmatch("(%w+)%s*=%s*([^%s%]]+)") do
-    if k == "id" then
+  for k, v in meta_str:gmatch("([%w_%-%.]+)=([^%s%]]+)") do
+    if k == "id" and not meta.id then
       meta.id = v
-    else
+    elseif k ~= "id" then
       meta.extras[k] = v
     end
   end
   return meta
 end
+
+-- Validity helpers shared between format_separator (drop bad keys) and
+-- to_buffer_lines (warn on the load-side mercury_extras stash). The contract
+-- is that whatever format_separator emits must round-trip through parse_meta
+-- — so the key class here MUST match parse_meta's key class exactly.
+local function _is_valid_extras_key(k)
+  return type(k) == "string" and k:match("^[%w_%-%.]+$") ~= nil
+end
+
+-- Reserved keys that have their own canonical emission path (id from cell.id,
+-- tags from cell.metadata.tags). An extras stash with these keys would be
+-- silently swallowed on reparse; drop them on emission so what we write is
+-- what the next read will see.
+local RESERVED_EXTRAS_KEYS = { id = true, tags = true }
 
 local function format_separator(cell)
   local parts = { "# %%" }
@@ -51,18 +76,25 @@ local function format_separator(cell)
   if cell.metadata and cell.metadata.tags and #cell.metadata.tags > 0 then
     parts[#parts + 1] = "tags=" .. table.concat(cell.metadata.tags, ",")
   end
-  -- Preserve unknown separator tokens (foo=bar) through save/load. We stash
-  -- them in metadata.mercury_extras during serialization and emit them back
-  -- here when rendering the buffer text. Values can't contain whitespace —
-  -- that's the same constraint parse_meta enforces on the read side.
+  -- Preserve unknown separator tokens (foo=bar) through save/load via
+  -- metadata.mercury_extras. Sort keys alphabetically so the output is
+  -- deterministic. Filter:
+  --   - reserved keys (id, tags) — those come from cell.id / cell.metadata.tags
+  --   - keys outside the [A-Za-z0-9_.-] class — those wouldn't parse back
+  --   - values containing whitespace or `]` — parse_meta would truncate them
   if cell.extras then
     local keys = {}
     for k in pairs(cell.extras) do
-      if k ~= "tags" then keys[#keys + 1] = k end
+      if not RESERVED_EXTRAS_KEYS[k] and _is_valid_extras_key(k) then
+        keys[#keys + 1] = k
+      end
     end
     table.sort(keys)
     for _, k in ipairs(keys) do
-      parts[#parts + 1] = k .. "=" .. tostring(cell.extras[k])
+      local v = tostring(cell.extras[k])
+      if not v:find("[%s%]]") then
+        parts[#parts + 1] = k .. "=" .. v
+      end
     end
   end
   return table.concat(parts, " ")
@@ -417,13 +449,19 @@ M._reindent_json = reindent_json
 function M.encode(nb)
   local cells = {}
   for _, c in ipairs(nb.cells or {}) do
+    local ctype
+    if c.kind == "markdown" then ctype = "markdown"
+    elseif c.kind == "raw" then ctype = "raw"
+    else ctype = "code" end
+    local md = c.metadata or {}
+    if next(md) == nil then md = vim.empty_dict() end
     local cell = {
-      cell_type = c.kind == "markdown" and "markdown" or "code",
+      cell_type = ctype,
       id = c.id,
-      metadata = c.metadata or {},
+      metadata = md,
       source = lines_to_nbsource(c.source or {}),
     }
-    if cell.cell_type == "code" then
+    if ctype == "code" then
       cell.execution_count = c.exec_count or vim.NIL
       local outs = {}
       for _, o in ipairs(c.outputs or {}) do
@@ -431,6 +469,11 @@ function M.encode(nb)
         if d then outs[#outs + 1] = d end
       end
       cell.outputs = outs
+    elseif ctype == "markdown" and c.attachments and next(c.attachments) ~= nil then
+      -- nbformat v4 lets markdown cells carry attachments (pasted images
+      -- referenced from prose as `attachment:filename`). Preserve verbatim
+      -- across save/load. Code/raw cells don't carry attachments.
+      cell.attachments = c.attachments
     end
     cells[#cells + 1] = cell
   end
@@ -444,22 +487,61 @@ function M.encode(nb)
 end
 
 -- Render a decoded notebook to buffer lines (the py:percent-style text).
+-- Surfaces three warnings for mercury_extras content that won't survive a
+-- round-trip through the separator (so the user can fix the JSON before
+-- the next save bakes in the truncation):
+--   - value contains whitespace or `]`  (parse_meta would truncate)
+--   - key contains characters outside [%w_%-%.]  (parse_meta would skip)
+--   - key is the reserved name "id" or "tags"  (own canonical source)
 function M.to_buffer_lines(nb)
   local out = {}
-  for i, c in ipairs(nb.cells or {}) do
+  for _, c in ipairs(nb.cells or {}) do
+    local extras = c.metadata and c.metadata.mercury_extras
+    if extras then
+      for k, v in pairs(extras) do
+        if RESERVED_EXTRAS_KEYS[k] then
+          local alt = (k == "id") and "cell.id" or "metadata.tags"
+          Util.notify(("mercury_extras contains reserved \"%s\" key — value will be sourced from %s, extras entry dropped from the separator")
+            :format(k, alt), vim.log.levels.WARN)
+        elseif not _is_valid_extras_key(k) then
+          Util.notify(("mercury_extras key %q is outside the [A-Za-z0-9_.-] class — dropped from the separator")
+            :format(k), vim.log.levels.WARN)
+        else
+          local s = tostring(v)
+          local has_ws = s:find("%s") ~= nil
+          local has_br = s:find("%]") ~= nil
+          if has_ws and has_br then
+            Util.notify(("mercury_extras[\"%s\"] = %q contains whitespace and ']' — both truncated on next save")
+              :format(k, s), vim.log.levels.WARN)
+          elseif has_ws then
+            Util.notify(("mercury_extras[\"%s\"] = %q contains whitespace — truncated on next save")
+              :format(k, s), vim.log.levels.WARN)
+          elseif has_br then
+            Util.notify(("mercury_extras[\"%s\"] = %q contains ']' — truncated on next save")
+              :format(k, s), vim.log.levels.WARN)
+          end
+        end
+      end
+    end
     out[#out + 1] = format_separator({
       id = c.id, kind = c.kind, metadata = c.metadata,
-      -- mercury_extras is our stash for unknown separator tokens; pull them
-      -- out so they reappear in the buffer text exactly as they were before.
-      extras = c.metadata and c.metadata.mercury_extras,
+      extras = extras,
     })
     for _, line in ipairs(c.source or {}) do
       out[#out + 1] = line
     end
-    if i < #nb.cells then
-      out[#out + 1] = ""
+  end
+  -- Insert one blank visual gap between cells.
+  local with_gaps = {}
+  for i, line in ipairs(out) do
+    with_gaps[#with_gaps + 1] = line
+    -- Detect cell boundary: the next line starts a new separator.
+    local nxt = out[i + 1]
+    if nxt and nxt:match("^#%s*%%%%") then
+      with_gaps[#with_gaps + 1] = ""
     end
   end
+  out = with_gaps
   if #out == 0 then
     out = { format_separator({ id = Util.short_id(), kind = "code" }) }
   end

@@ -13,11 +13,20 @@ local M = {}
 -- client.notify), this stops it from showing up under prose.
 function M.filter_diagnostics(nb, diagnostics)
   if not nb or not nb.cells or #nb.cells == 0 then return diagnostics end
+  local function in_markdown(row)
+    local cell = nb:cell_at_row(row)
+    return cell and cell.kind == "markdown"
+  end
   local kept = {}
   for _, d in ipairs(diagnostics or {}) do
-    local row = (d.range and d.range.start and d.range.start.line) or 0
-    local cell = nb:cell_at_row(row)
-    if not cell or cell.kind == "code" then
+    local start_row = (d.range and d.range.start and d.range.start.line) or 0
+    local end_row = (d.range and d.range["end"] and d.range["end"].line) or start_row
+    -- Drop a diagnostic whose range touches markdown at EITHER end. A
+    -- multi-line diagnostic that starts in code and ends inside the
+    -- following markdown cell would otherwise survive and render partially
+    -- on top of prose. Raw cells are NOT dropped — SPEC documents them as
+    -- visible to the LSP (treated as ordinary python text).
+    if not (in_markdown(start_row) or in_markdown(end_row)) then
       kept[#kept + 1] = d
     end
   end

@@ -34,6 +34,83 @@ function M.write_file(path, data)
   return true
 end
 
+-- Atomic write via a sibling tempfile + POSIX rename. A kill -9 / power
+-- loss during :w would otherwise corrupt the notebook; rename(2) is atomic
+-- within a single filesystem so observers see either the previous complete
+-- contents or the new ones, never a torn write. The tempfile lives next to
+-- the target so the rename stays intra-filesystem. SPEC Invariant 22.
+--
+-- Uses uv.fs_rename (not os.rename) so tests can stub it.
+function M.atomic_write_file(path, data)
+  local tmp = path .. ".mercury_save_tmp"
+  local f, err = io.open(tmp, "wb")
+  if not f then return false, err end
+  local ok, werr = pcall(function() f:write(data) end)
+  f:close()
+  if not ok then
+    pcall(os.remove, tmp)
+    return false, werr
+  end
+  local uv = vim.uv or vim.loop
+  if uv and uv.fs_open then
+    local fd = uv.fs_open(tmp, "r", 438)
+    if fd then
+      pcall(uv.fs_fsync, fd)
+      uv.fs_close(fd)
+    end
+  end
+  local ok2, rerr = pcall(uv.fs_rename, tmp, path)
+  if not ok2 or rerr == false then
+    pcall(os.remove, tmp)
+    return false, rerr or "rename failed"
+  end
+  return true
+end
+
+-- Single source of truth for "which python should mercury use?". Both
+-- kernel.lua (bridge launch) and health.lua (:checkhealth) delegate here so
+-- a divergence between "the interpreter we report on" and "the interpreter
+-- we actually run" is impossible. SPEC § "Health" calls this out explicitly.
+--
+-- Priority:
+--   1. Cfg.get().python
+--   2. vim.g.mercury_python
+--   3. vim.g.python3_host_prog
+--   4. $VIRTUAL_ENV/bin/python
+--   5. $CONDA_PREFIX/bin/python  (only if VIRTUAL_ENV is unset)
+--   6. python3 on PATH
+--   7. python on PATH
+function M.resolve_python()
+  local ok_cfg, Cfg = pcall(require, "mercury.config")
+  if ok_cfg then
+    local cfg = Cfg.get()
+    if cfg and cfg.python and vim.fn.executable(cfg.python) == 1 then
+      return cfg.python
+    end
+  end
+  if vim.g.mercury_python and vim.fn.executable(vim.g.mercury_python) == 1 then
+    return vim.g.mercury_python
+  end
+  if vim.g.python3_host_prog and vim.fn.executable(vim.g.python3_host_prog) == 1 then
+    return vim.g.python3_host_prog
+  end
+  local venv = vim.env.VIRTUAL_ENV
+  if venv and venv ~= "" then
+    local sep = package.config:sub(1, 1)
+    local cand = venv .. (sep == "\\" and "\\Scripts\\python.exe" or "/bin/python")
+    if vim.fn.executable(cand) == 1 then return cand end
+  end
+  local conda = vim.env.CONDA_PREFIX
+  if conda and conda ~= "" and (not venv or venv == "") then
+    local sep = package.config:sub(1, 1)
+    local cand = conda .. (sep == "\\" and "\\python.exe" or "/bin/python")
+    if vim.fn.executable(cand) == 1 then return cand end
+  end
+  if vim.fn.executable("python3") == 1 then return "python3" end
+  if vim.fn.executable("python") == 1 then return "python" end
+  return nil
+end
+
 function M.tmpfile(suffix)
   return vim.fn.tempname() .. (suffix or "")
 end
@@ -57,10 +134,29 @@ function M.short_id()
   return table.concat(out)
 end
 
--- Stable content hash for cache keys. Wraps vim.fn.sha256 so we don't need
--- a bit-ops library or a hand-rolled SHA1. Truncation is the caller's job.
+-- Stable content hash for cache keys. Pure-Lua FNV-1a 64-bit, hex-formatted.
+-- We can't delegate to vim.fn.sha256 because it raises "E976: Using a Blob
+-- as a String" on bytes outside printable ASCII — and PNG / JPEG payloads
+-- always contain such bytes. Truncation is the caller's job.
 function M.hash(data)
-  return vim.fn.sha256(data or "")
+  data = data or ""
+  -- FNV-1a 64 with 32-bit halves so it works on Lua 5.1 (no native int64).
+  -- Tracks h = h_hi*2^32 + h_lo and multiplies by 64-bit PRIME by hand.
+  local h_hi, h_lo = 0xcbf29ce4, 0x84222325
+  local PRIME_HI, PRIME_LO = 0x00000100, 0x000001b3
+  for i = 1, #data do
+    -- bit.bxor is provided by LuaJIT (nvim bundles LuaJIT, so this is safe).
+    h_lo = bit.bxor(h_lo, data:byte(i))
+    local lo_lo = h_lo * PRIME_LO
+    local lo_hi = h_hi * PRIME_LO
+    local hi_lo = h_lo * PRIME_HI
+    local new_lo = lo_lo % 4294967296
+    local carry = math.floor(lo_lo / 4294967296)
+    local new_hi = (lo_hi + hi_lo + carry) % 4294967296
+    h_lo = new_lo
+    h_hi = new_hi
+  end
+  return string.format("%08x%08x", h_hi, h_lo)
 end
 
 function M.debounce(ms, fn)

@@ -8,6 +8,23 @@
 
 local M = {}
 
+-- Per-buffer cache of the last region key we set. If the new rescan
+-- produces the same regions, skip the set_included_regions call entirely —
+-- treesitter re-parsing the whole markdown subtree is the single largest
+-- per-keystroke cost on a long notebook.
+M._last_key = {}
+
+local function regions_key(regions)
+  local parts = {}
+  for _, region in ipairs(regions) do
+    for _, r in ipairs(region) do
+      parts[#parts + 1] = table.concat(r, ",")
+    end
+    parts[#parts + 1] = "|"
+  end
+  return table.concat(parts, ";")
+end
+
 function M.update(buf, cells)
   local ok, parser = pcall(vim.treesitter.get_parser, buf, "python")
   if not ok or not parser then return end
@@ -20,6 +37,9 @@ function M.update(buf, cells)
     end
   end
 
+  local key = regions_key(regions)
+  if M._last_key[buf] == key then return end
+
   local children = parser:children()
   if not children.markdown then
     if not pcall(vim.treesitter.language.add, "markdown") then return end
@@ -28,7 +48,15 @@ function M.update(buf, cells)
   end
   if children.markdown then
     pcall(function() children.markdown:set_included_regions(regions) end)
+    M._last_key[buf] = key
   end
+end
+
+-- Forget a buffer's cached region key. Called from Notebook.detach so a
+-- recycled bufnr can't inherit a stale entry that happens to match its
+-- next rescan, silently skipping the set_included_regions call.
+function M._forget(buf)
+  M._last_key[buf] = nil
 end
 
 return M

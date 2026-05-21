@@ -8,23 +8,11 @@ local M = {}
 local Kernel = {}
 Kernel.__index = Kernel
 
-local function default_python()
-  local cfg = Cfg.get()
-  if cfg.python and vim.fn.executable(cfg.python) == 1 then return cfg.python end
-  local g = vim.g.mercury_python or vim.g.python3_host_prog
-  if g and vim.fn.executable(g) == 1 then return g end
-  local env = vim.env.VIRTUAL_ENV or vim.env.CONDA_PREFIX
-  if env and env ~= "" then
-    local sep = package.config:sub(1, 1)
-    local cand = env .. (sep == "\\" and "\\Scripts\\python.exe" or "/bin/python")
-    if vim.fn.executable(cand) == 1 then return cand end
-  end
-  for _, name in ipairs({ "python3", "python" }) do
-    local p = vim.fn.exepath(name)
-    if p ~= "" then return p end
-  end
-  return nil
-end
+-- Delegate to the single source of truth in util.lua. health.lua resolves
+-- the same way via the same helper; keeping them in sync is load-bearing
+-- (an :checkhealth pass for a python that's not the one the bridge actually
+-- launches is worse than no health check at all).
+local default_python = Util.resolve_python
 
 local function find_bridge_script()
   -- Always resolve relative to this Lua file; works regardless of how the
@@ -140,32 +128,45 @@ function Kernel:_handle_msg(msg)
   if typ == "execute_start" then
     -- already set running on send; ignore
   elseif typ == "output" then
-    local out = nb:ensure_output(msg.cell_id)
-    self:_apply_item(out, msg.item or {})
-    self.on_change()
+    -- Defense in depth (SPEC Invariant 19): the kernel keeps emitting until
+    -- execute_done even if the cell was deleted or converted to non-code
+    -- mid-execution. Without this guard, ensure_output would resurrect a
+    -- ghost entry on every chunk — harmless to render but a real
+    -- inconsistency the next rescan would have to clean up.
+    local Notebook = require("mercury.notebook")
+    if not Notebook._live_code_cell or Notebook._live_code_cell(nb, msg.cell_id) then
+      local out = nb:ensure_output(msg.cell_id)
+      self:_apply_item(out, msg.item or {})
+      self.on_change()
+    end
   elseif typ == "execute_done" then
     local out = nb:ensure_output(msg.cell_id)
     out.exec_count = msg.exec_count or out.exec_count
     out.ms = msg.ms or 0
     -- A trailing `clear_output(wait=True)` whose next output never arrives is
     -- a Jupyter idiom: tqdm clears its progress bar before exiting the loop.
-    -- If we left `_pending_clear` set, the previous run's items would survive
-    -- into the next execute. Drop them now so the cell's final state matches
-    -- what the user typed.
     if out._pending_clear then
       out.items = {}
       out._pending_clear = nil
     end
-    -- Preserve terminal statuses set earlier in the same execute: `error`
-    -- from an iopub error message, or `killed` from an interrupted/cancelled
-    -- handler. Without this, an interrupt whose `interrupted` event landed
-    -- before the iopub error would have its terminal status quietly
-    -- downgraded to "ok" here.
+    -- Preserve terminal statuses set earlier in the same execute.
     if not _is_terminal(out.status) then
       out.status = "ok"
     end
     if msg.outputs and (#out.items == 0) then
       for _, it in ipairs(msg.outputs) do self:_apply_item(out, it) end
+    end
+    -- If this cell was in-flight at the last :w (and therefore written to
+    -- JSON as not-yet-executed), the now-available output is something the
+    -- user expects a second :w to capture. Vim only tracks `modified` on
+    -- buffer text, so we set it ourselves so a re-save isn't silently a
+    -- no-op. SPEC Invariant 14.
+    if nb._skipped_at_save and nb._skipped_at_save[msg.cell_id] then
+      nb._skipped_at_save[msg.cell_id] = nil
+      if vim.api.nvim_buf_is_valid(nb.buf) then
+        vim.bo[nb.buf].modified = true
+      end
+      if next(nb._skipped_at_save) == nil then nb._skipped_at_save = nil end
     end
     if self.running and self.running.cell_id == msg.cell_id then self.running = nil end
     self:_pump()
@@ -178,7 +179,17 @@ function Kernel:_handle_msg(msg)
     self:_cancel_running("killed")
     self.on_change()
   elseif typ == "restarted" then
-    self:_cancel_in_flight("killed")
+    -- Two paths land here:
+    --   1. User invoked Kernel:restart — we already _cancel_in_flight'd
+    --      synchronously up-front. Cancelling again here would clobber any
+    --      cell the user queued during the restart window.
+    --   2. The bridge spontaneously emitted `restarted` — no synchronous
+    --      cancel ran, so we still need to clear in-flight cells.
+    if self._restart_pending then
+      self._restart_pending = false
+    else
+      self:_cancel_in_flight("killed")
+    end
     self.on_change()
   elseif typ == "kernel_dead" or typ == "kernel_error" then
     if msg.kind == "unsupported" then
@@ -205,9 +216,30 @@ function Kernel:_handle_msg(msg)
     self.on_change()
   elseif typ == "kernels_listed" then
     self.kernels = msg.kernels or {}
-    local cb = self._on_list
+    local cbs = self._on_list
     self._on_list = nil
-    if cb then cb(self.kernels) end
+    if cbs then
+      -- Backwards-compatible: old form was a single function. New form is
+      -- a list of functions queued via list_kernels — fire all of them.
+      if type(cbs) == "function" then
+        cbs(self.kernels)
+      else
+        for _, cb in ipairs(cbs) do pcall(cb, self.kernels) end
+      end
+    end
+  else
+    -- Unknown message type from the bridge. A future protocol version might
+    -- add new message kinds; don't silently drop them (masks protocol drift).
+    -- Once-per-type rate-limit via _unknown_typs so a misbehaving bridge
+    -- can't spam.
+    if typ then
+      self._unknown_typs = self._unknown_typs or {}
+      if not self._unknown_typs[typ] then
+        self._unknown_typs[typ] = true
+        Util.notify("kernel: unrecognized bridge message type "
+          .. tostring(typ) .. " — protocol drift", vim.log.levels.WARN)
+      end
+    end
   end
 end
 
@@ -240,17 +272,27 @@ function Kernel:_apply_item(out, item)
     end
   elseif t == "update_display_data" then
     -- IPython.display.update_display(obj, display_id="x") updates EVERY item
-    -- bound to that display_id, not just the first. Iterate through all and
-    -- only fall through to "insert as fresh display_data" if there were no
-    -- matches at all.
+    -- bound to that display_id, across ALL cells in the notebook — not just
+    -- the cell that emitted the update. Jupyter Lab and VS Code both
+    -- implement this: cell A creates `display(..., display_id="x")`, cell B
+    -- calls `update_display(new_obj, display_id="x")` to refresh A's display.
     local did = (item.transient or {}).display_id
     if did then
       local updated = false
-      for _, it in ipairs(out.items) do
-        if it._display_id == did then
-          it.data = item.data or it.data
-          it.metadata = item.metadata or it.metadata
-          updated = true
+      local function update_in(items)
+        for _, it in ipairs(items or {}) do
+          if it._display_id == did then
+            it.data = item.data or it.data
+            it.metadata = item.metadata or it.metadata
+            updated = true
+          end
+        end
+      end
+      update_in(out.items)
+      -- Walk every OTHER cell's outputs too.
+      if self.notebook and self.notebook.outputs then
+        for _, other in pairs(self.notebook.outputs) do
+          if other ~= out and other.items then update_in(other.items) end
         end
       end
       if updated then return end
@@ -299,17 +341,29 @@ function Kernel:_emit_line(line)
   if not line or line == "" then return end
   local ok, msg = pcall(vim.json.decode, line)
   if ok and type(msg) == "table" then
-    self:_handle_msg(msg)
+    -- pcall the handler too so a Lua error inside _handle_msg can't propagate
+    -- up through jobstart's stdout callback and tear down the channel.
+    pcall(self._handle_msg, self, msg)
     return
   end
   -- A non-JSON line on the bridge's stdout means something is corrupting the
   -- protocol stream — typically a python library that prints a banner /
-  -- progress / deprecation warning to stdout. Surface it instead of silently
-  -- dropping; otherwise the user sees "executes randomly fail" with no clue.
-  -- Truncate so a pathological caller can't blow up the notify panel.
-  local snippet = line:sub(1, 200)
-  Util.notify("kernel: corrupt protocol line (likely a library printing to "
-    .. "stdout): " .. snippet, vim.log.levels.WARN)
+  -- progress / deprecation warning. Batch these into a single debounced
+  -- notify so a library spamming stdout doesn't drown the user in popups.
+  self._corrupt_buf = self._corrupt_buf or {}
+  self._corrupt_buf[#self._corrupt_buf + 1] = line:sub(1, 200)
+  if self._corrupt_timer then return end
+  self._corrupt_timer = vim.defer_fn(function()
+    local lines = self._corrupt_buf or {}
+    self._corrupt_buf = nil
+    self._corrupt_timer = nil
+    if #lines == 0 then return end
+    local sample = lines[1]
+    Util.notify(("kernel: %d corrupt protocol line%s (likely a library "
+      .. "printing to stdout); first: %s"):format(
+        #lines, #lines == 1 and "" or "s", sample),
+      vim.log.levels.WARN)
+  end, 100)
 end
 
 function Kernel:_ensure_started()
@@ -361,22 +415,8 @@ function Kernel:_ensure_started()
         end
       end, 100)
     end,
-    on_exit = function()
-      -- Distinguish a clean user-initiated shutdown (Kernel:stop sets
-      -- _stopping) from a bridge crash. On crash, queue/running are still
-      -- set from the pre-crash state; without clearing them, `_pump`'s
-      -- `if self.running then return end` guard would block every future
-      -- execute and the queue would jam.
-      local was_stopping = self_ref._stopping
-      self_ref._stopping = false
-      self_ref.job_id = nil
-      self_ref.chan = nil
-      self_ref.json_buf = ""
-      if not was_stopping then
-        self_ref:_cancel_in_flight("killed")
-        Util.notify("kernel bridge exited unexpectedly", vim.log.levels.WARN)
-        if self_ref.on_change then pcall(self_ref.on_change) end
-      end
+    on_exit = function(job_id)
+      self_ref:_handle_exit(job_id)
     end,
   })
   if job <= 0 then
@@ -392,7 +432,12 @@ end
 
 function Kernel:_send(payload)
   if not self.chan then return false end
-  pcall(vim.fn.chansend, self.chan, vim.json.encode(payload) .. "\n")
+  local ok, err = pcall(vim.fn.chansend, self.chan, vim.json.encode(payload) .. "\n")
+  if not ok then
+    Util.notify("kernel: failed to send to bridge: " .. tostring(err),
+      vim.log.levels.WARN)
+    return false
+  end
   return true
 end
 
@@ -405,7 +450,40 @@ function Kernel:_pump()
   out.status = "running"
   out.items = {}
   self.on_change()
-  self:_send({ type = "execute", cell_id = task.cell_id, code = task.code })
+  -- Roll back the running state if _send fails (bridge died mid-flight).
+  -- Without this, self.running stays set forever and _pump refuses to
+  -- advance the queue on the next execute. Mark the cell killed so the
+  -- pill reflects what actually happened.
+  if not self:_send({ type = "execute", cell_id = task.cell_id, code = task.code }) then
+    self.running = nil
+    if not _is_terminal(out.status) then out.status = "killed" end
+    self.on_change()
+  end
+end
+
+-- Bridge job has exited (clean or otherwise). Called by jobstart's on_exit
+-- and by tests directly. Ignores stale callbacks whose job_id no longer
+-- matches self.job_id — a Kernel:stop followed quickly by Kernel:execute
+-- creates a new job and the old one's deferred on_exit must not clobber
+-- the new state. SPEC § "Graceful shutdown".
+function Kernel:_handle_exit(job_id)
+  if self.job_id ~= nil and job_id ~= nil and job_id ~= self.job_id then
+    return
+  end
+  -- _expected_exit survives across the event-loop tick — _stopping is
+  -- cleared synchronously at the end of stop() so the next execute can
+  -- respawn; _expected_exit tells THIS callback the exit was user-initiated.
+  local expected = self._expected_exit
+  self._expected_exit = false
+  self._stopping = false
+  self.job_id = nil
+  self.chan = nil
+  self.json_buf = ""
+  if not expected then
+    self:_cancel_in_flight("killed")
+    Util.notify("kernel bridge exited unexpectedly", vim.log.levels.WARN)
+    if self.on_change then pcall(self.on_change) end
+  end
 end
 
 function Kernel:execute(cell)
@@ -448,14 +526,33 @@ function Kernel:restart(opts)
     Util.notify("kernel is not running", vim.log.levels.INFO)
     return
   end
+  -- Cancel in-flight cells synchronously BEFORE sending restart so a user
+  -- who fires :NotebookExec immediately afterwards doesn't have their new
+  -- cell wiped by the eventual `restarted` event arriving back from the
+  -- bridge. Without this, _pump's `if self.running then return` guard sees
+  -- the still-set running state and queues the new cell; when `restarted`
+  -- lands, _cancel_in_flight drops the just-queued cell along with the old
+  -- ones.
+  --
+  -- _restart_pending tells the eventual `restarted` handler that we
+  -- already cancelled — without it, the handler would cancel again and
+  -- clobber any cell the user queued during the restart window.
+  self:_cancel_in_flight("killed")
+  self._restart_pending = true
   self:_send({ type = "restart" })
-  if opts.clear then self.notebook:clear_all_outputs(); self.on_change() end
+  if opts.clear then self.notebook:clear_all_outputs() end
+  if self.on_change then self.on_change() end
 end
 
 function Kernel:stop()
-  -- Tell on_exit this exit is expected, so it doesn't fire the
-  -- "bridge exited unexpectedly" notification.
+  -- Block new executes while we tear down (SPEC Invariant 13).
   self._stopping = true
+  -- _expected_exit is a SEPARATE flag from _stopping: _stopping is cleared
+  -- synchronously at the end of stop() so the next execute can respawn the
+  -- bridge, but _expected_exit must survive until the on_exit callback runs
+  -- on a later event-loop tick. If on_exit consulted _stopping it'd already
+  -- be false by then and would treat the clean stop as a crash.
+  self._expected_exit = true
   -- Mark any running / queued cells as killed BEFORE we clear them, so the
   -- UI doesn't show a permanent "Running…" or "Queued" pill on cells whose
   -- kernel is gone. (The on_exit handler does this for *unexpected* exits;
@@ -499,8 +596,21 @@ end
 
 function Kernel:list_kernels(cb)
   if not self:_ensure_started() then return end
-  self._on_list = cb
-  self:_send({ type = "list_kernels" })
+  -- Queue multiple callers. Without this, a second list_kernels call before
+  -- the bridge reply lands silently overwrites the first caller's callback.
+  -- If a request is already in-flight, just append the callback — the
+  -- single bridge reply fans out to all queued callbacks.
+  local in_flight = self._on_list ~= nil
+  if type(self._on_list) == "function" then
+    self._on_list = { self._on_list, cb }
+  elseif type(self._on_list) == "table" then
+    self._on_list[#self._on_list + 1] = cb
+  else
+    self._on_list = { cb }
+  end
+  if not in_flight then
+    self:_send({ type = "list_kernels" })
+  end
 end
 
 -- Accept any of:

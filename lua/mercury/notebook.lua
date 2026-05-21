@@ -44,11 +44,27 @@ end
 
 function M.get(buf) return M.instances[buf] end
 
+-- Defense-in-depth helper used by kernel.lua to drop iopub frames for
+-- cells that vanished or were converted to non-code mid-execution. SPEC
+-- Invariant 19. Returns true iff `cell_id` corresponds to a cell that
+-- (a) still exists in the buffer AND (b) is currently a code cell.
+function M._live_code_cell(nb, cell_id)
+  if not nb or not cell_id then return false end
+  for _, c in ipairs(nb.cells or {}) do
+    if c.id == cell_id then return c.kind == "code" end
+  end
+  return false
+end
+
 function M.detach(buf)
   local nb = M.instances[buf]
   if not nb then return end
   if nb._renderer and nb._renderer.clear_all then nb._renderer:clear_all() end
   if nb.kernel and nb.kernel.stop then nb.kernel:stop() end
+  -- Forget the markdown injected-regions cache for this buf so a recycled
+  -- bufnr can't reuse a stale `_last_key` by coincidence and skip the
+  -- set_included_regions call the new buffer actually needed. SPEC H15.
+  pcall(function() require("mercury.markdown")._forget(buf) end)
   M.instances[buf] = nil
 end
 
@@ -56,6 +72,19 @@ function Notebook:set_renderer(r) self._renderer = r end
 function Notebook:set_kernel(k) self.kernel = k end
 
 function Notebook:lines() return vim.api.nvim_buf_get_lines(self.buf, 0, -1, false) end
+
+-- Is this cell currently running or waiting in the kernel queue? Both
+-- set_kind (refuse to convert a busy cell) and the UI (status pill rules)
+-- depend on this answer. Returns false if no kernel is attached, which
+-- matches the spirit of "if there's no kernel, nothing can be busy".
+function Notebook:cell_is_busy(id)
+  if not self.kernel or not id then return false end
+  if self.kernel.running and self.kernel.running.cell_id == id then return true end
+  for _, t in ipairs(self.kernel.queue or {}) do
+    if t.cell_id == id then return true end
+  end
+  return false
+end
 
 -- Scan the buffer text for cells. Assign ids to any cell missing one. If ids
 -- were assigned, the buffer is rewritten in place to make ids persistent.
@@ -131,21 +160,53 @@ function Notebook:rescan()
     if not present[id] then self.cell_attachments[id] = nil end
   end
 
+  -- Drop side-table entries that don't match the surviving cell's kind:
+  --   - outputs for cells that are no longer code (nbformat: markdown / raw
+  --     cells don't carry outputs)
+  --   - attachments for cells that are no longer markdown
+  -- Catches the direct-text-edit conversion path that bypasses set_kind.
+  -- SPEC Invariant 20.
+  local kinds = {}
+  for _, c in ipairs(self.cells) do kinds[c.id] = c.kind end
+  for id, _ in pairs(self.outputs) do
+    if kinds[id] and kinds[id] ~= "code" then self.outputs[id] = nil end
+  end
+  for id, _ in pairs(self.cell_attachments) do
+    if kinds[id] and kinds[id] ~= "markdown" then self.cell_attachments[id] = nil end
+  end
+  -- Drop queued kernel tasks for cells that are gone OR no longer code. The
+  -- `kinds[id] == nil` case covers full deletion (visual-select + d across
+  -- a separator), which was previously short-circuited by the kind check.
+  if self.kernel and self.kernel.queue then
+    for i = #self.kernel.queue, 1, -1 do
+      local task = self.kernel.queue[i]
+      if kinds[task.cell_id] ~= "code" then
+        table.remove(self.kernel.queue, i)
+      end
+    end
+  end
+
   pcall(function() require("mercury.markdown").update(self.buf, self.cells) end)
 
   if self._on_change then self._on_change() end
 end
 
 function Notebook:_apply_id_assignments(orig_lines, cells)
-  -- Replace any header lines that lacked an id with rewritten ones, carrying
-  -- forward any tags= encoded on the original separator so toggling/scanning
-  -- doesn't silently drop them.
+  -- Rewrite header lines for two cases:
+  --   (a) the separator has no id at all — splice a fresh one in
+  --   (b) scan_lines flagged the cell as `dup_rewrite` because its id
+  --       collided with an earlier cell (yank-and-paste of a separator).
+  --       The line still has an id, but it's the wrong one now.
+  -- Either way, format_separator(...) rebuilds the canonical form preserving
+  -- kind + tags + extras so we don't silently drop them.
   local new_lines = {}
   for i, ln in ipairs(orig_lines) do new_lines[i] = ln end
   for _, c in ipairs(cells) do
     if c.header_row >= 0 then
       local row = c.header_row + 1
-      if not new_lines[row]:match("id=%w+") then
+      local needs_rebuild = c.dup_rewrite
+        or not new_lines[row]:match("id=[%w_%-]+")
+      if needs_rebuild then
         local md = {}
         local extras = c.meta and c.meta.extras
         if extras and extras.tags then
@@ -155,6 +216,7 @@ function Notebook:_apply_id_assignments(orig_lines, cells)
           id = c.id,
           kind = c.meta.kind,
           metadata = md,
+          extras = extras,
         })
       end
     end
@@ -474,10 +536,16 @@ function Notebook:to_ipynb_struct()
   end
 
   local cells = {}
-  for _, c in ipairs(self.cells) do
+  local last_idx = #self.cells
+  for i, c in ipairs(self.cells) do
     local body = self:cell_body_lines(c)
-    -- Trim a single trailing empty line that came from the visual gap between cells.
-    if #body > 0 and body[#body] == "" then table.remove(body, #body) end
+    -- Trim a single trailing empty line — but ONLY for non-last cells.
+    -- For non-last cells the trailing "" is the visual gap to_buffer_lines
+    -- inserts between cells; for the last cell there's no such gap, so a
+    -- trailing "" is real user content and must survive.
+    if i < last_idx and #body > 0 and body[#body] == "" then
+      table.remove(body, #body)
+    end
     local out = self.outputs[c.id]
     -- For an in-flight cell, treat as if it had no output state at all. We
     -- could emit partial items, but a half-streamed tqdm bar or a missing

@@ -21,7 +21,15 @@ end
 
 function M.kernel()
   local n = nb(); if not n then return "" end
-  local name = (n.meta and n.meta.kernelspec and n.meta.kernelspec.name) or "python3"
+  -- Prefer the active selector (b:mercury_kernel_name is updated by
+  -- attach_buffer and select_kernel) so what lualine shows matches the
+  -- interpreter the bridge actually runs against. Fall back to
+  -- metadata.kernelspec.name for notebooks that haven't gone through
+  -- attach yet (e.g., the buffer was never opened).
+  local active = vim.b[n.buf].mercury_kernel_name
+  local name = active
+    or (n.meta and n.meta.kernelspec and n.meta.kernelspec.name)
+    or "python3"
   return ("⎈ %s"):format(name)
 end
 

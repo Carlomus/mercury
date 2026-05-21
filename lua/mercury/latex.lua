@@ -97,10 +97,15 @@ function M.rasterize(src)
   local cfg = Cfg.get().latex
   local backend = cfg.rasterizer
 
-  -- Function backends manage their own caching; we just call them.
+  -- Function backends manage their own caching; we just call them. Guard
+  -- against a backend that returns a non-string by mistake (table / number /
+  -- nil) — fs_stat raises on non-string and would propagate the crash up to
+  -- the renderer, killing the whole output pass.
   if type(backend) == "function" then
     local out = backend(src)
-    if out and vim.loop.fs_stat(out) then return out end
+    if type(out) == "string" and out ~= "" and vim.loop.fs_stat(out) then
+      return out
+    end
     return nil
   end
 

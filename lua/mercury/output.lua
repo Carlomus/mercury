@@ -51,25 +51,59 @@ local function pick_mime(data)
   -- prefer plain over html because our html→text is naive and would mangle
   -- common cases like pandas DataFrame _repr_html_.
   for _, m in ipairs({
-    "image/png", "image/svg+xml", "text/latex",
+    "image/png", "image/jpeg", "image/svg+xml", "text/latex",
     "text/markdown", "text/plain", "text/html",
   }) do
     if data[m] then return m end
   end
-  for k in pairs(data) do return k end
+  -- Unknown-mime fallback. Prefer ANY text/* over unknown application/*
+  -- (Plotly etc. emit `application/vnd.plotly.v1+json` alongside `text/plain`;
+  -- alphabetical sort would pick the application/* binary blob).
+  local text_keys, other_keys = {}, {}
+  for k in pairs(data) do
+    if type(k) == "string" and k:sub(1, 5) == "text/" then
+      text_keys[#text_keys + 1] = k
+    else
+      other_keys[#other_keys + 1] = k
+    end
+  end
+  table.sort(text_keys)
+  table.sort(other_keys)
+  if text_keys[1] then return text_keys[1] end
+  if other_keys[1] then return other_keys[1] end
   return nil
 end
 
 M.pick_mime = pick_mime
 
+-- HTML entity decoder. ORDER MATTERS: numeric / named entities decode first,
+-- then &amp; LAST so that `&amp;lt;` collapses to literal `&lt;` (one round
+-- of decode), not `<` (two rounds). A regression that re-orders this would
+-- silently corrupt HTML-encoded user data containing escaped ampersands.
 local function html_to_text(html)
   html = html or ""
   html = html:gsub("<[bB][rR]%s*/?>", "\n")
   html = html:gsub("</p>", "\n")
   html = html:gsub("<[^>]+>", "")
+  -- Numeric entities (decimal &#NNN; and hex &#xHHH;).
+  html = html:gsub("&#[xX](%x+);", function(h)
+    local n = tonumber(h, 16)
+    if not n then return "" end
+    local ok, ch = pcall(vim.fn.nr2char, n)
+    return ok and ch or ""
+  end)
+  html = html:gsub("&#(%d+);", function(d)
+    local n = tonumber(d)
+    if not n then return "" end
+    local ok, ch = pcall(vim.fn.nr2char, n)
+    return ok and ch or ""
+  end)
+  -- Named entities (except &amp; which goes last).
   html = html:gsub("&nbsp;", " ")
   html = html:gsub("&lt;", "<")
   html = html:gsub("&gt;", ">")
+  html = html:gsub("&quot;", '"')
+  html = html:gsub("&apos;", "'")
   html = html:gsub("&amp;", "&")
   return html
 end
@@ -84,11 +118,11 @@ function M.build_virt_lines(out, opts)
     local status = STATUS_TEXT[out.status] or STATUS_TEXT.idle
     local pill = {}
     if out.status == "running" then
-      pill[#pill + 1] = { "⏳ Running…", status.hl }
+      pill[#pill + 1] = { "⏳ running…", status.hl }
     elseif out.status == "queued" then
-      pill[#pill + 1] = { "⏸ Queued", status.hl }
+      pill[#pill + 1] = { "⏸ queued", status.hl }
     elseif out.status == "killed" then
-      pill[#pill + 1] = { "󱚢 Killed", status.hl }
+      pill[#pill + 1] = { "󱚢 killed", status.hl }
     elseif out.status == "ok" or out.status == "error" or out.status == "idle" then
       local glyph = status.glyph
       local nstr = out.exec_count and ("[" .. tostring(out.exec_count) .. "]") or ""
@@ -236,27 +270,34 @@ function M.extract_images(out)
         -- defensively before decoding.
         local png_b64 = _value_to_string(data["image/png"])
         local bin = B64.decode(png_b64)
-        local hash = Util.hash(bin)
-        _ensure_image_cache()
-        local path = IMAGE_CACHE_DIR .. "/" .. hash:sub(1, 16) .. ".png"
-        if not vim.loop.fs_stat(path) then
-          Util.write_file(path, bin)
-        else
-          Util.touch(path)   -- mark hit so age-based GC doesn't evict
+        -- Signature gate: a corrupt/empty payload must not land in the
+        -- content-addressed cache (where it would persist for 30 days).
+        if type(bin) == "string" and bin:sub(1, 8) == "\137PNG\r\n\26\n" then
+          local hash = Util.hash(bin)
+          _ensure_image_cache()
+          local path = IMAGE_CACHE_DIR .. "/" .. hash:sub(1, 16) .. ".png"
+          if not vim.loop.fs_stat(path) then
+            Util.write_file(path, bin)
+          else
+            Util.touch(path)   -- mark hit so age-based GC doesn't evict
+          end
+          images[#images + 1] = { kind = "png", path = path, hash = hash, item_index = i }
         end
-        images[#images + 1] = { kind = "png", path = path, hash = hash, item_index = i }
       elseif data["image/jpeg"] then
         local jpg_b64 = _value_to_string(data["image/jpeg"])
         local bin = B64.decode(jpg_b64)
-        local hash = Util.hash(bin)
-        _ensure_image_cache()
-        local path = IMAGE_CACHE_DIR .. "/" .. hash:sub(1, 16) .. ".jpg"
-        if not vim.loop.fs_stat(path) then
-          Util.write_file(path, bin)
-        else
-          Util.touch(path)
+        if type(bin) == "string" and #bin >= 2
+          and bin:byte(1) == 0xFF and bin:byte(2) == 0xD8 then
+          local hash = Util.hash(bin)
+          _ensure_image_cache()
+          local path = IMAGE_CACHE_DIR .. "/" .. hash:sub(1, 16) .. ".jpg"
+          if not vim.loop.fs_stat(path) then
+            Util.write_file(path, bin)
+          else
+            Util.touch(path)
+          end
+          images[#images + 1] = { kind = "jpeg", path = path, hash = hash, item_index = i }
         end
-        images[#images + 1] = { kind = "jpeg", path = path, hash = hash, item_index = i }
       elseif data["image/svg+xml"] then
         local svg = data["image/svg+xml"]
         if type(svg) == "table" then svg = table.concat(svg, "") end
@@ -337,10 +378,38 @@ function M.jpeg_dimensions(bytes)
   return nil
 end
 
+-- Read intrinsic dimensions from an SVG document. Tries literal width/height
+-- attributes first (with px/pt unit stripping), then falls back to viewBox
+-- when width/height are missing or non-pixel ("100%"). Returns nil if no
+-- intrinsic size can be resolved (the caller then falls back to the full
+-- available width + max-rows reservation).
+function M.svg_dimensions(svg)
+  if not svg or type(svg) ~= "string" or svg == "" then return nil end
+  local function as_px(s)
+    if not s then return nil end
+    -- Reject relative units ("100%", "1em", etc.) — viewBox is the
+    -- authoritative answer for those.
+    if s:find("%%") then return nil end
+    local n = s:match("^(%d+%.?%d*)") or s:match("^(%.%d+)")
+    return n and tonumber(n) or nil
+  end
+  local w = as_px(svg:match("<svg[^>]-width%s*=%s*\"([^\"]+)\""))
+  local h = as_px(svg:match("<svg[^>]-height%s*=%s*\"([^\"]+)\""))
+  if w and h then return w, h end
+  -- viewBox="minX minY width height"
+  local vb = svg:match("<svg[^>]-viewBox%s*=%s*\"([^\"]+)\"")
+  if vb then
+    local _, _, vw, vh = vb:match("(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)%s+(%d+%.?%d*)%s+(%d+%.?%d*)")
+    if vw and vh then return tonumber(vw), tonumber(vh) end
+  end
+  return nil
+end
+
 -- Dispatch by image kind. Image renderer feeds this to the row-height math.
 function M.image_dimensions(kind, bytes)
   if kind == "png" then return M.png_dimensions(bytes) end
   if kind == "jpeg" then return M.jpeg_dimensions(bytes) end
+  if kind == "svg" then return M.svg_dimensions(bytes) end
   return nil
 end
 

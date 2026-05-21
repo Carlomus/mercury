@@ -36,12 +36,19 @@ def _jsonable(o):
 # ----------------------------------------------------------------------
 
 class NoUsableKernel(Exception):
-    def __init__(self, requested: Optional[str], available: list):
+    def __init__(self, requested: Optional[str] = None, available: list = None,
+                 detail: Optional[str] = None):
         self.requested = requested
-        self.available = available
+        self.available = available or []
+        self.detail = detail
         super().__init__(self._message())
 
     def _message(self) -> str:
+        # `detail` is verbatim — used for path-validation errors from
+        # _make_local_km_from_python / _from_spec_path whose messages would
+        # be misleading if wrapped in "kernelspec '...' not found".
+        if self.detail:
+            return self.detail
         if not self.available:
             return (
                 "no Jupyter kernelspecs are installed. "
@@ -133,13 +140,9 @@ def _make_local_km_from_python(python_path: str):
     from jupyter_client.kernelspec import KernelSpecManager
 
     if not os.path.isabs(python_path):
-        raise NoUsableKernel(
-            f"python path must be absolute: {python_path}",
-            _list_kernelspecs())
+        raise NoUsableKernel(detail=f"python path must be absolute: {python_path}")
     if not os.path.isfile(python_path) or not os.access(python_path, os.X_OK):
-        raise NoUsableKernel(
-            f"python not executable: {python_path}",
-            _list_kernelspecs())
+        raise NoUsableKernel(detail=f"python not executable: {python_path}")
 
     tmpdir = tempfile.mkdtemp(prefix="mercury_kernel_")
     spec_name = "mercury_synth"
@@ -175,9 +178,7 @@ def _make_local_km_from_spec_path(spec_path: str):
 
     spec_path = os.path.abspath(spec_path)
     if not os.path.isfile(os.path.join(spec_path, "kernel.json")):
-        raise NoUsableKernel(
-            f"no kernel.json at {spec_path}",
-            _list_kernelspecs())
+        raise NoUsableKernel(detail=f"no kernel.json at {spec_path}")
 
     parent = os.path.dirname(spec_path)
     name = os.path.basename(spec_path)
@@ -371,7 +372,24 @@ class Bridge:
             cell_id, code = task
             self.current_cell_id = cell_id
             jprint({"type": "execute_start", "cell_id": cell_id})
-            self._execute(cell_id, code)
+            # Catch any exception so the worker thread survives. A bug in
+            # _execute that propagates up would otherwise kill the thread
+            # and silently jam every subsequent execute in task_q.
+            try:
+                self._execute(cell_id, code)
+            except Exception as e:
+                jprint({
+                    "type": "execute_done",
+                    "cell_id": cell_id,
+                    "exec_count": None, "ms": 0,
+                    "outputs": [{
+                        "type": "error",
+                        "ename": type(e).__name__,
+                        "evalue": str(e),
+                        "traceback": [],
+                    }],
+                })
+                self.current_cell_id = None
 
     def _execute(self, cell_id: str, code: str) -> None:
         # Capture the restart epoch at entry. If it changes while we're
@@ -380,8 +398,16 @@ class Bridge:
         # so subsequent cells can run on the fresh kernel.
         my_seq = self._restart_seq
         started = time.time()
+        # Hold the lock through BOTH kc.execute and the parent_to_cell write
+        # so iopub_loop can't observe parent_to_cell mid-update. Without this,
+        # a kernel that emits its first iopub frame within microseconds of
+        # receiving execute_request would have that frame silently dropped
+        # because parent_to_cell.get(parent_id) returns None.
         try:
-            parent_id = self.kc.execute(code, stop_on_error=False, allow_stdin=False)
+            with self._lock:
+                parent_id = self.kc.execute(
+                    code, stop_on_error=False, allow_stdin=False)
+                self.parent_to_cell[parent_id] = cell_id
         except Exception as e:
             # If a restart fired between worker_loop popping our task and us
             # reaching kc.execute, the old kc is torn down and this raises.
@@ -402,9 +428,6 @@ class Bridge:
             })
             self.current_cell_id = None
             return
-
-        with self._lock:
-            self.parent_to_cell[parent_id] = cell_id
 
         exec_count = None
         # No hard deadline: long-running cells are legitimate. The user can
@@ -472,35 +495,46 @@ class Bridge:
                 continue
             except Exception:
                 continue
-
             # Per-message parsing is wrapped so a malformed iopub message
             # can't kill the thread — that would leave the kernel "alive"
             # but mute, with no observable error.
             try:
-                parent_id = msg.get("parent_header", {}).get("msg_id")
-                header = msg.get("header") or {}
-                mtype = header.get("msg_type")
-                content = msg.get("content") or {}
-                if not mtype:
-                    continue
-                with self._lock:
-                    cell_id = self.parent_to_cell.get(parent_id)
-
-                if mtype in ("stream", "display_data", "execute_result",
-                             "error", "clear_output", "update_display_data"):
-                    if cell_id is None:
-                        continue
-                    if mtype == "stream" and isinstance(content.get("text"), list):
-                        content["text"] = "".join(content["text"])
-                    item = {"type": mtype, **content}
-                    jprint({"type": "output", "cell_id": cell_id, "item": item})
-                elif mtype == "status":
-                    if content.get("execution_state") == "idle" and parent_id:
-                        with self._lock:
-                            self._idle_seen[parent_id] = True
+                self._handle_iopub_msg(msg)
             except Exception as e:
                 jprint({"type": "kernel_error",
                         "error": f"iopub parse: {type(e).__name__}: {e}"})
+
+    def _handle_iopub_msg(self, msg) -> None:
+        """Handle one iopub frame. Extracted so tests can drive it directly
+        without spinning the iopub thread or owning a real kernel client.
+        """
+        parent_id = msg.get("parent_header", {}).get("msg_id")
+        header = msg.get("header") or {}
+        mtype = header.get("msg_type")
+        content = msg.get("content") or {}
+        if not mtype:
+            return
+        with self._lock:
+            cell_id = self.parent_to_cell.get(parent_id)
+
+        if mtype in ("stream", "display_data", "execute_result",
+                     "error", "clear_output", "update_display_data"):
+            if cell_id is None:
+                return
+            if mtype == "stream" and isinstance(content.get("text"), list):
+                content["text"] = "".join(content["text"])
+            item = {"type": mtype, **content}
+            jprint({"type": "output", "cell_id": cell_id, "item": item})
+        elif mtype == "status":
+            # Only record idle for a parent we know about. A late idle frame
+            # arriving after _forget already cleaned up parent_to_cell would
+            # otherwise leak into _idle_seen forever (a small but real memory
+            # leak over many thousands of executes).
+            if (content.get("execution_state") == "idle"
+                    and parent_id
+                    and cell_id is not None):
+                with self._lock:
+                    self._idle_seen[parent_id] = True
 
     # -- requests ------------------------------------------------------
 

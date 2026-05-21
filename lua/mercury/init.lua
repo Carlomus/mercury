@@ -82,12 +82,41 @@ local function attach_buffer(buf, opts)
   local nb = Notebook.attach(buf, opts)
   local renderer = UI.new(nb)
   nb:set_renderer(renderer)
-  local kernel_opts = (opts.config and opts.config.kernel) or Cfg.get().kernel
+  -- Kernel selection priority on open (SPEC § "Kernel selection UI" closing
+  -- paragraph):
+  --   1. explicit setup{kernel={...}} — user config wins
+  --   2. metadata.mercury_kernel.{python,spec_path} — mercury's override
+  --   3. metadata.kernelspec.name — standard nbformat field
+  local kernel_opts = vim.deepcopy(Cfg.get().kernel or {})
+  local meta = nb.meta or {}
+  if meta and type(meta) == "table" then
+    if not kernel_opts.python and not kernel_opts.spec_path and not kernel_opts.name then
+      local mk = meta.mercury_kernel
+      if type(mk) == "table" then
+        if mk.python then kernel_opts.python = mk.python
+        elseif mk.spec_path then kernel_opts.spec_path = mk.spec_path end
+      end
+      if not kernel_opts.python and not kernel_opts.spec_path then
+        local ks = meta.kernelspec
+        if type(ks) == "table" and ks.name then kernel_opts.name = ks.name end
+      end
+    end
+  end
+  -- Coalesce kernel-driven render triggers to one per event-loop tick. A
+  -- streaming output (tqdm, watch loops) emits one on_change per chunk;
+  -- without coalescing we'd render thousands of times per second.
+  -- SPEC Invariant 7.
+  local on_change = Util.coalesce(function() renderer:render() end)
   local kernel = Kernel.new(nb, {
     kernel = kernel_opts,
-    on_change = function() vim.schedule(function() renderer:render() end) end,
+    on_change = on_change,
   })
   nb:set_kernel(kernel)
+  -- Surface the active selector (whichever of python/spec_path/name is set)
+  -- as b:mercury_kernel_name so lualine / user hooks can render the current
+  -- selection. SPEC § "Kernel selection UI".
+  vim.b[buf].mercury_kernel_name =
+    kernel_opts.python or kernel_opts.spec_path or kernel_opts.name
   nb._on_change = function() renderer:render() end
 
   nb:rescan()
@@ -105,7 +134,15 @@ local function attach_buffer(buf, opts)
     renderer:render()
   end)
 
+  -- Per-buffer augroup so :e! (which detaches + reattaches) doesn't stack
+  -- duplicate TextChanged / BufWinEnter / BufWipeout handlers closing over a
+  -- now-stale Notebook/Renderer. clear=true wipes the previous attach's
+  -- autocmds before the fresh set lands.
+  local buf_aug = vim.api.nvim_create_augroup("MercuryBuf_" .. buf,
+    { clear = true })
+
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
+    group = buf_aug,
     buffer = buf,
     callback = function()
       if nb._suppress_rescan then return end
@@ -114,16 +151,16 @@ local function attach_buffer(buf, opts)
   })
 
   vim.api.nvim_create_autocmd("BufWipeout", {
+    group = buf_aug,
     buffer = buf,
     callback = function() Notebook.detach(buf) end,
   })
 
   -- image.nvim's render path requires a window currently showing the buffer.
-  -- Without this, images disappear when the buffer is hidden and don't come
-  -- back when it's revealed in another window. Re-rendering on BufWinEnter
-  -- is idempotent — text decorations are skipped if nothing changed, and
-  -- image handles are looked up by content hash in the cache.
+  -- Re-render on BufWinEnter so images reappear when the buffer is revealed
+  -- in a new window.
   vim.api.nvim_create_autocmd("BufWinEnter", {
+    group = buf_aug,
     buffer = buf,
     callback = function()
       if vim.api.nvim_buf_is_loaded(buf) then renderer:render() end
@@ -179,6 +216,10 @@ local function decode_ipynb_or_blank(path)
 end
 
 local function load_ipynb(buf, path)
+  -- Detach any prior notebook on this buf so :e! doesn't leak the old
+  -- kernel + renderer (and the per-buf augroup gets cleared cleanly by the
+  -- next attach_buffer).
+  if Notebook.get(buf) then Notebook.detach(buf) end
   local doc, fresh = decode_ipynb_or_blank(path)
   if not doc then
     -- Parsing failed: show the raw bytes readonly so the user can diagnose
@@ -203,12 +244,14 @@ local function load_ipynb(buf, path)
   vim.bo[buf].modified = fresh   -- mark dirty so :w persists the new file
   vim.api.nvim_buf_set_name(buf, path)
 
-  -- Record the on-disk mtime so :w can detect external modifications and
-  -- refuse to clobber them without an explicit :w! — same contract vim's
-  -- default write path enforces (we replace it with BufWriteCmd, so we have
-  -- to enforce this ourselves).
+  -- Record the on-disk mtime AND the load path so :w can detect external
+  -- modifications and refuse to clobber them without an explicit :w!. The
+  -- guard is path-scoped: :saveas to a different file is writing a copy
+  -- and must not be refused on the basis of the original file's mtime
+  -- history. SPEC Invariant 21.
   local stat = vim.loop.fs_stat(path)
   if stat then vim.b[buf].mercury_file_mtime = stat.mtime.sec end
+  vim.b[buf].mercury_loaded_path = path
 
   local nb = attach_buffer(buf, {
     path = path,
@@ -217,12 +260,16 @@ local function load_ipynb(buf, path)
     nbformat_minor = doc.nbformat_minor,
   })
   -- Seed outputs, cell metadata, and attachments from the loaded ipynb.
+  -- Also seed an output record when exec_count is set but outputs are empty
+  -- (Jupyter Lab's "Clear All Outputs" leaves execution_count intact). Without
+  -- this, the encoder would write "execution_count": null on save and the
+  -- next reload would show the cell as never-run — silent data loss.
   for _, c in ipairs(doc.cells) do
     nb.cell_metadata[c.id] = c.metadata
     if c.attachments then nb.cell_attachments[c.id] = c.attachments end
-    if #c.outputs > 0 then
+    if (c.outputs and #c.outputs > 0) or c.exec_count then
       local out = nb:ensure_output(c.id)
-      out.items = c.outputs
+      out.items = c.outputs or {}
       out.exec_count = c.exec_count
       out.status = "idle"
     end
@@ -248,12 +295,17 @@ local function save_ipynb(buf, path, force)
   local nb = Notebook.get(buf)
   if not nb then return false, "notebook not attached" end
 
-  -- External-modification guard. If the file on disk has changed since we
-  -- loaded it (or last saved), refuse to clobber unless the user used :w!.
-  local stat = vim.loop.fs_stat(path)
-  local stored = vim.b[buf].mercury_file_mtime
-  if not force and stat and stored and stat.mtime.sec > stored then
-    return false, "file changed on disk since load (use :w! to overwrite)"
+  -- External-modification guard. Only fires when the save target matches
+  -- the originally-loaded path — :saveas to a new file is a copy and must
+  -- not be refused based on the original file's mtime history. SPEC 21.
+  local loaded = vim.b[buf].mercury_loaded_path
+  local saving_same_file = loaded and path == loaded
+  if saving_same_file then
+    local stat = vim.loop.fs_stat(path)
+    local stored = vim.b[buf].mercury_file_mtime
+    if not force and stat and stored and stat.mtime.sec > stored then
+      return false, "file changed on disk since load (use :w! to overwrite)"
+    end
   end
 
   -- Snapshot in-flight count BEFORE serializing, so the notify below reflects
@@ -262,7 +314,10 @@ local function save_ipynb(buf, path, force)
   local skipped = in_flight_count(nb)
   local struct = nb:to_ipynb_struct()
   local json = Ipynb.encode(struct)
-  local ok, err = Util.write_file(path, json)
+  -- Atomic save: write to a sibling tempfile, fsync, rename(2). Crash /
+  -- power loss during :w then leaves either the old or new file on disk,
+  -- never a partial one. SPEC Invariant 22.
+  local ok, err = Util.atomic_write_file(path, json)
   if not ok then return false, err end
   vim.bo[buf].modified = false
   if skipped > 0 then
@@ -276,11 +331,18 @@ local function save_ipynb(buf, path, force)
   if new_stat then
     vim.b[buf].mercury_file_mtime = new_stat.mtime.sec
   else
-    -- fs_stat failed post-write (rare; transient filesystem issue). Fall
-    -- back to wall-clock so the next save's guard doesn't refuse with
-    -- "file changed on disk" because the stored mtime is older than the
-    -- on-disk one we just wrote.
     vim.b[buf].mercury_file_mtime = os.time()
+  end
+  -- :saveas redirected this buffer to a new path. Update the load path so
+  -- subsequent saves are guarded against modifications of THIS file, not
+  -- the original. Use realpath equivalence so macOS /var vs /private/var
+  -- doesn't false-negative the comparison.
+  if loaded ~= path then
+    local r_loaded = loaded and (vim.loop.fs_realpath(loaded) or loaded)
+    local r_path = vim.loop.fs_realpath(path) or path
+    if r_loaded ~= r_path then
+      vim.b[buf].mercury_loaded_path = path
+    end
   end
   return true
 end
@@ -423,6 +485,8 @@ function M._register_commands()
 
   cmd("NotebookCellNewBelow",   with_nb(function(nb) nb:new_cell_below() end),  {})
   cmd("NotebookCellNewAbove",   with_nb(function(nb) nb:new_cell_above() end),  {})
+  cmd("NotebookCellNext",       with_nb(function(nb) nb:goto_next_cell() end),  {})
+  cmd("NotebookCellPrev",       with_nb(function(nb) nb:goto_prev_cell() end),  {})
   cmd("NotebookCellDelete",     with_nb(function(nb) nb:delete_cell() end),     {})
   cmd("NotebookCellMergeBelow", with_nb(function(nb) nb:merge_below() end),     {})
   cmd("NotebookCellMoveUp",     with_nb(function(nb) nb:move_up() end),         {})
