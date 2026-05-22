@@ -86,10 +86,37 @@ function Renderer:render(cell, anchor_row, images)
   local seen = {}
 
   -- Render in a window that's actually showing this notebook buffer; the
-  -- callback may fire while the user is focused elsewhere.
-  local wins = vim.fn.win_findbuf(self.notebook.buf)
-  local win = wins and wins[1]
-  if not win or not vim.api.nvim_win_is_valid(win) then return 0 end
+  -- callback may fire while the user is focused elsewhere (or before the
+  -- buffer is ever windowed during a programmatic load).
+  --
+  -- Window selection rules:
+  --   1. Prefer the CURRENTLY-FOCUSED window if it's showing this buffer —
+  --      that's almost always what the user is looking at, even when the
+  --      buffer is also visible in a background split.
+  --   2. Otherwise pick the first valid window from win_findbuf.
+  --   3. If no valid window currently shows the buffer, return early
+  --      WITHOUT touching the cache. image.nvim's render path requires a
+  --      live window, and we'd otherwise crash on `from_file`. The
+  --      BufWinEnter autocmd in init.lua re-runs renderer:render() when
+  --      the buffer is revealed, so the cached handles survive the gap
+  --      and the next render reuses them cheaply via same_placement().
+  --
+  -- Without rule (1), a user with the notebook open in two splits would
+  -- get images rendered into whichever split win_findbuf enumerates first
+  -- (usually tab/creation order, not focus order), leaving the focused
+  -- split visually blank for the duration of that placement.
+  local win
+  local cur = vim.api.nvim_get_current_win()
+  local wins = vim.fn.win_findbuf(self.notebook.buf) or {}
+  for _, w in ipairs(wins) do
+    if w == cur and vim.api.nvim_win_is_valid(w) then win = w; break end
+  end
+  if not win then
+    for _, w in ipairs(wins) do
+      if vim.api.nvim_win_is_valid(w) then win = w; break end
+    end
+  end
+  if not win then return 0 end
   local win_w = vim.api.nvim_win_get_width(win)
   -- Available width: cap at 85% of the window so the image doesn't crowd the
   -- whole pane. Hard floor of 20 cols so very narrow splits still render.
@@ -109,17 +136,38 @@ function Renderer:render(cell, anchor_row, images)
   -- SVG is the exception: it's resolution-independent, so we use the full
   -- available width (rendering as small as the natural PNG dimensions would
   -- waste the vector's whole point).
+  --
+  -- If the cached source bytes are missing (cache eviction races a render,
+  -- on-disk hash collision rebuild, etc.), reserve 1 row instead of the
+  -- pessimistic max_rows fallback — a 40-row blank space for a missing
+  -- image was the previous behavior and it dwarfs anything else on screen.
+  -- The image won't render anyway (image.nvim's from_file fails on a
+  -- missing path), so the right thing is to allocate minimal space. The
+  -- output renderer surfaces a [image unavailable] text line in this case
+  -- so the user understands what happened.
   local widths, heights = {}, {}
   for i, img in ipairs(images) do
     local img_cols = available_cols
-    local rows = max_rows
+    local rows = 1
+    img.unavailable = nil
     if img.kind == "png" or img.kind == "jpeg" or img.kind == "svg" then
       local data = Util.read_file(img.path)
-      local w, h = Output.image_dimensions(img.kind, data or "")
-      if w and h then
-        local natural_cols = math.ceil(w / cell_w)
-        img_cols = math.min(available_cols, natural_cols)
-        rows = Output.image_row_height(w, h, img_cols, cell_w, cell_h, max_rows)
+      if not data or data == "" then
+        img.unavailable = true
+        img_cols = 1
+        rows = 1
+      else
+        local w, h = Output.image_dimensions(img.kind, data)
+        if w and h then
+          local natural_cols = math.ceil(w / cell_w)
+          img_cols = math.min(available_cols, natural_cols)
+          rows = Output.image_row_height(w, h, img_cols, cell_w, cell_h, max_rows)
+        else
+          -- Unknown dimensions (e.g. SVG without an intrinsic size): use the
+          -- pessimistic max_rows so wide plots don't truncate. Documented
+          -- in Invariant 15.
+          rows = max_rows
+        end
       end
     end
     widths[i] = img_cols
@@ -134,29 +182,33 @@ function Renderer:render(cell, anchor_row, images)
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
-    local is_last = (i == #images)
-    local opts = {
-      buffer = self.notebook.buf,
-      window = win,
-      inline = true,
-      with_virtual_padding = is_last,
-      x = i - 1,                        -- distinct extmark col per image
-      y = anchor_row,
-      width = widths[i],
-      render_offset_top = cumulative,
-    }
-    local handle = entry.handles[img.hash]
-    local prev = entry.placements[img.hash]
-    if not (handle and same_placement(prev, opts)) then
-      if handle and handle.clear then pcall(function() handle:clear() end) end
-      local ok, h = pcall(mod.from_file, img.path, opts)
-      if ok and h then
-        pcall(function() h:render() end)
-        entry.handles[img.hash] = h
-        entry.placements[img.hash] = opts
-      else
-        entry.handles[img.hash] = nil
-        entry.placements[img.hash] = nil
+    -- Skip rendering a placement for images whose source bytes are gone;
+    -- the output renderer surfaces a text placeholder in their stead.
+    if not img.unavailable then
+      local is_last = (i == #images)
+      local opts = {
+        buffer = self.notebook.buf,
+        window = win,
+        inline = true,
+        with_virtual_padding = is_last,
+        x = i - 1,                        -- distinct extmark col per image
+        y = anchor_row,
+        width = widths[i],
+        render_offset_top = cumulative,
+      }
+      local handle = entry.handles[img.hash]
+      local prev = entry.placements[img.hash]
+      if not (handle and same_placement(prev, opts)) then
+        if handle and handle.clear then pcall(function() handle:clear() end) end
+        local ok, h = pcall(mod.from_file, img.path, opts)
+        if ok and h then
+          pcall(function() h:render() end)
+          entry.handles[img.hash] = h
+          entry.placements[img.hash] = opts
+        else
+          entry.handles[img.hash] = nil
+          entry.placements[img.hash] = nil
+        end
       end
     end
     cumulative = cumulative + heights[i]

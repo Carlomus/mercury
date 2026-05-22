@@ -115,15 +115,28 @@ describe("output rendering", function()
     assert.equals(100, h)
   end)
 
-  it("svg_dimensions strips px / pt units on width / height", function()
+  it("svg_dimensions parses px / pt units on width / height", function()
+    -- "px" strips trivially (SVG default is px for unitless values).
     local w, h = Output.svg_dimensions(
       [[<svg width="64px" height="32px"></svg>]])
     assert.equals(64, w)
     assert.equals(32, h)
+    -- "pt" converts at 96 DPI (1pt = 4/3 px). Matplotlib emits pt; treating
+    -- pt as px (the old bug) made plots render ~25% too small. Audit P1.
     local w2, h2 = Output.svg_dimensions(
       [[<svg width="120pt" height="60pt"></svg>]])
-    assert.equals(120, w2)
-    assert.equals(60, h2)
+    assert.equals(160, w2)  -- 120 * 4 / 3
+    assert.equals(80, h2)   -- 60 * 4 / 3
+  end)
+
+  it("svg_dimensions falls back to viewBox for unknown absolute units", function()
+    -- "in", "cm", "em", etc. aren't units we want to silently approximate
+    -- — viewBox is the authoritative answer when the absolute unit is
+    -- something we can't convert deterministically.
+    local w, h = Output.svg_dimensions(
+      [[<svg width="2in" height="1in" viewBox="0 0 192 96"></svg>]])
+    assert.equals(192, w)
+    assert.equals(96, h)
   end)
 
   it("svg_dimensions falls back to viewBox when width is %", function()

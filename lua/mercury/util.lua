@@ -57,11 +57,22 @@ function M.atomic_write_file(path, data)
   local tmp = path .. ".mercury_save_tmp"
   local f, err = io.open(tmp, "wb")
   if not f then return false, err end
-  local ok, werr = pcall(function() f:write(data) end)
-  f:close()
-  if not ok then
+  -- io.write returns the file handle on success, or `nil, err` on a short
+  -- write (disk-full, ENOSPC, IO error). Without checking the return value
+  -- we'd happily fsync truncated bytes and rename them over the user's
+  -- notebook. pcall only catches Lua exceptions, not the (nil, err) path.
+  local w_ok, w_err = pcall(function()
+    local ok, write_err = f:write(data)
+    if not ok then error(write_err or "short write") end
+  end)
+  local close_ok, close_err = pcall(function() f:close() end)
+  if not w_ok then
     pcall(os.remove, tmp)
-    return false, werr
+    return false, tostring(w_err or "write failed")
+  end
+  if not close_ok then
+    pcall(os.remove, tmp)
+    return false, "close failed: " .. tostring(close_err or "unknown")
   end
   local uv = vim.uv or vim.loop
   if uv and uv.fs_open then
@@ -85,6 +96,23 @@ function M.atomic_write_file(path, data)
         .. tostring(tmp) .. " → " .. tostring(path)
     end
     return false, msg
+  end
+  -- Fsync the parent directory so the rename(2) is durable. POSIX guarantees
+  -- rename atomicity but not durability: a crash / power loss between rename
+  -- and the dirent flush can leave the directory entry pointing at the old
+  -- inode (or unresolved). jupyter-server, git, sqlite, and other durability-
+  -- sensitive writers all do this. fs_fsync on the directory fd is the way
+  -- (most platforms don't allow open(O_RDWR) on a directory).
+  -- Best-effort: if the platform doesn't support it (e.g., open-on-directory
+  -- isn't permitted in this libuv build), continue rather than reporting a
+  -- success-with-warning that the user can't act on.
+  if uv and uv.fs_open then
+    local parent = path:match("^(.*)/[^/]+$") or "."
+    local dir_fd = uv.fs_open(parent, "r", 0)
+    if dir_fd then
+      pcall(uv.fs_fsync, dir_fd)
+      pcall(uv.fs_close, dir_fd)
+    end
   end
   return true
 end

@@ -285,11 +285,14 @@ describe("notebook scan + reconcile", function()
     Notebook.detach(buf)
   end)
 
-  it("rescan skips rename detection when cell count changes", function()
-    -- Per SPEC: rename detection only runs when #prev == #new. If the user
-    -- added/removed cells while also editing an id, side tables for the
-    -- renamed cell are GC'd (the safest fallback — we can't reliably
-    -- match positionally across structural changes).
+  it("rescan migrates side-tables on rename even when cell count changes (unambiguous case)", function()
+    -- SPEC Invariant 47 (extended): if exactly one previously-known id
+    -- vanishes from the buffer AND exactly one fresh id appears in the
+    -- new cell set, treat the pair as a rename and migrate side tables.
+    -- This is unambiguous and matches user intent ("I renamed cell X to
+    -- something else, and also deleted an unrelated cell"). Cases with
+    -- more than one vanished/new id are still left to GC — those would
+    -- require heuristic guessing and risk data corruption.
     local buf = make_buf({
       "# %% id=multi001",
       "x = 1",
@@ -304,8 +307,36 @@ describe("notebook scan + reconcile", function()
       "x = 1",
     })
     nb:rescan()
-    -- With cell-count change, side tables are NOT migrated.
-    assert.is_nil(nb.outputs["renamed1"])
+    -- multi001 → renamed1 migration applied because the count-changed branch
+    -- saw exactly one vanished (with side-table entries) and one new id.
+    assert.is_not_nil(nb.outputs["renamed1"])
+    assert.equals("out1", nb.outputs["renamed1"].items[1].text)
+    -- The old id's side-table entry was moved, not duplicated.
+    assert.is_nil(nb.outputs["multi001"])
+    Notebook.detach(buf)
+  end)
+
+  it("rescan leaves side-tables to GC when rename is ambiguous", function()
+    -- When MULTIPLE previously-known ids vanish AND multiple fresh ids
+    -- appear, the rename pairing is ambiguous and we can't migrate safely.
+    -- Side-table entries for vanished ids are GC'd; the user can re-execute
+    -- to repopulate.
+    local buf = make_buf({
+      "# %% id=multi001", "x = 1",
+      "# %% id=multi002", "y = 2",
+    })
+    local nb = Notebook.attach(buf); nb:rescan()
+    nb:ensure_output("multi001").items = { { type = "stream", text = "out1" } }
+    nb:ensure_output("multi002").items = { { type = "stream", text = "out2" } }
+    -- Rename BOTH ids in one edit.
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=ren1nnnn", "x = 1",
+      "# %% id=ren2nnnn", "y = 2",
+    })
+    nb:rescan()
+    -- Equal-length walk handles this — position-aligned migration applies.
+    assert.is_not_nil(nb.outputs["ren1nnnn"])
+    assert.is_not_nil(nb.outputs["ren2nnnn"])
     Notebook.detach(buf)
   end)
 

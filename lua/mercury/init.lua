@@ -21,10 +21,29 @@ local WO_KEYS = { "foldmethod", "foldexpr", "foldtext", "conceallevel", "conceal
 local function setup_folding(buf)
   -- Save and restore window-local opts so leaving the notebook in the same
   -- window doesn't leak foldexpr/conceal to the next buffer.
+  --
+  -- Save-once on entry; restore on leave. The order BufLeave-on-old →
+  -- BufEnter-on-new in nvim means:
+  --   * leaving mercury A: restore() flips wo back to user defaults and
+  --     clears the saved snapshot.
+  --   * entering mercury B: snapshot is nil → save the (now user-default)
+  --     wo, apply mercury values.
+  -- This keeps the snapshot pointing at the USER'S real defaults across
+  -- arbitrary cycles between mercury buffers. We additionally re-check
+  -- against the WO_KEYS' current values during save to avoid capturing
+  -- mercury defaults if some weird code path enters a mercury buffer
+  -- without firing BufLeave on the prior one (`:tabnew` patterns) — by
+  -- detecting that the current wo already looks mercury-shaped and
+  -- skipping the snapshot in that case (the prior buffer's snapshot, if
+  -- inherited via window-local var inheritance, will be honored).
+  local function _looks_mercury(wo)
+    return wo.foldmethod == "expr"
+      and tostring(wo.foldexpr or ""):find("mercury", 1, true) ~= nil
+  end
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufEnter" }, {
     buffer = buf,
     callback = function()
-      if vim.w._mercury_saved_wo == nil then
+      if vim.w._mercury_saved_wo == nil and not _looks_mercury(vim.wo) then
         local saved = {}
         for _, k in ipairs(WO_KEYS) do saved[k] = vim.wo[k] end
         vim.w._mercury_saved_wo = saved
@@ -102,10 +121,16 @@ local function attach_buffer(buf, opts)
       end
     end
   end
-  -- Coalesce kernel-driven render triggers to one per event-loop tick. A
-  -- streaming output (tqdm, watch loops) emits one on_change per chunk;
-  -- without coalescing we'd render thousands of times per second.
-  -- SPEC Invariant 7.
+  -- Coalesce render triggers to one per event-loop tick. A streaming output
+  -- (tqdm, watch loops) emits one on_change per chunk; without coalescing
+  -- we'd render thousands of times per second. SPEC Invariant 7.
+  --
+  -- A single shared coalesce wrapper drives BOTH the kernel's on_change
+  -- callback AND the notebook-mutation on_change. Two separate wrappers
+  -- would each maintain their own pending flag, so a kernel frame and a
+  -- buffer mutation arriving in the same tick would produce two renders.
+  -- Sharing the wrapper makes "one render per tick" hold across the union
+  -- of all render triggers, not just within a single source.
   local on_change = Util.coalesce(function() renderer:render() end)
   local kernel = Kernel.new(nb, {
     kernel = kernel_opts,
@@ -117,7 +142,7 @@ local function attach_buffer(buf, opts)
   -- selection. SPEC § "Kernel selection UI".
   vim.b[buf].mercury_kernel_name =
     kernel_opts.python or kernel_opts.spec_path or kernel_opts.name
-  nb._on_change = function() renderer:render() end
+  nb._on_change = on_change
 
   nb:rescan()
   renderer:render()
@@ -177,13 +202,19 @@ local function attach_buffer(buf, opts)
   pcall(function() require("mercury.render_markdown").enable_buffer(buf) end)
 
   -- Let users hook into post-attach setup (statusline refresh, lazy keymaps,
-  -- per-buffer LSP wiring, etc.) without monkey-patching Mercury.
+  -- per-buffer LSP wiring, etc.) without monkey-patching Mercury. Fire
+  -- ONCE per buffer — :e! reloads detach + reattach the notebook many
+  -- times in a session, but post-attach hooks (LSP wiring, keymap install,
+  -- statusline) are typically idempotent-but-expensive and the user
+  -- expects "this happens when the notebook opens", not "every time it
+  -- reloads". Guard via b:mercury_user_attached_seen.
   vim.schedule(function()
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_exec_autocmds, "User",
-        { pattern = "MercuryAttached", modeline = false,
-          data = { buf = buf } })
-    end
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    if vim.b[buf].mercury_user_attached_seen then return end
+    vim.b[buf].mercury_user_attached_seen = true
+    pcall(vim.api.nvim_exec_autocmds, "User",
+      { pattern = "MercuryAttached", modeline = false,
+        data = { buf = buf } })
   end)
 
   return nb
@@ -211,12 +242,26 @@ local function decode_ipynb_or_blank(path)
     return blank_notebook(), true   -- fresh: file missing or empty
   end
   local nb = Ipynb.decode(data)
-  if not nb or not nb.cells or #nb.cells == 0 then
-    -- Existing file is unreadable; bail out so we don't clobber it.
-    if nb and nb.cells then
-      return blank_notebook(), true
-    end
+  if not nb then
+    -- Parse failed: caller shows raw bytes readonly so we don't clobber a
+    -- broken-but-recoverable file. SPEC Invariant H13.
     return nil, false
+  end
+  if not nb.cells or #nb.cells == 0 then
+    -- File parsed, but the cell list is empty (e.g., a "Clear All" tool wrote
+    -- `{"cells":[], "metadata":{...}}`). Preserve the original metadata
+    -- (kernelspec, language_info, etc.) and add a single empty placeholder
+    -- cell so the user has somewhere to edit. Crucially: NOT marked fresh,
+    -- so the buffer is unmodified — a casual :w with no edits doesn't
+    -- overwrite the original file. The placeholder is purely visual until
+    -- the user actually types something.
+    nb.cells = {
+      { id = Util.short_id(), kind = "code", source = {},
+        outputs = {}, metadata = {} },
+    }
+    nb.nbformat = nb.nbformat or 4
+    nb.nbformat_minor = nb.nbformat_minor or 5
+    return nb, false
   end
   return nb, false
 end
@@ -246,8 +291,6 @@ local function load_ipynb(buf, path)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].buftype = "acwrite"
   vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = "python"
-  vim.bo[buf].modified = fresh   -- mark dirty so :w persists the new file
   vim.api.nvim_buf_set_name(buf, path)
 
   -- Record the on-disk mtime AND the load path so :w can detect external
@@ -266,12 +309,48 @@ local function load_ipynb(buf, path)
   end
   vim.b[buf].mercury_loaded_path = path
 
+  -- ATTACH FIRST, FILETYPE SECOND. The previous order was:
+  --   1. vim.bo[buf].filetype = "python"
+  --   2. attach_buffer(...)
+  -- Setting filetype synchronously fires `FileType` and Neovim's
+  -- auto-attach handler for `python` then fires `LspAttach`. Mercury's
+  -- LspAttach autocmd (`lsp.lua:LspAttach`) calls
+  -- `reset_server_view(buf)` — which short-circuits when
+  -- `Notebook.get(buf)` is nil. Under the old order, attach_buffer
+  -- (which calls Notebook.attach) had not yet run, so the server kept
+  -- its raw (unmasked, markdown-as-syntax-error) view of the document
+  -- and the diagnostic mask silently leaked. SPEC Invariant 6.
+  --
+  -- By calling attach_buffer before assigning filetype, the notebook is
+  -- registered before any LspAttach can fire; the reset path runs
+  -- cleanly and the server sees the masked document from the very first
+  -- didOpen.
   local nb = attach_buffer(buf, {
     path = path,
     meta = doc.meta,
     nbformat = doc.nbformat,
     nbformat_minor = doc.nbformat_minor,
   })
+  vim.bo[buf].filetype = "python"
+  vim.bo[buf].modified = fresh   -- mark dirty so :w persists the new file
+
+  -- :e! reload path: any LSP clients already attached to this buffer from
+  -- the previous load won't fire LspAttach again on the new content. Their
+  -- patched `notify` will mask the next `didChange`, but the document they
+  -- last saw is the previous file's text. Force a fresh `reset_server_view`
+  -- so the server picks up the new masked document immediately.
+  local ok_lsp, Lsp = pcall(require, "mercury.lsp")
+  if ok_lsp then
+    local clients = (vim.lsp.get_clients and vim.lsp.get_clients({ bufnr = buf }))
+      or (vim.lsp.buf_get_clients and vim.lsp.buf_get_clients(buf)) or {}
+    if next(clients) and Lsp.reset_server_view then
+      vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(buf) then
+          pcall(Lsp.reset_server_view, buf)
+        end
+      end)
+    end
+  end
   -- Seed outputs, cell metadata, and attachments from the loaded ipynb.
   -- Also seed an output record when exec_count is set but outputs are empty
   -- (Jupyter Lab's "Clear All Outputs" leaves execution_count intact). Without
@@ -289,6 +368,18 @@ local function load_ipynb(buf, path)
       out.items = c.outputs or {}
       out.exec_count = c.exec_count
       out.status = "idle"
+      -- Restore collapsed state from the canonical JupyterLab metadata
+      -- locations. Prefer `metadata.jupyter.outputs_hidden` (modern); fall
+      -- back to `metadata.collapsed` (classic). A truthy value in either
+      -- collapses the output on first render.
+      local meta = c.metadata or {}
+      local hidden = false
+      if type(meta.jupyter) == "table" and meta.jupyter.outputs_hidden then
+        hidden = true
+      elseif meta.collapsed then
+        hidden = true
+      end
+      if hidden then out._collapsed = true end
     end
   end
   -- Markdown-cell attachments are preserved across save/load but not
@@ -329,8 +420,17 @@ local function save_ipynb(buf, path, force)
   -- not be refused based on the original file's mtime history. SPEC 21.
   -- Compares {sec, nsec} so back-to-back writes within the same second
   -- on a fast filesystem still trip the guard. SPEC Invariant 28.
+  --
+  -- Path comparison uses realpath so symlinks resolve. On macOS the same
+  -- temp dir is reachable through `/var/folders/...` and
+  -- `/private/var/folders/...`; without realpath, an `:e` via one form
+  -- followed by `:w` of the other would silently skip the guard because
+  -- the string forms differ. Same problem for any user-symlinked project
+  -- (e.g. ~/work → /Users/carlo/Work).
   local loaded = vim.b[buf].mercury_loaded_path
-  local saving_same_file = loaded and path == loaded
+  local r_loaded = loaded and (vim.loop.fs_realpath(loaded) or loaded)
+  local r_path = vim.loop.fs_realpath(path) or path
+  local saving_same_file = r_loaded and r_loaded == r_path
   if saving_same_file then
     local stat = vim.loop.fs_stat(path)
     local stored = vim.b[buf].mercury_file_mtime

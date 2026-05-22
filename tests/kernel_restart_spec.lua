@@ -68,7 +68,13 @@ describe("kernel lifecycle messages", function()
     assert.equals("killed", nb.outputs["q2"].status)
   end)
 
-  it("Kernel:restart{ clear = true } also wipes cached outputs", function()
+  it("Kernel:restart{ clear = true } defers clear until `restarted` arrives", function()
+    -- SPEC Invariant 42: the clear is deferred (not synchronous in
+    -- Kernel:restart) so iopub frames from the old kernel that arrive
+    -- after restart() was called don't resurrect a writable output entry
+    -- via ensure_output and re-fill a cell the user just cleared. The
+    -- clear lands when the bridge emits `restarted` (after its lock-held
+    -- parent_to_cell drain).
     local nb = fake_notebook()
     local k = Kernel.new(nb)
     k.chan = 999999
@@ -77,9 +83,26 @@ describe("kernel lifecycle messages", function()
 
     k:restart({ clear = true })
 
-    -- clear_all_outputs wipes nb.outputs entirely; the previous "old" entry
-    -- is gone, not just status-flipped.
-    assert.is_nil(rawget(nb.outputs, "old"))
+    -- BEFORE `restarted`: outputs survive. The cell shows "killed" via
+    -- _cancel_in_flight, but its items are still there.
+    assert.is_not_nil(rawget(nb.outputs, "old"),
+      "clear must NOT run synchronously inside Kernel:restart — see SPEC #42")
+    assert.is_true(k._restart_clear_pending == true,
+      "the deferred-clear flag is set so the `restarted` handler knows to clear")
+
+    -- An iopub frame for the cell-id 'old' arriving here is a stale frame
+    -- from the old kernel. It MUST not resurrect output state, but Mercury
+    -- only enforces that via the bridge's `parent_to_cell` drain — Lua-side
+    -- guards against frames are lighter. The behavioral assertion is on
+    -- the deferred-clear semantics, so we test those directly.
+
+    k:_handle_msg({ type = "restarted" })
+
+    -- AFTER `restarted`: clear has now run, the cached output entry is gone.
+    assert.is_nil(rawget(nb.outputs, "old"),
+      "after `restarted` arrives, the deferred clear runs and outputs are dropped")
+    assert.is_nil(k._restart_clear_pending,
+      "the deferred-clear flag is consumed by the `restarted` handler")
   end)
 
   it("restarted message clears running, queue, and marks cell killed", function()
@@ -394,10 +417,13 @@ describe("kernel lifecycle messages", function()
     assert.is_false(k:_ensure_started())
   end)
 
-  it("clear_output(wait=True) at end of cell wipes prior output", function()
-    -- tqdm idiom: clear progress bar before exiting the loop. If we left
-    -- _pending_clear set after execute_done, the previous run's items would
-    -- survive into the next execute — confusing.
+  it("clear_output(wait=True) at end of cell PRESERVES prior output (IPython semantics)", function()
+    -- IPython.display.clear_output(wait=True) documented semantics: defer
+    -- the clear until the NEXT output arrives. If no further output arrives
+    -- before the cell finishes, the prior content STAYS. This is what
+    -- keeps tqdm's final progress-bar frame visible in JupyterLab / VS Code /
+    -- classic Notebook. Earlier Mercury releases incorrectly flushed the
+    -- pending clear at execute_done — diverging from every other notebook UI.
     local nb = fake_notebook()
     local k = Kernel.new(nb)
     k.running = { cell_id = "tqdm", started_at = 0 }
@@ -409,12 +435,14 @@ describe("kernel lifecycle messages", function()
     -- Deferred clear, no subsequent item.
     k:_apply_item(out, { type = "clear_output", wait = true })
     assert.is_true(out._pending_clear)
-    assert.equals(1, #out.items)   -- still pending
+    assert.equals(1, #out.items)
 
-    -- Cell finishes.
+    -- Cell finishes. Prior output must survive; the deferred-clear flag is
+    -- cleared so a re-execute starts clean.
     k:_handle_msg({ type = "execute_done", cell_id = "tqdm",
                     exec_count = 1, ms = 5 })
-    assert.equals(0, #out.items)
+    assert.equals(1, #out.items)
+    assert.equals("progress: 100%", out.items[1].text)
     assert.is_nil(out._pending_clear)
     assert.equals("ok", out.status)
   end)

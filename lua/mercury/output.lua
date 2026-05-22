@@ -54,12 +54,25 @@ local WIDGET_MIME = "application/vnd.jupyter.widget-view+json"
 
 local function pick_mime(data)
   if not data then return nil end
-  -- Prefer rich formats (image, latex, markdown) first; for text fallbacks,
-  -- prefer plain over html because our html→text is naive and would mangle
-  -- common cases like pandas DataFrame _repr_html_.
+  -- Mime preference order — matches Jupyter Lab's rendermime ordering for the
+  -- formats Mercury can render, with two deliberate divergences for a
+  -- terminal UI:
+  --
+  --   1. text/plain ranks ABOVE text/html. Most rich `_repr_html_` outputs
+  --      (pandas DataFrame, sklearn estimator, etc.) also emit a text/plain
+  --      companion — our html→text path mangles tables, so we'd rather
+  --      surface the plain repr than a flattened HTML version.
+  --   2. image/svg+xml ranks ABOVE image/png (matches Jupyter Lab — SVG is
+  --      sharper when both are present, as matplotlib commonly emits).
+  --   3. text/markdown ranks ABOVE text/latex. Latex rasterizes to an image,
+  --      which is heavy and loses interactivity; markdown styles inline via
+  --      treesitter HL groups. Matches Jupyter Lab when both are present.
+  --
+  -- The remaining ordering inside image/* matches Jupyter Lab.
   for _, m in ipairs({
-    "image/png", "image/jpeg", "image/svg+xml", "text/latex",
-    "text/markdown", "text/plain", "text/html",
+    "image/svg+xml", "image/png", "image/jpeg",
+    "text/markdown", "text/latex",
+    "text/plain", "text/html",
   }) do
     if data[m] then return m end
   end
@@ -223,9 +236,21 @@ function M.build_virt_lines(out, opts)
         -- When image.nvim is available it renders the image inline below the
         -- virt_lines; in that case the placeholder is just noise. Show one
         -- only as a fallback when no image renderer is loaded.
+        --
+        -- If the image renderer is available but the per-item descriptor
+        -- carries an `unavailable` flag (set by the image driver when the
+        -- on-disk cached bytes have been evicted between extract and
+        -- render), surface a clear text placeholder so the user knows why
+        -- nothing is appearing inline. Without this, the cell shows a tiny
+        -- (1-row) blank slot and the user has no diagnostic.
         local image_ok, Image = pcall(require, "mercury.image")
         if not image_ok or not Image.available() then
           body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
+        elseif item._mercury_image_unavailable then
+          body_lines[#body_lines + 1] = {
+            ("[%s: image bytes unavailable; re-execute the cell]"):format(mime),
+            "Comment",
+          }
         end
       elseif mime == "text/html" then
         local txt = html_to_text(_value_to_string(item.data["text/html"]))
@@ -307,11 +332,36 @@ function M.build_virt_lines(out, opts)
   return lines
 end
 
--- Get just the plain text of an output (for copy / scratch view).
+-- Get just the plain text of an output (for copy / scratch view). The
+-- surface here MUST mirror what `build_virt_lines` shows on screen —
+-- including the status pill, [empty output] placeholders, and the
+-- formatting rules around exec_count / ms suppression. SPEC Invariant 54.
 function M.to_plain_text(out)
   local lines = {}
-  if out.exec_count then
-    lines[#lines + 1] = ("Out[%s] %s ms"):format(out.exec_count, out.ms or 0)
+  -- Status-pill line, matching build_virt_lines' suppression rules:
+  --   * idle + no exec_count + ms <= 0 ⇒ no pill (fresh, never-run cell)
+  --   * killed/running/queued ⇒ a status word
+  --   * ok/error ⇒ "Out[N]  M ms  ✓" with "M ms" omitted when ms<=0
+  if out.status == "running" then
+    lines[#lines + 1] = "running…"
+  elseif out.status == "queued" then
+    lines[#lines + 1] = "queued"
+  elseif out.status == "killed" then
+    lines[#lines + 1] = "killed"
+  elseif out.status == "ok" or out.status == "error" then
+    local n = out.exec_count and ("[" .. tostring(out.exec_count) .. "]") or ""
+    local ms = (out.ms and out.ms > 0) and (tostring(out.ms) .. " ms") or ""
+    local glyph = (out.status == "ok") and "✓" or "✗"
+    local parts = { "Out" .. n }
+    if ms ~= "" then parts[#parts + 1] = ms end
+    parts[#parts + 1] = glyph
+    lines[#lines + 1] = table.concat(parts, "  ")
+  elseif out.status == "idle"
+      and (out.exec_count or (out.ms and out.ms > 0)) then
+    -- Loaded-from-disk cell with execution_count set: show "Out[N]" with
+    -- no ms (ms=0 means "unknown", not "instant"). Matches inline render.
+    local n = out.exec_count and ("[" .. tostring(out.exec_count) .. "]") or ""
+    lines[#lines + 1] = "Out" .. n
   end
   for _, item in ipairs(out.items or {}) do
     if item.type == "stream" then
@@ -327,17 +377,28 @@ function M.to_plain_text(out)
       end
     elseif item.type == "display_data" or item.type == "execute_result" then
       local mime = pick_mime(item.data)
-      if mime then
-        local raw = item.data[mime]
-        if mime:sub(1, 5) == "text/" or mime == "application/json" then
-          local s = _value_to_string(raw)
-          for _, ln in ipairs(Util.split_lines(s)) do lines[#lines + 1] = ln end
-        else
-          -- Binary-ish payload (image/*, application/octet-stream, etc.).
-          -- It's a base64 string at the wire level; len of the string is fine.
-          local s = type(raw) == "string" and raw or _value_to_string(raw)
-          lines[#lines + 1] = ("[%s, %d bytes]"):format(mime, #s)
+      if not mime then
+        -- Mirror build_virt_lines: emit the same placeholder for an output
+        -- with no recognizable mime payload.
+        lines[#lines + 1] = "[empty output]"
+      elseif mime == WIDGET_MIME then
+        lines[#lines + 1] = "[widget unsupported]"
+      elseif mime == "text/html" then
+        local txt = html_to_text(_value_to_string(item.data[mime]))
+        for _, ln in ipairs(Util.split_lines(txt)) do lines[#lines + 1] = ln end
+      elseif mime == "text/latex" then
+        for _, ln in ipairs(Util.split_lines(_value_to_string(item.data[mime]))) do
+          lines[#lines + 1] = ln
         end
+      elseif mime:sub(1, 5) == "text/"
+          or mime == "application/json"
+          or mime:find("%+json$") then
+        local s = _value_to_string(item.data[mime])
+        for _, ln in ipairs(Util.split_lines(s)) do lines[#lines + 1] = ln end
+      else
+        local raw = item.data[mime]
+        local s = type(raw) == "string" and raw or _value_to_string(raw)
+        lines[#lines + 1] = ("[%s, %d bytes]"):format(mime, #s)
       end
     end
   end
@@ -477,19 +538,35 @@ function M.jpeg_dimensions(bytes)
 end
 
 -- Read intrinsic dimensions from an SVG document. Tries literal width/height
--- attributes first (with px/pt unit stripping), then falls back to viewBox
--- when width/height are missing or non-pixel ("100%"). Returns nil if no
--- intrinsic size can be resolved (the caller then falls back to the full
--- available width + max-rows reservation).
+-- attributes first (px and pt absolute units accepted; pt is converted at
+-- the SVG default 96 DPI so a 100pt attribute becomes 133.33px), then falls
+-- back to viewBox when width/height are missing or non-pixel ("100%").
+-- Returns nil if no intrinsic size can be resolved (the caller then falls
+-- back to the full available width + max-rows reservation).
 function M.svg_dimensions(svg)
   if not svg or type(svg) ~= "string" or svg == "" then return nil end
+  -- Convert an SVG length attribute to pixels.
+  --
+  -- Matplotlib (and most desktop SVG generators) emit width/height in pt,
+  -- not px. Treating "100pt" as 100 pixels makes plots render ~25% too
+  -- small. We do the standard SVG-DOM conversion: 1in = 96px, 1pt = 1/72in,
+  -- so 1pt = 4/3 px. Relative units (`%`, `em`, …) and unparseable values
+  -- return nil so the caller falls back to viewBox.
   local function as_px(s)
     if not s then return nil end
-    -- Reject relative units ("100%", "1em", etc.) — viewBox is the
-    -- authoritative answer for those.
     if s:find("%%") then return nil end
-    local n = s:match("^(%d+%.?%d*)") or s:match("^(%.%d+)")
-    return n and tonumber(n) or nil
+    local num_str, unit = s:match("^(%d+%.?%d*)(.-)$")
+    if not num_str or num_str == "" then
+      num_str, unit = s:match("^(%.%d+)(.-)$")
+    end
+    local n = num_str and tonumber(num_str) or nil
+    if not n then return nil end
+    unit = (unit or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+    if unit == "pt" then return n * 4 / 3 end
+    -- Unknown unit (em, ex, in, cm, mm, …) → treat as not-resolvable so
+    -- viewBox wins. SVG default for unitless values is px.
+    if unit ~= "" and unit ~= "px" then return nil end
+    return n
   end
   local w = as_px(svg:match("<svg[^>]-width%s*=%s*\"([^\"]+)\""))
   local h = as_px(svg:match("<svg[^>]-height%s*=%s*\"([^\"]+)\""))

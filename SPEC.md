@@ -71,18 +71,43 @@ updating this spec.
 7. **Output rendering is coalesced to one render per event-loop tick.**
    Streaming kernel output must not produce N renders for N chunks.
 8. **`Kernel:stop` is graceful** — `shutdown` message before chanclose/jobstop.
-9. **Cancellation policy matches Jupyter.** Interrupt cancels *only* the
-   running cell (SIGINT → `KeyboardInterrupt`); queued cells continue.
-   Restart / stop / `kernel_dead` / unexpected bridge exit cancel both the
-   running cell *and* the queue. See "Execution → Cancellation policy".
-10. **Terminal output statuses are sticky everywhere.** Once a cell's
-    `out.status` reaches `error` or `killed`, NO subsequent path may
-    downgrade it. This applies to `execute_done` (the original case) AND to
-    every `_cancel_*` path: an interrupt arriving after an iopub `error`
-    must not flip the error pill to `killed`, and a `kernel_dead` arriving
-    after an `error` must not erase the error signal either. Implemented
-    via `_is_terminal(status)` guards in `_cancel_running`, `_cancel_queue`,
-    and `execute_done`.
+9. **Cancellation policy matches the Jupyter kernel-protocol semantics.**
+   Interrupt cancels *only* the running cell (SIGINT → `KeyboardInterrupt`);
+   queued cells continue. Restart / stop / `kernel_dead` / unexpected
+   bridge exit cancel both the running cell *and* the queue. See
+   "Execution → Cancellation policy".
+
+   This intentionally diverges from JupyterLab's UI-level behavior, which
+   *also* drops the frontend queue when the user hits Interrupt. Mercury
+   keeps the queue running because (a) the kernel's shell channel already
+   buffers the queued execute_requests by the time the interrupt arrives,
+   so dropping them client-side would only stop the next-to-run requests,
+   not the ones already in flight; and (b) "interrupt this cell, not all
+   of them" is what the verb `interrupt` literally means in the protocol.
+   To drop the queue too, use `:NotebookKernelRestart` or
+   `:NotebookKernelStop`.
+10. **Terminal output statuses are sticky against downgrades, with two
+    documented carve-outs.** Once a cell's `out.status` reaches `error` or
+    `killed`, NO subsequent path may *downgrade* it (e.g., an interrupt
+    arriving after an iopub `error` must not flip the error pill to
+    `killed`; a `kernel_dead` arriving after an `error` must not erase the
+    error signal). Implemented via `_is_terminal(status)` guards in
+    `_cancel_running`, `_cancel_queue`, and `execute_done`.
+
+    Two writes are deliberately unguarded:
+
+    (a) `_apply_item` for an iopub `error` frame sets `out.status = "error"`
+    unconditionally. This is an *upgrade* (`killed` → `error`): an
+    interrupt-triggered cell typically produces an iopub `error`
+    afterwards, and we want the error signal to win over the placeholder
+    `killed` from the interrupt path. The sticky rule applies to
+    downgrades only.
+
+    (b) `_pump` sets `out.status = "running"` when transitioning a cell
+    from `queued` to `running`. This is the re-execute path: the user
+    requested a fresh run of a cell whose previous run errored, and the
+    new run must produce a new live pill. The sticky rule applies within
+    a single execute, not across them.
 11. **A cell can be running or queued at most once.** `Kernel:execute`
     refuses to enqueue a cell that's already running or already in the
     queue. Without this, a rapid double-keystroke would push a second task
@@ -107,11 +132,12 @@ updating this spec.
     renders at 4 columns, not at 85% of the window. Matches VS Code /
     Jupyter Lab. See "Outputs → Image sizing".
 16. **Image handles are reused on identical content + placement.** image.nvim
-    handles are keyed by `(content_hash, place_key)` where place_key
-    encodes (anchor_row, index, total, width, render_offset_top). A
-    re-render with the same content at the same place is a no-op. Without
-    this, every TextChanged-debounced rescan recreates every handle —
-    flicker during streaming output.
+    handles are keyed by `content_hash` and compared via `same_placement`
+    (anchor row `y`, column index `x`, width, `render_offset_top`,
+    `with_virtual_padding`, target `window`). A re-render with the same
+    content at the same place is a no-op. Without this, every
+    TextChanged-debounced rescan recreates every handle — flicker during
+    streaming output.
 17. **Image handles for vanished cell ids are GC'd.** `Renderer:gc(present)`
     runs at the end of each ui render pass and clears image handles for
     any cell id not in the current cell set. Without this, deleted /
@@ -148,22 +174,41 @@ updating this spec.
     successful `:saveas` (detected by `nvim_buf_get_name == args.match`),
     `mercury_loaded_path` is updated so future saves to the new path are
     guarded against external modification.
-22. **Saves are atomic, and the fsync failure mode is loud.**
+22. **Saves are atomic AND durable, with loud fsync failure modes.**
     `save_ipynb` writes via `Util.atomic_write_file` which writes to
-    `<path>.mercury_save_tmp`, fsyncs, then `rename(2)`s into place. POSIX
-    rename is atomic within a single filesystem, so an observer (another
-    process, or a future `:e!` after a crash) sees either the previous
-    complete contents or the new complete contents — never a torn partial
-    write. Critical for a notebook editor where a `kill -9` / power loss
-    during `:w` would otherwise corrupt the user's work. The tempfile
-    lives next to the target so the rename stays intra-filesystem.
-    `fs_fsync` failures are surfaced (`return false, err`) instead of
-    being silently swallowed, so a disk-full / hardware error doesn't
-    quietly downgrade atomicity. A cross-filesystem rename (EXDEV — only
-    possible if the target path's directory itself is on a different
-    filesystem than where the tempfile landed, which is unusual since the
-    tempfile is `<path>..mercury_save_tmp`) is reported with a clear
-    error rather than silently falling back to a non-atomic copy.
+    `<path>.mercury_save_tmp`, fsyncs the tempfile, `rename(2)`s into
+    place, then fsyncs the parent directory. POSIX rename is atomic within
+    a single filesystem, so an observer (another process, or a future
+    `:e!` after a crash) sees either the previous complete contents or
+    the new complete contents — never a torn partial write. The parent-
+    directory fsync is required for durability: rename alone is atomic but
+    not synchronous w.r.t. the directory entry, and a power loss between
+    rename and the dirent flush can leave the entry pointing at the old
+    inode (or unresolved). jupyter-server, git, sqlite, and other
+    durability-sensitive writers all do the parent-dir fsync. Critical for
+    a notebook editor where a `kill -9` / power loss during `:w` would
+    otherwise corrupt the user's work. The tempfile lives next to the
+    target so the rename stays intra-filesystem. `fs_fsync` failures on
+    the tempfile are surfaced (`return false, err`) instead of being
+    silently swallowed, so a disk-full / hardware error doesn't quietly
+    downgrade atomicity. The parent-dir fsync is best-effort (some
+    platforms don't permit `open()` on a directory) — failure is logged
+    but doesn't fail the save, on the theory that "the file is on disk
+    but the dirent may be lost on power loss" is still strictly better
+    than "the save failed and we don't know how much state to roll back."
+    A cross-filesystem rename (EXDEV — only possible if the target path's
+    directory itself is on a different filesystem than where the tempfile
+    landed, which is unusual since the tempfile is
+    `<path>.mercury_save_tmp`) is reported with a clear error rather than
+    silently falling back to a non-atomic copy.
+
+    The write step ALSO checks `f:write`'s return value, not just whether
+    it threw. Lua's `io.write` reports short writes (disk-full ENOSPC, IO
+    errors) by returning `nil, err` — which a bare `pcall` does not catch.
+    Without this check, a disk-full during the write step would let
+    `fs_fsync` succeed on the truncated bytes and `rename` clobber the
+    original notebook with a partial file. The tempfile is removed on
+    failure so the next save isn't tripped by a stale `.mercury_save_tmp`.
 
 23. **`set_kind` is a structural mutation and obeys five rules.**
     Single source-of-truth for code↔markdown↔raw conversion. The function:
@@ -195,18 +240,60 @@ updating this spec.
     result from being reported, but the kernel may still execute the
     code with side effects the user didn't expect.
 
-26. **`interrupt` is the bridge's responsibility to reject in
-    `mode="existing"`.** The bridge must emit
-    `kernel_error{kind="unsupported"}` instead of sending a control-channel
-    `interrupt_request` — interrupt is signal-based and only works on a
-    locally-owned kernel subprocess. Pairs with Invariant 25's restart
-    handling for an explicit "what this transport can / cannot do".
+26. **Interrupt in `mode="existing"` attempts the control-channel
+    `interrupt_request`; restart in `mode="existing"` is explicitly
+    unsupported.**
 
-27. **`ExecuteTime` metadata is populated on execute.** Mercury writes
-    `cell.metadata.execution.iopub.execute_input` (started) and
-    `shell.execute_reply` (ended) as ISO-8601 timestamps. Matches Jupyter
-    Lab's nbformat `ExecuteTime` extension; preserved across save/load
-    via the standard `cell_metadata` round-trip.
+    For **interrupt** in existing mode: the bridge constructs and sends
+    a control-channel `interrupt_request` directly via
+    `kc.session.msg("interrupt_request", {})` + `kc.control_channel.send(...)`.
+    This is the Jupyter messaging spec's standard path for kernels that
+    advertise `interrupt_mode: "message"` in their kernelspec (Windows
+    kernels, kernels running in containers, kernels managed by
+    Jupyter Server). The send is fire-and-forget — control-channel
+    replies are observable but Mercury doesn't wait on them; the actual
+    interrupt outcome propagates via the next iopub frame (typically an
+    `error` carrying KeyboardInterrupt). Signal-mode kernels silently
+    drop the `interrupt_request` (no error, no kernel response) — the
+    user sees Mercury's `interrupted` notification but the kernel keeps
+    running. That matches JupyterLab's behavior against a non-
+    interruptible kernel; we can't do better without owning the
+    subprocess.
+
+    For **restart** in existing mode: the bridge rejects with
+    `kernel_error{kind="unsupported"}`. `BlockingKernelClient.shutdown(
+    restart=True)` only asks the kernel itself to exit, and from a
+    connection-file transport Mercury has no path to the kernel's
+    supervisor (Jupyter Server's `KernelManager`, systemd, etc.) to make
+    it come back. The 30-second `wait_for_ready` would time out almost
+    every time. Restart through the supervisor's own UI/API, then
+    `:NotebookKernelSelect` to reconnect. A future Jupyter-Server
+    HTTP/WebSocket transport would handle both via the REST endpoints;
+    that's out of scope (see "Non-goals").
+
+27. **`ExecuteTime` metadata uses JupyterLab's dotted-leaf-keys shape
+    with microsecond-precision ISO-8601 timestamps.** Mercury writes:
+
+    ```json
+    "metadata": {
+      "execution": {
+        "iopub.execute_input": "2024-01-01T12:00:00.123456Z",
+        "shell.execute_reply": "2024-01-01T12:00:01.789012Z"
+      }
+    }
+    ```
+
+    The keys `"iopub.execute_input"` and `"shell.execute_reply"` are
+    *literal dotted strings* — they are NOT a nested object path. This
+    matches JupyterLab's `@jupyterlab/celltags-extension`/ExecuteTime
+    extension exactly so notebooks round-trip Lab ↔ Mercury without losing
+    the timing field. Microsecond precision (`.123456Z`) comes from
+    `vim.uv.gettimeofday()` (or its legacy `vim.loop` alias); the previous
+    Mercury implementation hardcoded `.000000Z` and lost sub-second
+    information. The `iopub.execute_input` timestamp is sourced from the
+    kernel's iopub `execute_input` frame `header.date` when available
+    (i.e., the exact moment the kernel started executing); Mercury falls
+    back to its own clock if the bridge can't extract that field.
 
 28. **mtime guard uses nanosecond precision.** `vim.b.mercury_file_mtime`
     stores `{sec, nsec}`; the W12-style refusal compares both. Two
@@ -270,13 +357,21 @@ updating this spec.
     once that `attachment:` references won't render inline. Prevents the
     silent "where did my pasted image go?" UX cliff.
 
-36. **Stream items merge across interleavings on the render side.** The
-    side-table preserves the exact nbformat order (so round-trip is
-    byte-stable), but the render walks the items and groups consecutive
-    `name == "stdout"` (and consecutive `name == "stderr"`) into single
-    virtual blocks even when the side-table has a stdout/stderr/stdout
-    interleave. Matches Jupyter Lab's visual grouping; loses no
-    information because the underlying items keep their per-chunk text.
+36. **Stream items merge consecutive same-name runs on BOTH the render
+    side AND the save side.** The render walks live items and groups
+    consecutive `name == "stdout"` (and `name == "stderr"`) into single
+    virtual blocks — even when the in-memory side-table has a
+    stdout/stderr/stdout interleave — matching JupyterLab's visual
+    grouping. On save, `Ipynb._merge_stream_items` runs over the
+    denormalized output list and collapses runs of same-name streams
+    into single entries with concatenated text, matching the canonical
+    form produced by `nbformat.v4.normalize`. Without the save-side
+    merge, files Mercury writes re-shape on the next pass through any
+    nbformat-aware tool (Jupyter Server, nbconvert, nbdime, papermill),
+    producing meaningless diffs. The stdout/stderr/stdout interleave
+    survives the merge as three separate entries (stdout, stderr,
+    stdout) because the rule is *consecutive same-name*, not *all of
+    the same name*.
 
 37. **`_restart_pending` is cleared on every restart-exit path.** SPEC
     Invariant 25 closes the *entry* to the restart window (executes
@@ -310,9 +405,18 @@ updating this spec.
     tag and the reason (`contains ','`, `contains whitespace`, etc.),
     so the user can fix the JSON before the next save bakes in the
     silent loss. nbformat lets tags be arbitrary strings; this is a
-    documented round-trip lossiness — the alternative (URL-encoding
-    or a different in-buffer grammar) would diverge from the
-    `# %% tags=foo,bar` convention every other py:percent tool uses.
+    documented round-trip lossiness.
+
+    Mercury's `tags=foo,bar` grammar is a deliberate simplification of
+    jupytext's richer percent-format syntax (which supports a JSON-array
+    literal like `tags=["foo bar", "baz,qux"]`). Adopting jupytext's
+    array form would round-trip tags with whitespace / commas / brackets,
+    at the cost of a more complex separator grammar; for now Mercury
+    accepts the loss and surfaces it loudly. Users who need arbitrary
+    tag content should edit `metadata.tags` in the JSON directly and
+    leave the separator's `tags=` token off — `mercury_extras` will not
+    overwrite a JSON-only tag list since the separator is authoritative
+    only for what it explicitly mentions.
 
 40. **`delete_cell` interrupts the kernel for a running cell.** If the
     deleted cell is currently `self.kernel.running`, `Kernel:interrupt`
@@ -324,6 +428,440 @@ updating this spec.
     either way (Invariant 18 covers the conversion case; this is the
     deletion counterpart). Side effects already produced by the running
     cell are NOT rewound — the user accepts that by choosing delete.
+
+41. **`display_id` round-trips through save / load under
+    `metadata.mercury.display_id`.** Mercury's in-memory output table
+    tracks it as `_display_id`; the encoder writes it under
+    `metadata.mercury.display_id` on `display_data` / `execute_result`
+    outputs. The decoder reads it back from either that canonical
+    location OR the legacy `transient.display_id` sibling that older
+    Mercury releases (and a tiny number of in-the-wild tools) wrote.
+
+    Why not the sibling `transient.display_id` shape: `transient` is a
+    Jupyter messaging-protocol concept, not an nbformat output field.
+    The nbformat v4 schema for `display_data` / `execute_result` does
+    NOT list `transient` as a sibling; strict nbformat validators reject
+    the shape, and `nbformat.write` (the canonical writer) never emits
+    it. The Mercury-namespaced location under `metadata` is the right
+    place for any Mercury-specific extension data; nbformat tolerates
+    unknown keys under `metadata` by design.
+
+    Without this round-trip, saving then reopening a notebook silently
+    decoupled outputs from the display_id that other cells use to
+    update them — the next `update_display(display_id=…)` call would
+    fail to find a matching block and the update would be lost. The
+    kernel-side `update_display_data` walker keys on `_display_id` for
+    live outputs (`kernel.lua:_apply_item`); the disk and live state
+    stay in lockstep through the canonical metadata location.
+
+42. **`Kernel:restart{ clear = true }` defers the clear until `restarted`
+    arrives.** A synchronous `nb:clear_all_outputs()` in `restart()`
+    raced iopub frames from the dying old kernel — those frames hit
+    `ensure_output` and resurrected the cleared cells before the bridge
+    finished draining `parent_to_cell` (which is the moment after which
+    no more old-kernel frames can be processed). The deferred-clear
+    flag (`_restart_clear_pending`) is consumed by the `restarted`
+    handler; on failed-restart paths (`kernel_error`, `kernel_dead`,
+    unexpected exit, `stop()`) the flag is cleared without running
+    the clear — outputs stay where they are, and the user can re-run
+    RestartClear after the next successful restart.
+
+    In `mode="existing"`, the deferred-clear is irrelevant: the bridge
+    rejects restart entirely with `kernel_error{kind="unsupported"}`
+    (Invariant 26), so `restarted` never arrives and `_restart_clear_pending`
+    is cleared by the `kernel_error` path. The clear's "wait for the
+    parent_to_cell drain" rationale only applies to the local-mode path
+    where the drain is observable.
+
+43. **JSON encode is fully deterministic: sorted keys, 1-space indent.**
+    `Ipynb.encode` routes through `_encode_pretty` (which alphabetizes
+    keys at every nesting level) rather than `vim.json.encode + reindent`
+    (which preserves Lua iteration order). Without the sorted path,
+    saving the same notebook twice could shuffle keys — generating
+    diffs that are pure churn. Strengthens Invariant 3 (which already
+    promised "sorted keys" but was not enforced in the live code path).
+
+44. **Empty nbformat object fields serialize as `{}` not `[]`, including
+    nested per-mime values.** Top-level `metadata`, cell-level
+    `metadata`, output-level `metadata`, output-level `data`, AND each
+    per-mime value inside `data` (e.g., an empty `application/json`
+    payload, an empty `application/vnd.foo+json` object) are all routed
+    through `_ensure_dict`, which converts an empty Lua table to
+    `vim.empty_dict()` so the encoder emits `{}`. nbformat declares these
+    fields as objects; emitting `[]` is a hard schema violation that
+    nbformat validators reject.
+
+    The nested coverage matters in practice: `IPython.display.JSON({})`
+    emits an `application/json` value of `{}` which Mercury must
+    preserve as an object. Without the per-mime empty-dict wrap, the
+    Lua-side empty table would re-emit as `[]` on the next save.
+    Strengthens Invariant 4 (which covered the in-memory sentinel path
+    for empty objects loaded *from disk*; this covers the symmetric
+    path for empty tables created *in memory* — fresh code cells whose
+    kernel didn't emit metadata, fresh display_data with no metadata
+    block, IPython.display.JSON({}), etc.).
+
+45. **`Kernel:interrupt` and `Kernel:restart` refuse during the
+    stop/restart teardown windows.** `_stopping` and `_restart_pending`
+    are checked at entry. Without these guards, hammering `:NotebookKernelInterrupt`
+    during the 500ms `jobwait` window would write to a channel that's
+    being torn down (visible misbehavior: confusing notifies, the
+    interrupt may or may not reach the dying kernel before SIGKILL);
+    hammering `:NotebookKernelRestart` during the same window would
+    re-enter the restart state machine on a half-dead transport.
+    Symmetric with Invariant 13 (which already guarded `_ensure_started`)
+    and Invariant 25 (which already guarded the execute path).
+
+46. **`_skipped_at_save` is populated on every save with at least one
+    in-flight cell.** `to_ipynb_struct` writes the in-flight set to
+    `self._skipped_at_save` so the kernel's `execute_done` branch can
+    mark the buffer modified when the cell finally finishes. Without
+    this population pass, the read-side flush logic in
+    `kernel.lua:_handle_msg` was dead code: the user could save during
+    a long-running cell, wait for it to finish, run `:w` again — and
+    the cell's output would silently never land on disk because vim
+    tracks `modified` on text changes only. Closes a real data-loss
+    hole in Invariant 14's "save again to flush" contract.
+
+47. **Rescan id-rename migration covers both equal-length and
+    unequal-length cell-set transitions.** Two code paths:
+
+    (a) `#prev_cells == #self.cells`: position-aligned walk. For each
+    position `i` whose id changed AND the previous id has no surviving
+    cell anywhere in the new set, migrate the side tables (`outputs`,
+    `cell_metadata`, `cell_attachments`), the kernel pointers
+    (`self.kernel.running.cell_id`, every matching
+    `self.kernel.queue[i].cell_id`), and the save-bookkeeping
+    (`self._skipped_at_save`).
+
+    (b) `#prev_cells ~= #self.cells`: position alignment is broken by
+    the insert / delete, so we fall back to set arithmetic. If exactly
+    ONE previously-known id has vanished from the new set AND that id
+    had side-table entries AND exactly ONE id in the new set is fresh
+    (no side-table entries), the pairing is unambiguous — migrate. Any
+    ambiguity (multiple vanished, multiple new) leaves the side tables
+    to GC, on the conservative principle that a rename heuristic gone
+    wrong silently corrupts the user's data while a missing rename
+    just makes the user re-execute.
+
+    Without (a), the rename left kernel pointers pointing at the dead
+    id: `_live_code_cell` dropped every subsequent iopub frame (silent
+    output loss on the running cell). Without (b), a rename + unrelated
+    delete in the same edit batch would lose the renamed cell's
+    outputs. Strengthens Invariant 4 ("ids are stable across edits")
+    by making the kernel state and the unequal-length case both honor
+    the migration.
+
+48. **`_cancel_running` resets transient execution fields on the output.**
+    `out._pending_clear` and `out._started_iso` are cleaned up alongside
+    the status flip. Without this reset, a re-execute of the same cell
+    after `:NotebookKernelInterrupt` would silently wipe the first chunk
+    of new output (because `_pending_clear` from the killed run carries
+    over and gets honored by the next `_apply_item`); and a stale
+    `_started_iso` would land in the cell_metadata.execution block on
+    the next `execute_done`, producing an ExecuteTime "start" without a
+    matching "end" timestamp. Sticky-terminal status semantics
+    (Invariant 10) are preserved — `error` doesn't downgrade to
+    `killed` — but the transient bookkeeping fields are unconditionally
+    cleared.
+
+49. **`merge_below` refuses on a busy cell.** Symmetric with `set_kind`
+    (Invariant 18) and `delete_cell` (Invariant 40): if either the
+    current cell OR the cell being merged into it is in `kernel.running`
+    or `kernel.queue`, the merge is refused with a notify. Without this,
+    a merge would silently drop the merged-away cell's id from
+    `nb.cells`; iopub frames for that id are then dropped by
+    `_live_code_cell` (Invariant 19) while the kernel keeps executing
+    the code with side effects (file writes, network calls) that the
+    user can no longer observe. The conservative choice is to refuse —
+    the user can `:NotebookKernelInterrupt` then retry.
+
+50. **`load_ipynb` preserves a parsed-but-empty-cells file.** When the
+    JSON parses but `cells: []`, the load path keeps the original
+    `metadata` (kernelspec, language_info, etc.) and synthesizes a
+    single placeholder code cell so the user has somewhere to edit. The
+    buffer is NOT marked modified, so a casual `:w` with no edits won't
+    fire `BufWriteCmd` and won't overwrite the original file. Pre-fix:
+    mercury replaced the parsed empty notebook with `blank_notebook()`
+    and marked the buffer `fresh=true`, silently rewriting the file
+    with hard-coded default metadata on the next save. Pairs with
+    Invariant H13 (malformed JSON → readonly raw bytes) — different
+    failure mode, same protect-user-data principle.
+
+51. **`Kernel:execute` strips the trailing visual-gap blank line from
+    the body before sending to the bridge.** `to_buffer_lines` inserts
+    a blank line between cells for visual separation; `cell_body_lines`
+    includes it because `body_end` covers it. The kernel must not see
+    this blank — it's purely a UI artifact, never typed by the user,
+    and `to_ipynb_struct` already strips it on save (Invariant for
+    "Trailing blank lines on non-last cells"). Without this trim, a
+    `%timeit foo` magic with a trailing blank could be interpreted
+    differently, and `??`-style source introspection would display
+    spurious trailing whitespace. Symmetric: the visible gap is the
+    same idea on both sides — display-only.
+
+52. **`_apply_item update_display_data` fires `on_change` when the
+    update mutates a DIFFERENT cell's items.** Defense in depth: the
+    same-cell case is covered by the caller's existing `on_change` (in
+    `_handle_msg`'s `output` branch); the cross-cell case must not
+    depend on the caller's discipline because a missing render here
+    means the update lands in state without ever reaching the screen.
+    `on_change` is coalesced (Invariant 7) so a redundant call collapses
+    into the same tick — no double-render cost. Strengthens
+    cross-cell `update_display(display_id=…)` semantics.
+
+53. **`rescan` interrupts the kernel when a busy code cell is converted
+    to non-code via direct text edit.** `set_kind` already refuses on
+    busy (Invariant 18), but a user hand-editing the separator from
+    `# %% id=X` to `# %% id=X [markdown]` bypasses `set_kind` — the
+    conversion lands via the rescan path. Without an interrupt, the
+    kernel keeps executing the original code (side effects continue)
+    while iopub frames are silently dropped by `_live_code_cell`
+    (Invariant 19). When `rescan` detects that `kernel.running.cell_id`
+    now points at a cell whose kind has flipped away from `code`, it
+    calls `kernel:interrupt()` so the kernel work stops in a
+    user-observable way. Symmetric with `delete_cell`'s interrupt
+    path (Invariant 40); queued-only cells need no interrupt because
+    rescan's "no longer code" queue filter evicts them and there's
+    no live execution to SIGINT.
+
+54. **`Output.to_plain_text` mirrors what `build_virt_lines` shows.**
+    The copy text (`:NotebookOutputCopy`) and the scratch view
+    (`:NotebookOutputView`) must reflect the rendered output, not the
+    raw mime payload. Concretely:
+
+    - The status pill is emitted as a leading line: `Out[N]  142 ms  ✓`
+      for ok, `Out[N]  ✗` for error (the same `0 ms` suppression that
+      the visible pill uses applies here), `running…` / `queued` /
+      `killed` for the in-flight statuses. Fresh-cell idle outputs emit
+      no pill (matches the visible render).
+    - `text/html` is stripped through `html_to_text` (same as the inline
+      render).
+    - `text/markdown` keeps its raw source (the inline render styles it
+      but the underlying text is what the user wrote).
+    - `application/vnd.*+json` and `application/json` JSON-encode for
+      human readability.
+    - The `widget-view+json` mime emits `[widget unsupported]`.
+    - An output with no recognizable mime emits `[empty output]` (mirrors
+      the visible render's same placeholder).
+    - True binary payloads (`image/*`, `application/octet-stream`) emit
+      the `[mime, N bytes]` placeholder.
+
+    Without this, "what you see" and "what you copy" diverged for the
+    most common HTML-only output — e.g., a pandas DataFrame's
+    `_repr_html_` would render as stripped text on screen but copy as
+    raw `<table>…` markup.
+
+55. **`Kernel:list_kernels` has a bounded timeout.** If the bridge
+    accepts the request but never replies (bridge bug, wedged kernel
+    spec manager), the registered callbacks fire after 5 seconds with
+    an empty list and a WARN. Without this, the picker would never
+    open and the user would have no recovery short of
+    `:NotebookKernelStop`. The timer is cancelled on the legitimate
+    reply, on `Kernel:stop()`, and on bridge exit; multiple in-flight
+    `list_kernels` calls share the one timer (matching the existing
+    callback-queue fan-out).
+
+56. **Image renderer prefers the currently-focused window showing the
+    buffer, falling back to the first valid one.** `vim.fn.win_findbuf`
+    enumerates windows in tab/creation order, which often doesn't match
+    user focus when the buffer is open in multiple splits. Mercury's
+    selection rule:
+
+    1. If the currently-focused window shows this buffer, use it.
+    2. Otherwise walk the win_findbuf list and pick the first valid one.
+    3. If no valid window exists, return early WITHOUT touching the
+       per-cell handle cache — image.nvim's render path requires a live
+       window, and the `BufWinEnter` autocmd in `init.lua` re-runs
+       `renderer:render()` when the buffer is revealed, so cached
+       handles survive the gap and the next render reuses them cheaply
+       via `same_placement()`.
+
+    Without rule (1), a user with the notebook open in two splits saw
+    images render into whichever split happened to be enumerated first
+    by `win_findbuf` — typically a background split, leaving the
+    focused split visually empty. Rule (2) is the stale-window guard:
+    `win_findbuf` can return a handle that closed between the kernel
+    emitting `output` and the coalesced render firing.
+
+57. **nbformat v3 is refused on load with a clear migration hint.**
+    nbformat v3 has a completely different schema (`worksheets`,
+    `prompt_number` instead of `execution_count`, etc.). Reading it as
+    v4 silently produces a notebook with no cells, and a casual `:w`
+    then overwrites the original with Mercury's placeholder —
+    destroying the user's data. The decoder refuses with
+    `"nbformat v3 is not supported by Mercury (reads v4 only). Run:
+    jupyter nbconvert --to notebook --inplace <file>"` so the user can
+    upgrade in place before Mercury touches the file. Forward-incompat
+    versions (a hypothetical nbformat v5) are also refused for the
+    same reason.
+
+58. **Multiline text mimes and stream text serialize as
+    arrays-of-strings on save.** `nbformat.write` canonical form for
+    multiline `text/*` mimes and stream `text` is an array of strings,
+    one per source line, with `"\n"` retained on all but optionally the
+    last (`text.splitlines(keepends=True)`). Mercury holds these as a
+    single string in memory for ease of edit / render and converts back
+    to array form via `Ipynb._to_multiline_strings` on save. Without
+    this, files Mercury writes diff loudly against files Jupyter Lab /
+    nbconvert / nbformat.write produce, and "byte-stable round-trip"
+    (Invariant 3's spirit) fails for any notebook that came from
+    upstream tooling. A single-line value stays a plain string —
+    nbformat accepts both forms.
+
+59. **`_denest_mime_value` is scoped to `text/*` mimes.** nbformat's
+    multilineString form (string OR array-of-strings, joined on read)
+    applies *only* to text mimes; for `application/json` and
+    `application/vnd.*+json` payloads, an array of strings is
+    legitimate data (e.g., a Plotly trace's categorical axis labels,
+    a JSON-Schema enum, a Vega-Lite spec field). The pre-fix denest
+    joined every string-array payload, silently corrupting
+    JSON-mime arrays to a single concatenated string. The fix passes
+    the mime key to the denester and skips the join for non-text mimes.
+
+60. **Unknown `cell_type` values round-trip losslessly.** The decoder
+    renders any cell_type other than `code` / `markdown` / `raw` as
+    `code` internally (Mercury can't display a hypothetical `sql` or
+    `julia` cell type), but stashes the original cell_type under
+    `metadata.mercury_original_cell_type`. The encoder restores it on
+    save and strips the stash so the file looks identical to its
+    pre-Mercury form. nbformat is a living format; this avoids data
+    loss as new cell types are added by upstream specs.
+
+61. **`update_display_data` for a stale display_id is silently dropped.**
+    When `IPython.display.update_display(display_id=X)` fires and no
+    output anywhere in the notebook holds display_id `X` (because the
+    cell that created it was deleted, or its outputs were cleared),
+    JupyterLab silently drops the update. Mercury matches: in
+    `_apply_item`'s `update_display_data` branch, if `did` is non-nil
+    and no items were updated, we return without inserting a phantom
+    display_data block in the calling cell. The previous fallthrough
+    created a ghost output in the wrong cell.
+
+62. **`stop_on_error=True` on every `execute_request`.** Matches
+    JupyterLab's "Run cells" semantics: if the running cell errors,
+    any execute_requests already buffered on the shell channel are
+    skipped by the kernel rather than running through. Mercury's
+    client-side queue is one-at-a-time so this mostly matters as a
+    belt-and-braces guard against any future path that submits
+    multiple requests in flight; aligning with Lab's default also
+    keeps notebook behavior consistent for users who switch between
+    the two clients.
+
+63. **`execute_input` is forwarded from iopub for live `In[N]`.** The
+    kernel publishes `execute_input` on iopub the moment it pulls the
+    request off the shell channel; this is what JupyterLab / VS Code
+    use to bind the `In[N]` prompt eagerly, well before
+    `execute_reply` lands. The bridge forwards a synthesized
+    `execute_input` message with `cell_id`, `exec_count`, and
+    `started_iso` (taken from the iopub header's `date` field — the
+    canonical kernel-side timestamp); Mercury's Lua side binds
+    `out.exec_count` and `out._started_iso` immediately. ExecuteTime
+    metadata (Invariant 27) then reflects the kernel's start
+    timestamp rather than Mercury's `_pump`-time estimate.
+
+64. **`clear_output(wait=True)` preserves prior output at end-of-cell.**
+    `IPython.display.clear_output(wait=True)` documented semantics: defer
+    the clear until the next output arrives; if no output follows before
+    the cell finishes, the prior content stays. This is what keeps
+    tqdm's final progress-bar frame visible after the loop exits. The
+    `execute_done` handler clears the deferred-clear flag (so a
+    re-execute of the same cell starts clean) but does NOT wipe
+    `out.items` — matching JupyterLab / VS Code / classic Notebook
+    behavior.
+
+65. **Collapsed output state persists across save/load under JupyterLab's
+    canonical metadata locations.** Mercury writes BOTH
+    `cell.metadata.collapsed = true` (classic-Notebook key, still
+    tolerated by Lab) AND `cell.metadata.jupyter.outputs_hidden = true`
+    (Lab/VS Code's modern key) when a cell's output is collapsed.
+    Reading: either key collapses the output on load. Toggling expand
+    explicitly clears both. Without this, the collapse state was
+    in-memory-only and reopening the notebook always showed every
+    output expanded.
+
+66. **LSP `reset_server_view` runs before any LspAttach can fire.**
+    `load_ipynb` calls `attach_buffer(buf)` (which registers the
+    notebook in `Notebook._registry`) *before* assigning
+    `vim.bo[buf].filetype = "python"`. Setting filetype synchronously
+    fires `FileType` and Neovim's auto-attach handler then fires
+    `LspAttach` — by which point `Notebook.get(buf)` returns a live
+    notebook and Mercury's LspAttach handler can call
+    `reset_server_view(buf)` with the masked text. Without this
+    ordering, the very first didOpen reached pyright / ruff / mypy
+    with the raw markdown lines, and those servers cached a parse
+    that diverged silently from Mercury's mask. On `:e!` reloads, an
+    already-attached LSP client doesn't fire LspAttach again;
+    `load_ipynb` explicitly schedules a `reset_server_view` for those
+    clients so the new file's masked text reaches the server
+    immediately.
+
+67. **mtime guard path comparison resolves symlinks.** Both the
+    loaded path (stored on the buffer) and the save target are passed
+    through `vim.loop.fs_realpath` before string-comparison.
+    Without this, an `:e` via `/var/folders/...` and a later `:w` via
+    `/private/var/folders/...` (macOS's typical symlinked temp dirs)
+    would compare unequal, the guard would short-circuit on
+    "different file (saveas semantics)", and external modifications
+    to the actual file would not trigger the W12-style refusal.
+
+68. **`format_separator` id-assignment is a splice, not a rebuild.**
+    When `scan_lines` flags a cell as missing an id, `_apply_id_assignments`
+    splices `id=<new>` into the existing header line via a regex
+    substitution — preserving any non-token text the user typed (e.g.,
+    `# %% Cell title` becomes `# %% id=abc12345 Cell title`). For
+    `dup_rewrite` cells (a yank-and-paste that duplicated an id), only
+    the `id=` token is replaced, leaving the rest of the header line
+    text intact. The full `format_separator` rebuild is reserved for
+    paths that genuinely synthesize a fresh separator (e.g.,
+    `:NotebookCellNewBelow`) where there is no existing line text to
+    preserve.
+
+69. **`_skipped_at_save` is cleared on unexpected bridge exit.** The
+    table tracks cells that were in-flight at the last `:w` so a later
+    `execute_done` can mark the buffer modified (so the user's next
+    `:w` captures the now-finished output — Invariant 14). If the
+    bridge dies before the cell finishes, the cell never emits
+    `execute_done`; without clearing `_skipped_at_save` the table would
+    grow unboundedly across crashes and the "save again to flush"
+    contract would silently break. `_handle_exit`'s unexpected-exit
+    path clears the table.
+
+70. **`MercuryAttached` fires once per buffer, not once per reload.**
+    `:e!` and similar reload paths detach + reattach the notebook
+    repeatedly across a session, but `User MercuryAttached` consumers
+    (statusline refresh, lazy keymap install, per-buffer LSP wiring)
+    are typically idempotent-but-expensive and the user expects "this
+    runs when I open the notebook." Mercury sets
+    `vim.b[buf].mercury_user_attached_seen` after the first emit; the
+    autocmd doesn't fire again for the same buffer. (Other internal
+    re-attach paths — augroup recreation, rescan, render — still run
+    every reload as before.)
+
+71. **Window-local opts (foldmethod / foldexpr / conceallevel) are
+    saved against the user's pre-mercury values, not mercury values.**
+    The BufEnter handler that snapshots the previous wo state skips
+    the save when it detects that the window already shows mercury
+    wo (foldexpr containing "mercury"). Without this, switching
+    between two mercury notebooks in the same window — A → B → A —
+    could snapshot mercury's own foldexpr as the restore target;
+    leaving the window then leaked mercury's fold/conceal to the next
+    non-mercury buffer.
+
+72. **LSP responses with positions inside markdown cells are filtered.**
+    The diagnostic filter (Invariant 32) already does this for
+    `textDocument/publishDiagnostics`. Mercury extends the same idea to
+    `textDocument/inlayHint` and `textDocument/codeLens` responses:
+    any hint / lens whose `position.line` (or `range.start.line`) falls
+    inside a markdown cell is dropped before vim renders it. The
+    motivating case is pyright's type-comment matcher: a markdown line
+    containing prose like `"the type: int parameter"` becomes
+    `"# the type: int parameter"` in the masked view, which pyright
+    pattern-matches as a `# type:` type-comment and emits an inlay hint
+    on it. Without the filter, the hint surfaces on top of the user's
+    prose — confusing and misleading. With the filter, markdown rows are
+    silently dropped from every position-bearing proactive response,
+    matching the "markdown cells are invisible to the LSP" contract.
 
 ## Goal
 
@@ -485,9 +1023,12 @@ nbformat v4 defines three cell types and mercury preserves all three:
 | `markdown` | `markdown` | Renders as markdown via treesitter included regions. Has no outputs. May carry `attachments`. Masked as `# ` comments for the LSP. |
 | `raw` | `raw` | Verbatim text. Doesn't execute. No outputs. Not masked from the LSP (treated as code, so it's visible to pyright as ordinary python text — accept that LSP may flag it). Round-trips losslessly. |
 
-Round-trip discipline: an unknown `cell_type` on disk is preserved as
-`code` (the only safe fallback), but `raw` is recognized and preserved
-verbatim across save/load.
+Round-trip discipline: an unknown `cell_type` on disk is rendered as
+`code` in the buffer (Mercury can't display a hypothetical `sql` /
+`julia` / future cell type), but the original `cell_type` is stashed
+under `cell.metadata.mercury_original_cell_type` and restored on save
+— so the file is byte-equivalent to its pre-Mercury form. `raw` is
+recognized natively and preserved verbatim. SPEC Invariant 60.
 
 ### Cell attachments
 
@@ -586,8 +1127,13 @@ Rendering:
   a 4000-pixel-wide photo gets downscaled to 85% of the window. Matches
   VS Code / Jupyter Lab's "show at intrinsic resolution if smaller, scale
   down if larger" contract. SVG follows the same rule: `svg_dimensions`
-  reads the document's `width`/`height` attributes (px or pt) or falls
-  back to the `viewBox`. SVGs that declare no resolvable intrinsic size
+  reads the document's `width`/`height` attributes and converts to
+  pixels — `px` (or unitless, which SVG defaults to px) passes through;
+  `pt` converts at the SVG-default 96 DPI (1pt = 4/3 px, so 72pt → 96px);
+  relative units (`%`, `em`, …) and unknown absolute units (`in`, `cm`,
+  …) return nil so the `viewBox` wins. Matplotlib emits SVGs in pt, so
+  the conversion is load-bearing: without it, plots rendered at ~75% of
+  their intended size. SVGs that declare no resolvable intrinsic size
   fall through to the "unknown dimensions" path (full available width +
   max-rows reservation), same as a PNG with an unreadable IHDR.
 - **Render height = clamp(natural_height_at_that_width, 1,
@@ -627,20 +1173,32 @@ Status pill rules:
 
 Mime preference order in `output.pick_mime`:
 
-1. `image/png`
-2. `image/jpeg`
-3. `image/svg+xml`
-4. `text/latex` (rasterized; renders as image)
-5. `text/markdown` (rendered via `render-markdown.nvim` when available —
-   see "Markdown rendering")
+1. `image/svg+xml`
+2. `image/png`
+3. `image/jpeg`
+4. `text/markdown`
+5. `text/latex` (rasterized; renders as image)
 6. `text/plain`
 7. `text/html` (lowest priority — pandas etc. always emit text/plain
    alongside; html_to_text is naive and loses table structure)
 
-This deliberately differs from Jupyter Lab / nbviewer, which prefer
-`text/html` above `text/plain` (so pandas DataFrames render as HTML
-tables). In a terminal those tables degrade to soup; the plain repr is
-the readable one. Documented divergence.
+This order matches Jupyter Lab's `rendermime` ordering for the formats
+Mercury renders, with two documented divergences for a terminal UI:
+
+- `text/plain` ranks ABOVE `text/html`. Most rich `_repr_html_` outputs
+  (pandas DataFrame, sklearn estimator, etc.) also emit a `text/plain`
+  companion; our `html_to_text` mangles tables, so we'd rather surface
+  the plain repr than a flattened HTML version. Documented divergence
+  from Jupyter Lab / nbviewer.
+- `text/latex` ranks BELOW `text/markdown`. Latex rasterizes to an
+  image (heavy, no interactivity); markdown styles inline via the
+  markdown treesitter highlight groups. When both are present, the
+  markdown rendering is the better terminal experience.
+
+SVG ranks above PNG and JPEG (matplotlib commonly emits both when its
+`svg` backend is enabled; SVG is sharper at any size) — this matches
+Jupyter Lab. The intra-image order (`svg > png > jpeg`) is uniform
+across Lab / VS Code / Mercury.
 
 `application/vnd.jupyter.widget-view+json` is recognised explicitly and
 rendered as a single `[widget unsupported]` line — never falls through to
@@ -705,12 +1263,19 @@ bridge supports two transports:
 
 2. **Existing connection file.** `mercury.setup{ kernel = { mode =
    "existing", connection_file = "/path/to/kernel-XXX.json" } }` — bridge
-   connects to a kernel that's already running, locally or via SSH-tunneled
-   ports. **Interrupt is unsupported in this mode** (signal-based, requires
-   owning the kernel process) — the bridge emits `kernel_error` with
-   `kind="unsupported"`. **Restart is supported** when the kernel has an
-   upstream supervisor (jupyter server etc.) that will relaunch it; see
-   "Restart" below.
+   connects to a kernel that's already running, locally or via
+   SSH-tunneled ports. **Interrupt** sends a control-channel
+   `interrupt_request` directly via the Jupyter messaging Session API —
+   works for kernels that advertise `interrupt_mode: "message"` in their
+   kernelspec (Windows kernels, container-managed kernels). For
+   signal-mode kernels the request is silently dropped by the kernel
+   itself; the user sees Mercury's `interrupted` notification but the
+   kernel keeps running (no way to do better without owning the
+   subprocess — matches JupyterLab's behavior against the same kernel).
+   **Restart is NOT supported** — the bridge has no path to whatever
+   supervisor owns the kernel process; restart the kernel through that
+   supervisor and `:NotebookKernelSelect` to reconnect. SPEC
+   Invariant 26.
 
 Wire framing: the bridge writes one JSON message per line, but Neovim's
 `channel-lines` callback may slice a single message across multiple
@@ -722,8 +1287,16 @@ silently dropped.
 
 Requests: `init`, `execute`, `interrupt`, `restart`, `shutdown`, `list_kernels`.
 
-Responses: `execute_start`, `output`, `execute_done`, `interrupted`,
-`restarted`, `kernel_dead`, `kernel_error`, `kernels_listed`.
+Responses: `execute_start`, `execute_input`, `output`, `execute_done`,
+`interrupted`, `restarted`, `kernel_dead`, `kernel_error`, `kernels_listed`.
+
+The `execute_input` response forwards the kernel's iopub
+`execute_input` frame as soon as the kernel pulls the request off its
+shell channel. Lua binds `out.exec_count` (so the live `In[N]` prompt
+appears immediately, matching JupyterLab / VS Code) and `out._started_iso`
+(so the ExecuteTime metadata reflects the kernel's actual start
+timestamp — `header.date` — rather than Mercury's `_pump`-time
+estimate). SPEC Invariant 63.
 
 `kernel_error` carries an optional `kind` discriminator:
 
@@ -739,17 +1312,20 @@ bridge acknowledges; later cells in the queue display as `queued`.
 
 ### Streaming clear (`clear_output`)
 
-Jupyter's `clear_output(wait=True)` semantics: "defer the clear until the
-next output arrives" — used by tqdm to clear its progress bar before
-emitting the next frame. Mercury implements this as a `_pending_clear`
-flag on the output state.
+`IPython.display.clear_output(wait=True)` semantics: defer the clear
+until the *next* output arrives — used by tqdm to atomically replace its
+progress bar with the next frame. Mercury implements this as a
+`_pending_clear` flag on the output state.
 
 End-of-cell handling: if `_pending_clear` is set when `execute_done`
 arrives (i.e. the cell finished without emitting further output after
-the deferred-clear request), mercury honors the clear. The cell ends with
-an empty items list, matching what the user explicitly asked for. This
-diverges from classic notebook (which leaves the prior output visible if
-nothing follows) and matches modern Jupyter Lab / VS Code behaviour.
+the deferred-clear request), Mercury PRESERVES the prior output — it
+clears `_pending_clear` so the next execute starts clean, but leaves
+`out.items` untouched. This matches the documented IPython behavior
+and what JupyterLab / VS Code / classic Notebook all do: tqdm's final
+progress-bar frame stays visible after the loop exits. Earlier Mercury
+releases incorrectly flushed the items at `execute_done`, diverging
+from every other notebook UI. SPEC Invariant 64.
 
 ### Cancellation policy
 
@@ -822,16 +1398,25 @@ the kernel is fully cleared — variables, imports, everything — as Jupyter
 users expect.
 
 - **Local mode (`self.km is not None`).** `km.restart_kernel(now=True)`
-  SIGKILLs the kernel subprocess and starts a fresh one on the same
-  ports. The Lua side receives `restarted` and cancels both running and
-  queued cells (the new kernel doesn't know about them).
-- **Existing mode (`self.km is None`).** Bridge sends
-  `kc.shutdown(restart=True)` over the control channel. Whatever
-  supervisor launched the kernel (typically jupyter server's
-  `KernelManager`) is responsible for relaunching it; the bridge then
-  `wait_for_ready`s on the heartbeat. If nothing relaunches the kernel,
-  the wait times out and the bridge emits `kernel_error` so the user
-  doesn't end up with a dead connection silently.
+  reaps the kernel subprocess (SIGTERM, then SIGKILL if needed via
+  jupyter_client's `now=True` flag — *not* a direct SIGKILL) and starts
+  a fresh one on the same ports. The Lua side receives `restarted` and
+  cancels both running and queued cells (the new kernel doesn't know
+  about them).
+- **Existing mode (`self.km is None`).** The bridge rejects restart
+  with `kernel_error{kind="unsupported"}`. From a connection-file
+  transport, `BlockingKernelClient` has no path to the kernel's
+  upstream supervisor (Jupyter Server's `KernelManager`, systemd,
+  etc.) — `kc.shutdown(restart=True)` only asks the kernel to exit and
+  hopes someone else respawns it on the same ports. The 30-second
+  `wait_for_ready` would time out almost every time. Mercury surfaces
+  the rejection as a soft WARN (kind=unsupported is non-fatal:
+  running/queue state is preserved, the connection stays up); the
+  user must restart the kernel through the supervisor's own UI/API
+  and then `:NotebookKernelSelect` to reconnect. A future
+  Jupyter-Server HTTP/WebSocket transport would handle this via the
+  REST `/api/kernels/<id>/restart` endpoint; that's out of scope.
+  SPEC Invariants 26, 42.
 
 **Restart epoch (`_restart_seq`).** Without this, an in-flight `_execute`
 on the *old* kernel keeps waiting for shell replies with the old
@@ -1117,6 +1702,24 @@ prose) reaches the user — that's the documented contract for raw cells
 (see "Outputs → LSP integration"). Code-cell and out-of-cell diagnostics
 pass through unchanged.
 
+### Position-bearing response filters
+
+Mercury also wraps two proactive position-bearing response handlers:
+
+- `textDocument/inlayHint` — pyright emits inlay hints on `# type:`
+  type-comment patterns; the markdown mask can accidentally synthesize
+  these from user prose like `"the type: int parameter"`. The filter
+  drops any hint whose `position.line` (or `range.start.line`) falls
+  inside a markdown cell.
+- `textDocument/codeLens` — same filter principle for proactive code
+  lenses, though pyright/ruff don't currently emit code lenses on
+  comment-like content. Defensive belt against future LSP features.
+
+Both wraps live in `M.filter_positioned_items` and use the same
+`Notebook.cell_at_row` + `kind == "markdown"` predicate as the
+diagnostic filter. Code-cell hints/lenses pass through unchanged.
+SPEC Invariant 72.
+
 ### Non-goals
 
 - **Per-cell language LSP** (e.g., a SQL cell with a SQL LSP). Mercury
@@ -1218,7 +1821,53 @@ testable Lua module (`ipynb.lua`).
 pretty-printer in `Ipynb.encode` honors this: it uses
 `vim.json.encode(t)` to detect dict-vs-list for empty tables. The encode
 helper `ensure_dict(t)` wraps the relevant fields (`metadata`, `data`,
-top-level meta) so empty defaults serialize correctly.
+top-level meta, AND each per-mime value inside `data`) so empty
+defaults serialize correctly. SPEC Invariant 44.
+
+### Canonical multilineString serialization
+
+`nbformat.write`'s canonical form for multiline `text/*` mime values and
+stream `text` is an **array of strings** — one element per source line,
+with the trailing `"\n"` retained on all but optionally the last
+(matches Python's `text.splitlines(keepends=True)`). Mercury holds these
+as a single string in memory for ease of edit / render and converts back
+to array form via `Ipynb._to_multiline_strings` on save.
+
+Without the conversion, files Mercury writes diff loudly against files
+Jupyter Lab / nbconvert / nbformat.write produce. With it, a notebook
+authored in JupyterLab and saved through Mercury is byte-identical (or
+within a one-blank-line tolerance, see "Trailing blank lines" above) to
+the original. SPEC Invariant 58.
+
+A single-line value stays a plain string — nbformat accepts both forms.
+Non-text mimes (`application/json`, `application/vnd.*+json`,
+`image/*`) pass through verbatim because their array form is real data,
+not a string-array splitting artifact. SPEC Invariant 59.
+
+### Output schema notes
+
+A few schema details Mercury enforces that aren't obvious from the
+in-memory shape:
+
+- **`display_id` location**: under `metadata.mercury.display_id` on
+  `display_data` / `execute_result` outputs. NOT as a sibling
+  `transient.display_id` (which is a Jupyter messaging-protocol concept,
+  not an nbformat output field). The decoder accepts both shapes for
+  backwards-compat with older Mercury files. SPEC Invariant 41.
+- **Stream items**: consecutive same-name stream items are merged on
+  save into single entries with concatenated text, matching the
+  canonical form produced by `nbformat.v4.normalize`. SPEC Invariant 36.
+- **Unknown `cell_type`**: rendered as `code` in the buffer; the
+  original cell_type is stashed under `cell.metadata.mercury_original_cell_type`
+  and restored on save. Lossless round-trip even for cell types
+  nbformat does not yet define. SPEC Invariant 60.
+- **Collapsed output state**: persisted as BOTH
+  `cell.metadata.collapsed = true` (classic-Notebook key) AND
+  `cell.metadata.jupyter.outputs_hidden = true` (Lab/VS Code key).
+  Either is honored on load. SPEC Invariant 65.
+- **`nbformat` version**: only v4 is supported. v3 (worksheets schema)
+  and hypothetical v5 are refused at decode with a clear migration
+  hint. SPEC Invariant 57.
 
 ## Autocmds
 

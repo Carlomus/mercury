@@ -324,30 +324,31 @@ class Bridge:
                 self.kc.start_channels()
                 self.kc.wait_for_ready(timeout=30)
             elif self.kc is not None:
-                # Existing-kernel mode: we don't own the process. Send the
-                # standard Jupyter shutdown_request(restart=True); whatever
-                # supervisor launched the kernel (typically jupyter server's
-                # KernelManager) is responsible for relaunching it on the
-                # same ports. wait_for_ready then blocks on heartbeat until
-                # the new kernel attaches. If nothing relaunches the kernel,
-                # wait_for_ready times out and we surface an error rather
-                # than silently leaving the user with a dead connection.
-                try:
-                    self.kc.shutdown(restart=True)
-                except Exception as e:
-                    jprint({"type": "kernel_error",
-                            "error": f"restart request failed: "
-                                     f"{type(e).__name__}: {e}"})
-                    return
-                try:
-                    self.kc.wait_for_ready(timeout=30)
-                except Exception:
-                    jprint({"type": "kernel_error",
-                            "error": "kernel did not come back within 30s after "
-                                     "restart — the kernel must be supervised by "
-                                     "an upstream manager (e.g. jupyter server) "
-                                     "to be restartable in existing-kernel mode."})
-                    return
+                # Existing-kernel mode: we don't own the process. There is no
+                # generic way to make the kernel come back — `kc.shutdown(
+                # restart=True)` only asks the kernel to exit and relies on
+                # an upstream supervisor (Jupyter Server's KernelManager,
+                # systemd, etc.) to relaunch on the same ports. From a
+                # connection-file transport, BlockingKernelClient has no path
+                # to that supervisor, so the relaunch almost always doesn't
+                # happen and `wait_for_ready` times out 30 s later — looking
+                # to the user like restart silently broke.
+                #
+                # Reject explicitly with kind="unsupported" so the Lua side
+                # surfaces a WARN without clobbering running/queue state.
+                # Symmetric with `interrupt` in mode="existing". A future
+                # Jupyter-Server transport would handle this via the REST
+                # /api/kernels/<id>/restart endpoint; that's out of scope.
+                jprint({
+                    "type": "kernel_error",
+                    "kind": "unsupported",
+                    "error": "restart is not supported in mode='existing' "
+                             "(no path to the kernel supervisor from a "
+                             "connection-file transport). Restart the kernel "
+                             "via its supervisor (jupyter server, systemd, "
+                             "etc.) and then :NotebookKernelSelect to reconnect.",
+                })
+                return
             else:
                 jprint({"type": "kernel_error",
                         "error": "no kernel client; nothing to restart"})
@@ -405,8 +406,14 @@ class Bridge:
         # because parent_to_cell.get(parent_id) returns None.
         try:
             with self._lock:
+                # stop_on_error=True matches JupyterLab's "Run cells" semantics:
+                # if THIS cell errors, subsequent execute_requests already on the
+                # shell channel are skipped by the kernel rather than running
+                # through. Mercury's client-side queue is one-at-a-time so this
+                # mostly matters as a belt-and-braces guard against any future
+                # path that submits multiple requests in flight.
                 parent_id = self.kc.execute(
-                    code, stop_on_error=False, allow_stdin=False)
+                    code, stop_on_error=True, allow_stdin=False)
                 self.parent_to_cell[parent_id] = cell_id
         except Exception as e:
             # If a restart fired between worker_loop popping our task and us
@@ -525,6 +532,23 @@ class Bridge:
                 content["text"] = "".join(content["text"])
             item = {"type": mtype, **content}
             jprint({"type": "output", "cell_id": cell_id, "item": item})
+        elif mtype == "execute_input":
+            # The kernel publishes execute_input on iopub as soon as it pulls
+            # the request off the shell channel. This is what populates the
+            # live `In[N]` prompt in JupyterLab / VS Code well before the
+            # corresponding execute_reply arrives. Forward it so the Lua
+            # side can bind exec_count and the ISO-8601 start timestamp
+            # eagerly. The header carries the iopub-side timestamp; nbformat's
+            # ExecuteTime extension wants exactly this value.
+            if cell_id is None:
+                return
+            started_iso = header.get("date")
+            jprint({
+                "type": "execute_input",
+                "cell_id": cell_id,
+                "exec_count": content.get("execution_count"),
+                "started_iso": started_iso,
+            })
         elif mtype == "status":
             # Only record idle for a parent we know about. A late idle frame
             # arriving after _forget already cleaned up parent_to_cell would
@@ -552,26 +576,60 @@ class Bridge:
         self.task_q.put((cell_id, code))
 
     def interrupt(self) -> None:
-        # Interrupt is signal-based and only works on a locally-owned
-        # kernel subprocess. In mode="existing" we don't own the process
-        # (a jupyter server / external supervisor does), so there's nothing
-        # to SIGINT. Reject explicitly with kind="unsupported" so the Lua
-        # side surfaces a WARN without clobbering running/queue state.
-        # SPEC Invariant 26.
-        if self.km is None:
-            jprint({
-                "type": "kernel_error",
-                "kind": "unsupported",
-                "error": "interrupt is not supported in mode='existing' "
-                         "(signal-based; requires owning the kernel process)",
-            })
+        # Two interrupt paths, picked by transport mode:
+        #
+        # Local mode (we own the subprocess via KernelManager): use the
+        # high-level KernelManager.interrupt_kernel(), which consults the
+        # kernelspec's `interrupt_mode` field and dispatches to SIGINT or
+        # a control-channel `interrupt_request` as appropriate. This is
+        # the path JupyterLab uses; works for both signal-mode and
+        # message-mode kernels.
+        #
+        # Existing mode (we connect via a connection file, the supervisor
+        # owns the subprocess): we have no signal access. The kernel may
+        # still be interruptible if it advertises `interrupt_mode: message`
+        # — send `interrupt_request` over the control channel and the
+        # kernel will raise KeyboardInterrupt. We can't read the
+        # kernelspec here (we have no `KernelManager`), so we attempt the
+        # control-channel send unconditionally: it's a no-op against a
+        # signal-mode kernel (no error raised, no kernel response), and
+        # the kernel-side reality propagates back via the next iopub frame
+        # (typically `error` with KeyboardInterrupt, or `idle` if the cell
+        # had already finished). The fire-and-forget design matches
+        # JupyterLab's behavior against remote kernels.
+        if self.km is not None:
+            try:
+                self.km.interrupt_kernel()
+            except Exception as e:
+                jprint({"type": "kernel_error",
+                        "error": f"interrupt failed: {type(e).__name__}: {e}"})
+                return
+            jprint({"type": "interrupted", "cell_id": self.current_cell_id})
             return
+
+        if self.kc is None:
+            jprint({"type": "kernel_error",
+                    "error": "no kernel client; nothing to interrupt"})
+            return
+
+        # Construct and send `interrupt_request` directly on the control
+        # channel. jupyter_client doesn't expose a public method for this
+        # on BlockingKernelClient, so we use the underlying Session API.
+        # Content is empty per the Jupyter messaging spec.
         try:
-            self.km.interrupt_kernel()
+            msg = self.kc.session.msg("interrupt_request", {})
+            self.kc.control_channel.send(msg)
         except Exception as e:
             jprint({"type": "kernel_error",
-                    "error": f"interrupt failed: {type(e).__name__}: {e}"})
+                    "error": f"control-channel interrupt failed: "
+                             f"{type(e).__name__}: {e}"})
             return
+        # Emit `interrupted` immediately. If the kernel is signal-mode
+        # rather than message-mode, the request is silently dropped and
+        # no iopub error follows — same UX as JupyterLab against a
+        # non-interruptible kernel ("interrupted" appeared but nothing
+        # actually changed). The user can fall back to restart through
+        # the supervisor.
         jprint({"type": "interrupted", "cell_id": self.current_cell_id})
 
     def list_kernels(self) -> None:

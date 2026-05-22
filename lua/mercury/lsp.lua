@@ -42,6 +42,34 @@ function M.filter_diagnostics(nb, diagnostics)
   return kept
 end
 
+-- Drop position-bearing items (inlay hints, code lenses) whose target
+-- position falls inside a markdown cell. The masked LSP view turns
+-- markdown lines into `# prose`; pyright pattern-matches `# type: int`
+-- and similar idioms and emits inlay hints on those positions. Without
+-- filtering, those spurious hints attach to the user's prose. Symmetric
+-- with the diagnostic filter — both run as a safety net under the
+-- masking layer. SPEC Invariant 72.
+function M.filter_positioned_items(nb, items)
+  if not nb or not nb.cells or #nb.cells == 0 then return items end
+  if type(items) ~= "table" then return items end
+  local function in_markdown(row)
+    if row == nil then return false end
+    local cell = nb:cell_at_row(row)
+    return cell and cell.kind == "markdown"
+  end
+  local kept = {}
+  for _, h in ipairs(items) do
+    local row
+    if h.position and h.position.line ~= nil then
+      row = h.position.line
+    elseif h.range and h.range.start and h.range.start.line ~= nil then
+      row = h.range.start.line
+    end
+    if not in_markdown(row) then kept[#kept + 1] = h end
+  end
+  return kept
+end
+
 -- Drop text edits whose range intersects a markdown cell. The masked view
 -- shown to the LSP server prepends "# " to markdown lines; if the server
 -- returns formatting edits based on that masked view, applying them
@@ -223,11 +251,33 @@ local function install_format_filter()
   end
 end
 
+-- Wrap proactive position-bearing response handlers (inlay hints, code
+-- lenses) so any item whose position falls inside a markdown cell is
+-- dropped before vim renders it. Inlay hints in particular are a real
+-- bug surface: pyright emits hints on `# type: int` and similar patterns
+-- that the markdown mask can accidentally synthesize from user prose.
+-- Reload-safe via the same vim.g marker pattern as the other filters.
+local function install_inlay_hint_filter()
+  if vim.g._mercury_lsp_positioned_wrapped then return end
+  vim.g._mercury_lsp_positioned_wrapped = 1
+  for _, key in ipairs({ "textDocument/inlayHint", "textDocument/codeLens" }) do
+    local prev = vim.lsp.handlers[key]
+    vim.lsp.handlers[key] = function(err, result, ctx, config)
+      if type(result) == "table" and #result > 0 and ctx and ctx.bufnr then
+        local nb = Notebook.get(ctx.bufnr)
+        if nb then result = M.filter_positioned_items(nb, result) end
+      end
+      if prev then return prev(err, result, ctx, config) end
+    end
+  end
+end
+
 -- Called once from mercury.setup(). Installs the diagnostic safety-net filter
 -- and the LspAttach autocmd that patches clients and resets their view.
 function M.setup()
   install_diag_filter()
   install_format_filter()
+  install_inlay_hint_filter()
 
   vim.api.nvim_create_autocmd("LspAttach", {
     group = vim.api.nvim_create_augroup("MercuryLsp", { clear = true }),

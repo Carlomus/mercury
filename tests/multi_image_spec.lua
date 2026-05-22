@@ -212,7 +212,14 @@ describe("multi-image stacking", function()
     os.remove("/tmp/gc.png")
   end)
 
-  it("falls back to default height when PNG can't be read", function()
+  it("skips render and reserves minimal rows when the cached image bytes are missing", function()
+    -- When the on-disk cached image file has been evicted between
+    -- extract_images and the render pass, the renderer used to fall back to
+    -- max_rows (40 blank rows per image — a huge dead-space gap dwarfing
+    -- everything else on screen). Current behavior: skip rendering the
+    -- image (from_file is NOT called), reserve only 1 row per missing image,
+    -- and surface a `[image bytes unavailable]` text placeholder via the
+    -- build_virt_lines path.
     local images = {
       { kind = "png", path = "/nonexistent_xyz.png", hash = "x1" },
       { kind = "png", path = "/nonexistent_xyz.png", hash = "x2" },
@@ -223,11 +230,18 @@ describe("multi-image stacking", function()
     })
     vim.api.nvim_set_current_buf(buf)
     local nb = require("mercury.notebook").attach(buf); nb:rescan()
-    require("mercury.image").new(nb):render(
+    local renderer = require("mercury.image").new(nb)
+    local total = renderer:render(
       nb.cells[1], nb:cell_anchor_row(nb.cells[1]), images)
-    assert.equals(2, #recorded)
-    -- Default max_rows from config is 40; second image starts at offset 40.
-    assert.equals(40, recorded[2].opts.render_offset_top)
+    -- No image placements are recorded because from_file is bypassed for
+    -- unavailable images.
+    assert.equals(0, #recorded)
+    -- 1 row reserved per image (2 unavailable images → 2 rows of virtual gap).
+    assert.equals(2, total)
+    -- The descriptors carry the unavailable flag so build_virt_lines can
+    -- show a text placeholder.
+    assert.is_true(images[1].unavailable)
+    assert.is_true(images[2].unavailable)
     require("mercury.notebook").detach(buf)
   end)
 

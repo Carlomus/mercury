@@ -11,12 +11,17 @@ local M = {}
 local SEP_PAT = "^#%s*%%%%(.*)$"
 
 -- Map our internal kind <-> nbformat cell_type. Anything we don't recognize
--- becomes "code" so we never lose data on encode.
+-- maps to "code" (the only kind we know how to render and execute), but the
+-- ORIGINAL cell_type is stashed in metadata.mercury_original_cell_type on
+-- decode and restored on encode so round-trip is lossless even for cell
+-- types nbformat doesn't yet define (sql, julia, etc.). SPEC "Cell types".
 local function nb_cell_type(kind)
   if kind == "markdown" then return "markdown" end
   if kind == "raw" then return "raw" end
   return "code"
 end
+
+local KNOWN_CELL_TYPES = { code = true, markdown = true, raw = true }
 
 local function kind_from_cell_type(ct)
   if ct == "markdown" then return "markdown" end
@@ -152,12 +157,15 @@ end
 --   string | array<string>  (multilineString — represents text content)
 --   any JSON value          (for mimes like application/json that ARE objects)
 --
--- This helper joins arrays of strings (the multilineString case) and passes
--- everything else through unchanged. Without this distinction, a Lua dict
--- value for `application/json` would silently `table.concat` to "" and the
--- data would be lost on first load — corrupting Plotly / Vega-Lite outputs.
-local function _denest_mime_value(val)
+-- The multilineString form applies *only* to `text/*` mimes per nbformat.
+-- For `application/json` / `application/vnd.*+json` the value is "any JSON
+-- value" and may legitimately be a string array (e.g., a Plotly trace's
+-- categorical axis labels). Joining those into a single string would
+-- silently corrupt the payload. Mime is required to determine policy.
+local function _denest_mime_value(mime, val)
   if type(val) ~= "table" then return val end
+  -- Only text mimes are multilineString. Non-text mimes pass through verbatim.
+  if not (type(mime) == "string" and mime:match("^text/")) then return val end
   -- An array of strings: per nbformat, every element is a string (often
   -- ending with "\n"). Join into a single string.
   local n = #val
@@ -167,12 +175,41 @@ local function _denest_mime_value(val)
     end
     return table.concat(val, "")
   end
-  -- Empty table OR a dict-shaped table: pass through. (An empty array would
-  -- also pass through; that's a no-op for our renderer since split_lines
-  -- handles "" specially anyway, but more importantly it preserves the
-  -- structure for application/json `{}`.)
+  -- Empty table OR a dict-shaped table: pass through.
   return val
 end
+
+-- nbformat's canonical multilineString form on disk is an array of strings:
+-- one element per source line, with the trailing "\n" retained on all but
+-- (optionally) the last. Mercury keeps a single string in memory for ease
+-- of rendering and edit; this helper converts back to array form on save
+-- so files we write diff cleanly against `nbformat.write` / Jupyter Lab.
+-- A pure single-line value stays a string (nbformat accepts either form).
+-- SPEC "Canonical multilineString serialization".
+local function _to_multiline_strings(s)
+  if type(s) ~= "string" then return s end
+  if s == "" then return "" end
+  -- Match Python's str.splitlines(True): keep the line terminator on each
+  -- segment. Only LF is treated as a line break — nbformat normalizes line
+  -- endings to LF in the writer.
+  if not s:find("\n", 1, true) then return s end
+  local parts = {}
+  local i, n = 1, #s
+  while i <= n do
+    local nl = s:find("\n", i, true)
+    if not nl then
+      parts[#parts + 1] = s:sub(i)
+      break
+    end
+    parts[#parts + 1] = s:sub(i, nl)
+    i = nl + 1
+  end
+  return parts
+end
+M._to_multiline_strings = _to_multiline_strings
+
+-- Forward declaration; ensure_dict is defined below alongside the encoder.
+local ensure_dict
 
 local function normalize_output(o)
   local t = o.output_type
@@ -183,7 +220,7 @@ local function normalize_output(o)
   elseif t == "display_data" or t == "execute_result" then
     local data = {}
     for mime, val in pairs(o.data or {}) do
-      data[mime] = _denest_mime_value(val)
+      data[mime] = _denest_mime_value(mime, val)
     end
     local out = {
       type = t,
@@ -191,6 +228,27 @@ local function normalize_output(o)
       metadata = o.metadata or {},
     }
     if t == "execute_result" then out.execution_count = o.execution_count end
+    -- Read display_id from EITHER its canonical Mercury location
+    -- (`metadata.mercury.display_id`) OR the legacy `transient.display_id`
+    -- stash that older Mercury versions wrote. SPEC Invariant 41.
+    --
+    -- `transient` is a messaging-protocol concept, not an nbformat field;
+    -- writing it as a sibling of `output_type` is a schema violation that
+    -- strict nbformat validators reject. New saves write the metadata.mercury
+    -- location; the legacy reader keeps existing files working.
+    local meta = o.metadata
+    local display_id
+    if type(meta) == "table"
+        and type(meta.mercury) == "table"
+        and type(meta.mercury.display_id) == "string"
+        and meta.mercury.display_id ~= "" then
+      display_id = meta.mercury.display_id
+    elseif type(o.transient) == "table"
+        and type(o.transient.display_id) == "string"
+        and o.transient.display_id ~= "" then
+      display_id = o.transient.display_id
+    end
+    if display_id then out._display_id = display_id end
     return out
   elseif t == "error" then
     return {
@@ -208,17 +266,40 @@ local function denormalize_output(o)
     return {
       output_type = "stream",
       name = o.name or "stdout",
-      text = o.text or "",
+      text = _to_multiline_strings(o.text or ""),
     }
   elseif o.type == "display_data" or o.type == "execute_result" then
     local data = {}
     for mime, val in pairs(o.data or {}) do
-      data[mime] = val
+      -- nbformat canonical form for multiline text mimes is an array of
+      -- strings. Joining on read + splitting on write keeps files we write
+      -- diff-clean against nbformat.write / Jupyter Lab output. Non-text
+      -- mimes pass through verbatim.
+      if type(val) == "string" and type(mime) == "string" and mime:match("^text/") then
+        data[mime] = _to_multiline_strings(val)
+      elseif type(val) == "table" and next(val) == nil then
+        -- Empty per-mime table (e.g., application/json `{}`) must serialize
+        -- as an object, not an array. SPEC Invariant 44.
+        data[mime] = ensure_dict(val)
+      else
+        data[mime] = val
+      end
+    end
+    -- Build metadata with display_id stashed under `mercury.display_id`.
+    -- We don't write the legacy `transient.display_id` shape any more, but
+    -- the reader accepts it for backwards-compat. SPEC Invariant 41.
+    local meta = {}
+    for k, v in pairs(o.metadata or {}) do meta[k] = v end
+    if o._display_id then
+      local m = meta.mercury
+      if type(m) ~= "table" then m = {} end
+      m.display_id = o._display_id
+      meta.mercury = m
     end
     local out = {
       output_type = o.type,
-      data = data,
-      metadata = o.metadata or {},
+      data = ensure_dict(data),
+      metadata = ensure_dict(meta),
     }
     if o.type == "execute_result" then
       out.execution_count = o.execution_count or vim.NIL
@@ -235,15 +316,57 @@ local function denormalize_output(o)
   return nil
 end
 
+-- Merge consecutive same-name stream items into one (nbformat canonical
+-- form, produced by `nbformat.v4.normalize`). The kernel emits one iopub
+-- frame per chunk; nbformat collapses runs of stdout/stderr into single
+-- entries with concatenated text. Without this, files Mercury writes
+-- re-shape on the next pass through any nbformat-aware tool, producing
+-- meaningless diffs. SPEC Invariant 36.
+--
+-- Operates on already-denormalized outputs (output_type / name / text
+-- keys), so it is called after the items have been built for the encoder.
+-- For stream items whose text was split into array form by
+-- _to_multiline_strings, this re-joins before merging — concatenating two
+-- arrays of multiline-text would otherwise produce visually-correct but
+-- semantically-redundant nesting. After concat, the merged text is
+-- re-split via _to_multiline_strings to preserve nbformat canonical
+-- form for the merged result.
+local function _merge_stream_items(items)
+  if not items or #items < 2 then return items end
+  local function _as_string(t)
+    if type(t) == "table" then return table.concat(t, "") end
+    return t or ""
+  end
+  local out = {}
+  for _, it in ipairs(items) do
+    local prev = out[#out]
+    if prev and prev.output_type == "stream" and it.output_type == "stream"
+        and prev.name == it.name then
+      prev.text = _as_string(prev.text) .. _as_string(it.text)
+    else
+      out[#out + 1] = it
+    end
+  end
+  -- Re-canonicalize stream text to array form after merging.
+  for _, it in ipairs(out) do
+    if it.output_type == "stream" then
+      it.text = _to_multiline_strings(_as_string(it.text))
+    end
+  end
+  return out
+end
+M._merge_stream_items = _merge_stream_items
+
 M.denormalize_output = denormalize_output
 M.normalize_output = normalize_output
 
-local function ensure_dict(t)
+ensure_dict = function(t)
   if t == nil or (type(t) == "table" and next(t) == nil) then
     return vim.empty_dict()
   end
   return t
 end
+M._ensure_dict = ensure_dict
 
 -- nbformat-style pretty printer. vim.json.encode emits single-line JSON, which
 -- makes .ipynb files unreadable in GitHub diffs; Jupyter writes indent=1 with
@@ -361,10 +484,25 @@ function M.decode(json_text)
     return nil, "invalid JSON"
   end
   doc = _unmark_empty_objects(doc)
+  -- nbformat v3 has a completely different schema (worksheets, prompt_number
+  -- instead of execution_count, etc.). Reading it as v4 silently produces an
+  -- empty notebook; a casual :w then overwrites the original with mercury's
+  -- placeholder, destroying the user's data. Refuse explicitly so the user
+  -- can run `jupyter nbconvert --to notebook` to upgrade in-place first.
+  local nbformat_major = doc.nbformat or 4
+  if type(nbformat_major) == "number" and nbformat_major < 4 then
+    return nil, ("nbformat v%d is not supported by Mercury (reads v4 only). " ..
+                 "Run: jupyter nbconvert --to notebook --inplace <file>"):format(nbformat_major)
+  end
+  if type(nbformat_major) == "number" and nbformat_major > 4 then
+    -- Future-proof: refuse a hypothetical v5 too so we don't misinterpret it.
+    return nil, ("nbformat v%d is not supported by Mercury (reads v4 only)."):format(nbformat_major)
+  end
   local cells = {}
   local injected_id = false
   for _, c in ipairs(doc.cells or {}) do
-    local kind = kind_from_cell_type(c.cell_type)
+    local raw_type = c.cell_type
+    local kind = kind_from_cell_type(raw_type)
     local id = c.id
     if not id or id == "" then
       id = Util.short_id()
@@ -380,6 +518,16 @@ function M.decode(json_text)
         if norm then outputs[#outputs + 1] = norm end
       end
     end
+    -- Preserve unknown cell_type verbatim across save/load. nbformat may
+    -- gain new cell types (sql, julia, etc.); we render them as code in
+    -- the buffer (the only kind we know how to display) but the original
+    -- cell_type is stashed in metadata.mercury_original_cell_type so the
+    -- next save restores it. Lossless round-trip.
+    local metadata = c.metadata or {}
+    if type(raw_type) == "string" and not KNOWN_CELL_TYPES[raw_type] then
+      metadata = vim.deepcopy(metadata)
+      metadata.mercury_original_cell_type = raw_type
+    end
     cells[#cells + 1] = {
       id = id,
       kind = kind,
@@ -387,7 +535,7 @@ function M.decode(json_text)
       outputs = outputs,
       -- Only code cells have execution_count per nbformat.
       exec_count = kind == "code" and c.execution_count or nil,
-      metadata = c.metadata or {},
+      metadata = metadata,
       -- nbformat v4 lets markdown cells carry an `attachments` table mapping
       -- filename -> { mime -> base64-string }. Preserve verbatim so paste-image
       -- bytes round-trip; we don't decode or render them.
@@ -402,7 +550,7 @@ function M.decode(json_text)
   if injected_id and nbformat_minor < 5 then nbformat_minor = 5 end
   return {
     meta = doc.metadata or {},
-    nbformat = doc.nbformat or 4,
+    nbformat = nbformat_major,
     nbformat_minor = nbformat_minor,
     cells = cells,
   }
@@ -462,8 +610,15 @@ local function reindent_json(s)
 end
 
 M._reindent_json = reindent_json
+M._encode_pretty = _encode_pretty
 
 -- Encode internal shape back to nbformat v4 JSON text.
+--
+-- Uses _encode_pretty (not vim.json.encode + reindent) so keys are sorted
+-- alphabetically — SPEC Invariant 3. vim.json.encode emits keys in Lua
+-- iteration order, which is unstable across inserts and produces churn
+-- in saved .ipynb files even when no semantic content changed. _encode_pretty
+-- is the single source of truth for on-disk JSON shape.
 function M.encode(nb)
   local cells = {}
   for _, c in ipairs(nb.cells or {}) do
@@ -471,12 +626,25 @@ function M.encode(nb)
     if c.kind == "markdown" then ctype = "markdown"
     elseif c.kind == "raw" then ctype = "raw"
     else ctype = "code" end
-    local md = c.metadata or {}
-    if next(md) == nil then md = vim.empty_dict() end
+    -- Restore the original cell_type stashed at decode time. Mercury
+    -- renders unknown types as code in the buffer but the on-disk form
+    -- must be byte-stable. SPEC "Cell types".
+    local metadata = c.metadata or {}
+    local original_ct = metadata.mercury_original_cell_type
+    local out_metadata
+    if type(original_ct) == "string" and not KNOWN_CELL_TYPES[original_ct] and ctype == "code" then
+      ctype = original_ct
+      out_metadata = {}
+      for k, v in pairs(metadata) do
+        if k ~= "mercury_original_cell_type" then out_metadata[k] = v end
+      end
+    else
+      out_metadata = metadata
+    end
     local cell = {
       cell_type = ctype,
       id = c.id,
-      metadata = md,
+      metadata = ensure_dict(out_metadata),
       source = lines_to_nbsource(c.source or {}),
     }
     if ctype == "code" then
@@ -486,7 +654,7 @@ function M.encode(nb)
         local d = denormalize_output(o)
         if d then outs[#outs + 1] = d end
       end
-      cell.outputs = outs
+      cell.outputs = _merge_stream_items(outs)
     elseif ctype == "markdown" and c.attachments and next(c.attachments) ~= nil then
       -- nbformat v4 lets markdown cells carry attachments (pasted images
       -- referenced from prose as `attachment:filename`). Preserve verbatim
@@ -497,11 +665,11 @@ function M.encode(nb)
   end
   local doc = {
     cells = cells,
-    metadata = nb.meta or vim.empty_dict(),
+    metadata = ensure_dict(nb.meta),
     nbformat = nb.nbformat or 4,
     nbformat_minor = nb.nbformat_minor or 5,
   }
-  return reindent_json(vim.json.encode(doc)) .. "\n"
+  return _encode_pretty(doc, " ", 0) .. "\n"
 end
 
 -- Render a decoded notebook to buffer lines (the py:percent-style text).

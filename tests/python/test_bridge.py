@@ -547,36 +547,98 @@ class ListKernelspecsResilience(unittest.TestCase):
 
 
 class InterruptInExistingMode(unittest.TestCase):
-    """SPEC Invariant 26: interrupt is signal-based and requires owning the
-    kernel process. In mode='existing' the bridge does NOT own the
-    subprocess, so it must emit kernel_error{kind='unsupported'} instead
-    of sending a control-channel interrupt_request that has nothing
-    SIGINT-able on the receiving end.
+    """SPEC Invariant 26 (revised): interrupt in mode='existing' attempts
+    a control-channel `interrupt_request`. This works for kernels that
+    advertise `interrupt_mode: "message"` in their kernelspec (Windows
+    kernels, some custom kernels); signal-mode kernels silently drop the
+    request, in which case the user sees `interrupted` but no kernel-side
+    effect — matching JupyterLab's behavior against the same kernel.
     """
 
-    def test_existing_mode_emits_unsupported_kernel_error(self):
+    def _capture(self, fn):
         import io, json
-        b = bridge.Bridge()
-        # Simulate mode='existing': km is None but kc is set.
-        b.km = None
-        b.kc = object()
         old_stdout = sys.stdout
         sys.stdout = io.StringIO()
         try:
-            b.interrupt()
+            fn()
             captured = sys.stdout.getvalue()
         finally:
             sys.stdout = old_stdout
-        msgs = [json.loads(line) for line in captured.splitlines() if line]
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0]["type"], "kernel_error")
-        self.assertEqual(msgs[0]["kind"], "unsupported")
-        self.assertIn("interrupt", msgs[0]["error"])
+        return [json.loads(line) for line in captured.splitlines() if line]
+
+    def test_existing_mode_sends_control_channel_interrupt_request(self):
+        b = bridge.Bridge()
+        b.km = None
+        # Stub kc with the session.msg() + control_channel.send() interface
+        # the production code uses.
+        recorded = {}
+
+        class _Session:
+            def msg(self_inner, msg_type, content):
+                recorded["msg_type"] = msg_type
+                recorded["content"] = content
+                return {"_synthesized": True, "header": {"msg_type": msg_type}}
+
+        class _ControlChannel:
+            def send(self_inner, msg):
+                recorded["sent"] = msg
+
+        class _KC:
+            session = _Session()
+            control_channel = _ControlChannel()
+
+        b.kc = _KC()
+        b.current_cell_id = "c1"
+
+        msgs = self._capture(b.interrupt)
+
+        # An interrupt_request was constructed and sent on the control channel.
+        self.assertEqual(recorded["msg_type"], "interrupt_request")
+        self.assertEqual(recorded["content"], {})
+        self.assertIn("sent", recorded)
+        # Bridge emitted `interrupted` (fire-and-forget on control channel —
+        # see the in-source rationale; iopub idle/error reflects actual kernel
+        # response).
+        self.assertTrue(any(m.get("type") == "interrupted" for m in msgs))
+        # And specifically NOT kernel_error{kind=unsupported}, which was the
+        # pre-revision behavior.
+        for m in msgs:
+            self.assertNotEqual(m.get("kind"), "unsupported")
+
+    def test_existing_mode_surfaces_send_failure(self):
+        b = bridge.Bridge()
+        b.km = None
+
+        class _Session:
+            def msg(self_inner, *_args, **_kw):
+                return {"header": {"msg_type": "interrupt_request"}}
+
+        class _ControlChannel:
+            def send(self_inner, _msg):
+                raise RuntimeError("zmq EAGAIN")
+
+        class _KC:
+            session = _Session()
+            control_channel = _ControlChannel()
+
+        b.kc = _KC()
+        msgs = self._capture(b.interrupt)
+        # A control-channel transport failure must surface as kernel_error
+        # (not silently swallowed) so the user knows the request didn't go.
+        self.assertTrue(any(m.get("type") == "kernel_error" for m in msgs))
+        err = next(m for m in msgs if m.get("type") == "kernel_error")
+        self.assertIn("control-channel", err["error"])
+
+    def test_existing_mode_with_no_client_surfaces_error(self):
+        b = bridge.Bridge()
+        b.km = None
+        b.kc = None
+        msgs = self._capture(b.interrupt)
+        self.assertTrue(any(m.get("type") == "kernel_error" for m in msgs))
 
     def test_local_mode_calls_interrupt_kernel(self):
         # Sanity: in local mode the interrupt_kernel path is still taken
         # and an "interrupted" message lands. We stub km to record the call.
-        import io, json
         b = bridge.Bridge()
         called = {"n": 0}
 
@@ -587,15 +649,8 @@ class InterruptInExistingMode(unittest.TestCase):
         b.km = _StubKM()
         b.kc = object()
         b.current_cell_id = "c1"
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        try:
-            b.interrupt()
-            captured = sys.stdout.getvalue()
-        finally:
-            sys.stdout = old_stdout
+        msgs = self._capture(b.interrupt)
         self.assertEqual(called["n"], 1)
-        msgs = [json.loads(line) for line in captured.splitlines() if line]
         self.assertTrue(any(m.get("type") == "interrupted" for m in msgs))
 
 

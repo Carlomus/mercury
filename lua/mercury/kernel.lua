@@ -8,6 +8,22 @@ local M = {}
 local Kernel = {}
 Kernel.__index = Kernel
 
+-- ISO-8601 UTC timestamp with real microsecond precision. JupyterLab's
+-- ExecuteTime extension writes microsecond-precise stamps, and a notebook
+-- that round-trips Lab→Mercury→Lab should not lose that precision. Uses
+-- vim.uv.gettimeofday() when available (returns sec, microsec), falling
+-- back to second precision when not.
+local function _iso_now()
+  local uv = vim.uv or vim.loop
+  local ok, sec, usec = pcall(uv.gettimeofday)
+  if ok and type(sec) == "number" and type(usec) == "number" then
+    return os.date("!%Y-%m-%dT%H:%M:%S", sec) ..
+      string.format(".%06dZ", usec)
+  end
+  return os.date("!%Y-%m-%dT%H:%M:%S.000000Z")
+end
+M._iso_now = _iso_now
+
 -- Delegate to the single source of truth in util.lua. health.lua resolves
 -- the same way via the same helper; keeping them in sync is load-bearing
 -- (an :checkhealth pass for a python that's not the one the bridge actually
@@ -94,7 +110,21 @@ function Kernel:_cancel_running(out_status)
   local nb = self.notebook
   if nb and self.running then
     local out = nb.outputs and nb.outputs[self.running.cell_id]
-    if out and not _is_terminal(out.status) then out.status = out_status end
+    if out then
+      if not _is_terminal(out.status) then out.status = out_status end
+      -- Reset transient execution flags so a re-execute of the same cell
+      -- after :NotebookKernelInterrupt starts from a clean slate:
+      --   * `_pending_clear` carrying over would silently wipe the first
+      --     output of the new run (the next `_apply_item` flushes pending
+      --     before appending — that's the tqdm-style deferred clear);
+      --   * `_started_iso` would orphan a stale ExecuteTime "start" inside
+      --     cell_metadata.execution without a matching "end" timestamp.
+      -- SPEC Invariant 10's sticky-status rule still holds (status fields
+      -- on terminal `error`/`killed` aren't downgraded); these are
+      -- per-execute transient fields, not the user-visible pill.
+      out._pending_clear = nil
+      out._started_iso = nil
+    end
   end
   self.running = nil
 end
@@ -139,6 +169,19 @@ function Kernel:_handle_msg(msg)
       self:_apply_item(out, msg.item or {})
       self.on_change()
     end
+  elseif typ == "execute_input" then
+    -- The kernel publishes `execute_input` on iopub as soon as it pulls the
+    -- request off the shell channel; this is what populates the live `In[N]`
+    -- prompt in JupyterLab / VS Code well before `execute_reply` arrives.
+    -- Bind exec_count and the ISO-8601 start timestamp here so a long-running
+    -- cell shows its In[N] number immediately.
+    local Notebook = require("mercury.notebook")
+    if (not Notebook._live_code_cell) or Notebook._live_code_cell(nb, msg.cell_id) then
+      local out = nb:ensure_output(msg.cell_id)
+      if msg.exec_count then out.exec_count = msg.exec_count end
+      if msg.started_iso then out._started_iso = msg.started_iso end
+      self.on_change()
+    end
   elseif typ == "execute_done" then
     -- SPEC Invariant 24: like the `output` branch, the cell may have
     -- vanished or been converted to non-code mid-execution. We still
@@ -154,12 +197,15 @@ function Kernel:_handle_msg(msg)
       local out = nb:ensure_output(msg.cell_id)
       out.exec_count = msg.exec_count or out.exec_count
       out.ms = msg.ms or 0
-      -- A trailing `clear_output(wait=True)` whose next output never arrives is
-      -- a Jupyter idiom: tqdm clears its progress bar before exiting the loop.
-      if out._pending_clear then
-        out.items = {}
-        out._pending_clear = nil
-      end
+      -- Drop any leftover deferred-clear flag, but do NOT wipe `out.items`.
+      -- IPython's documented `clear_output(wait=True)` semantics: defer the
+      -- clear until the *next* output arrives; if no further output arrives
+      -- before the cell finishes, the prior content STAYS. This is what
+      -- preserves tqdm's final progress-bar frame in JupyterLab / VS Code /
+      -- classic Notebook. Earlier Mercury releases flushed the pending
+      -- clear at execute_done, wiping the final frame — divergent from
+      -- every other notebook UI.
+      out._pending_clear = nil
       -- Preserve terminal statuses set earlier in the same execute.
       if not _is_terminal(out.status) then
         out.status = "ok"
@@ -170,14 +216,15 @@ function Kernel:_handle_msg(msg)
       -- ExecuteTime nbformat extension (Invariant 27): record the iso8601
       -- end timestamp so a notebook round-tripped Jupyter Lab ↔ Mercury
       -- doesn't lose absolute execute timing. `out._started_iso` is set
-      -- by `_pump` when this cell started running; copy it over to the
-      -- nbformat-shaped table now.
+      -- by `_pump` when this cell started running (or by the bridge's
+      -- execute_input forward); copy it over to the cell_metadata.execution
+      -- block under JupyterLab's dotted-leaf-keys convention now.
       if out._started_iso then
         nb.cell_metadata[msg.cell_id] = nb.cell_metadata[msg.cell_id] or {}
         local cm = nb.cell_metadata[msg.cell_id]
         cm.execution = cm.execution or {}
         cm.execution["iopub.execute_input"] = out._started_iso
-        cm.execution["shell.execute_reply"] = os.date("!%Y-%m-%dT%H:%M:%S.000000Z")
+        cm.execution["shell.execute_reply"] = _iso_now()
         out._started_iso = nil
       end
       -- If this cell was in-flight at the last :w (and therefore written to
@@ -215,6 +262,16 @@ function Kernel:_handle_msg(msg)
     else
       self:_cancel_in_flight("killed")
     end
+    -- Apply the deferred clear (RestartClear) now — the bridge has emitted
+    -- `restarted` after draining its parent_to_cell map, so no more old-
+    -- kernel frames will arrive. Clearing earlier (synchronously in
+    -- Kernel:restart) raced iopub frames in flight. SPEC Invariant 42.
+    if self._restart_clear_pending then
+      self._restart_clear_pending = nil
+      if self.notebook and self.notebook.clear_all_outputs then
+        self.notebook:clear_all_outputs()
+      end
+    end
     self.on_change()
   elseif typ == "kernel_dead" or typ == "kernel_error" then
     if msg.kind == "unsupported" then
@@ -232,7 +289,10 @@ function Kernel:_handle_msg(msg)
     -- restart (e.g., existing-mode supervisor never relaunched the kernel,
     -- or local restart raised in bridge.restart()) wedged every subsequent
     -- :NotebookExec into the "kernel is restarting" notify forever.
+    -- Drop the deferred clear too — the kernel is gone, outputs stay where
+    -- they are; user can re-run RestartClear later.
     self._restart_pending = false
+    self._restart_clear_pending = nil
     self:_cancel_in_flight("killed")
     if msg.kind == "no_kernelspec" and msg.available and #msg.available > 0 then
       Util.notify("kernel: " .. (msg.error or typ), vim.log.levels.WARN)
@@ -252,6 +312,13 @@ function Kernel:_handle_msg(msg)
     self.kernels = msg.kernels or {}
     local cbs = self._on_list
     self._on_list = nil
+    -- Cancel the pending timeout — the reply arrived in time, so the
+    -- fallback "bridge did not reply" notify must not fire later.
+    if self._list_kernels_timer then
+      pcall(function() self._list_kernels_timer:stop() end)
+      pcall(function() self._list_kernels_timer:close() end)
+      self._list_kernels_timer = nil
+    end
     if cbs then
       -- Backwards-compatible: old form was a single function. New form is
       -- a list of functions queued via list_kernels — fire all of them.
@@ -313,23 +380,42 @@ function Kernel:_apply_item(out, item)
     local did = (item.transient or {}).display_id
     if did then
       local updated = false
-      local function update_in(items)
+      local cross_cell_updated = false
+      local function update_in(items, is_other)
         for _, it in ipairs(items or {}) do
           if it._display_id == did then
             it.data = item.data or it.data
             it.metadata = item.metadata or it.metadata
             updated = true
+            if is_other then cross_cell_updated = true end
           end
         end
       end
-      update_in(out.items)
+      update_in(out.items, false)
       -- Walk every OTHER cell's outputs too.
       if self.notebook and self.notebook.outputs then
         for _, other in pairs(self.notebook.outputs) do
-          if other ~= out and other.items then update_in(other.items) end
+          if other ~= out and other.items then update_in(other.items, true) end
         end
       end
-      if updated then return end
+      if updated then
+        -- Defense in depth: if a different cell's items got mutated, schedule
+        -- a render here rather than relying on the caller. on_change is
+        -- coalesced (SPEC Invariant 7) so a redundant call collapses; this
+        -- guarantees the cross-cell update lands visually even if a future
+        -- caller of _apply_item forgets to call on_change after.
+        if cross_cell_updated and self.on_change then
+          pcall(self.on_change)
+        end
+        return
+      end
+      -- `display_id` was provided but no existing output holds it: the
+      -- target display block was deleted (the cell that created it was
+      -- removed, or its outputs were cleared). Real JupyterLab silently
+      -- drops the update in this case; the prior behavior of inserting a
+      -- new `display_data` in the CALLING cell produced a phantom block
+      -- in the wrong place. Drop and return.
+      return
     end
     table.insert(out.items, {
       type = "display_data", data = item.data or {},
@@ -494,13 +580,17 @@ function Kernel:_pump()
   local out = self.notebook:ensure_output(task.cell_id)
   out.status = "running"
   out.items = {}
-  -- Record an ISO-8601 UTC start timestamp on the live output; execute_done
+  -- Record an ISO-8601 UTC start timestamp on the live output (microsecond
+  -- precision, matching JupyterLab's ExecuteTime extension). execute_done
   -- copies it (along with a fresh end-timestamp) into
   -- cell_metadata.execution to populate the nbformat ExecuteTime extension.
   -- SPEC Invariant 27. Stored on `out` (not directly on cell_metadata) so
   -- a partial in-flight execute that's later restarted doesn't leak a
-  -- start-without-end into the saved JSON.
-  out._started_iso = os.date("!%Y-%m-%dT%H:%M:%S.000000Z")
+  -- start-without-end into the saved JSON. If the bridge later forwards
+  -- iopub `execute_input` for this cell, it will overwrite this estimate
+  -- with the kernel-side stamp so the saved metadata matches what
+  -- JupyterLab would have written.
+  out._started_iso = _iso_now()
   self.on_change()
   -- Roll back the running state if _send fails (bridge died mid-flight).
   -- Without this, self.running stays set forever and _pump refuses to
@@ -549,11 +639,20 @@ function Kernel:_handle_exit(job_id)
   -- kernel_error) must also clear `_restart_pending`, or `_ensure_started`
   -- refuses every subsequent execute forever. SPEC Invariant 25.
   self._restart_pending = false
+  self._restart_clear_pending = nil
   self.job_id = nil
   self.chan = nil
   self.json_buf = ""
   if not expected then
     self:_cancel_in_flight("killed")
+    -- The `_skipped_at_save` table tracks cells that were in-flight at the
+    -- last :w so a later execute_done can mark the buffer modified. A bridge
+    -- death means those cells will never finish — every subsequent save would
+    -- still skip them under SPEC Invariant 14's "no in-flight" check, but the
+    -- table would grow forever. Clear it; if the user re-runs the cells the
+    -- table repopulates on the next save with in-flight entries.
+    local nb = self.notebook
+    if nb and nb._skipped_at_save then nb._skipped_at_save = nil end
     Util.notify("kernel bridge exited unexpectedly", vim.log.levels.WARN)
     if self.on_change then pcall(self.on_change) end
   end
@@ -577,7 +676,16 @@ function Kernel:execute(cell)
       return
     end
   end
-  local code = table.concat(self.notebook:cell_body_lines(cell), "\n")
+  -- Trim the trailing visual-gap blank line(s) that to_buffer_lines inserts
+  -- between cells. They are purely visual — the user did not type them and
+  -- they're stripped on save (to_ipynb_struct) — so the kernel should not see
+  -- them either. Without this, "%%timeit foo" / last-expression-evaluation
+  -- semantics on some kernels can be perturbed by a stray trailing newline,
+  -- and tools that introspect the source (e.g., IPython's `??`) would
+  -- display the extra blank.
+  local body = self.notebook:cell_body_lines(cell)
+  while #body > 0 and body[#body] == "" do table.remove(body, #body) end
+  local code = table.concat(body, "\n")
   local out = self.notebook:ensure_output(cell.id)
   out.status = "queued"
   table.insert(self.queue, { cell_id = cell.id, code = code })
@@ -590,6 +698,21 @@ function Kernel:interrupt()
     Util.notify("kernel is not running", vim.log.levels.INFO)
     return
   end
+  -- Don't shove an interrupt at a channel that's being torn down. The bridge
+  -- has already received `shutdown`; the kernel may or may not see SIGINT
+  -- before its supervisor reaps it. Either way, the user expectation is
+  -- "interrupt the active execution," and there is no active execution to
+  -- interrupt during stop/restart windows. SPEC Invariant 11 made bidirectional.
+  if self._stopping then
+    Util.notify("kernel is stopping; interrupt ignored",
+      vim.log.levels.INFO)
+    return
+  end
+  if self._restart_pending then
+    Util.notify("kernel is restarting; interrupt ignored",
+      vim.log.levels.INFO)
+    return
+  end
   self:_send({ type = "interrupt" })
 end
 
@@ -597,6 +720,19 @@ function Kernel:restart(opts)
   opts = opts or {}
   if not self.chan then
     Util.notify("kernel is not running", vim.log.levels.INFO)
+    return
+  end
+  -- Symmetric to interrupt: pressing :NotebookKernelRestart while a stop
+  -- teardown is in flight, or while a previous restart hasn't completed,
+  -- would otherwise write to a dying channel and the result of the
+  -- subsequent execute could be confusing.
+  if self._stopping then
+    Util.notify("kernel is stopping; restart ignored (next execute will respawn the bridge)",
+      vim.log.levels.INFO)
+    return
+  end
+  if self._restart_pending then
+    Util.notify("kernel is already restarting", vim.log.levels.INFO)
     return
   end
   -- Cancel in-flight cells synchronously BEFORE sending restart so a user
@@ -612,8 +748,16 @@ function Kernel:restart(opts)
   -- clobber any cell the user queued during the restart window.
   self:_cancel_in_flight("killed")
   self._restart_pending = true
+  -- Defer the clear until `restarted` arrives. The bridge's restart()
+  -- empties `parent_to_cell` and bumps `_restart_seq` before SIGKILLing the
+  -- kernel, but iopub frames that were already on the wire when restart
+  -- was called continue to arrive until the channel drains. Those frames
+  -- land in `_handle_msg` → `ensure_output` and resurrect output entries
+  -- on cells the user just asked to clear. By deferring the clear until
+  -- after `restarted` (which is emitted *after* the bridge's lock-held
+  -- drain), we know no more old-kernel frames are coming. SPEC Invariant 42.
+  self._restart_clear_pending = (opts.clear and true) or nil
   self:_send({ type = "restart" })
-  if opts.clear then self.notebook:clear_all_outputs() end
   if self.on_change then self.on_change() end
 end
 
@@ -638,6 +782,7 @@ function Kernel:stop()
   -- restart that races a stop() before the bridge emits `restarted` leaves
   -- `_restart_pending` stuck true after stop returns. SPEC Invariant 25.
   self._restart_pending = false
+  self._restart_clear_pending = nil
   -- Mark any running / queued cells as killed BEFORE we clear them, so the
   -- UI doesn't show a permanent "Running…" or "Queued" pill on cells whose
   -- kernel is gone. (The on_exit handler does this for *unexpected* exits;
@@ -667,6 +812,23 @@ function Kernel:stop()
     self._stderr_timer = nil
   end
   self._stderr_buf = {}
+  -- Same for the list_kernels timeout: if the bridge is going away, a
+  -- pending picker that already lost its reply must fire its callbacks
+  -- (with empty lists) so callers aren't stranded waiting.
+  if self._list_kernels_timer then
+    pcall(function() self._list_kernels_timer:stop() end)
+    pcall(function() self._list_kernels_timer:close() end)
+    self._list_kernels_timer = nil
+  end
+  local cbs = self._on_list
+  self._on_list = nil
+  if cbs then
+    if type(cbs) == "function" then
+      pcall(cbs, {})
+    else
+      for _, c in ipairs(cbs) do pcall(c, {}) end
+    end
+  end
   self.job_id = nil; self.chan = nil
   self.json_buf = ""
   -- Clear _stopping so the next execute can respawn the bridge. We held this
@@ -678,6 +840,13 @@ function Kernel:stop()
   -- user actually sees them transition out of running/queued.
   if self.on_change then pcall(self.on_change) end
 end
+
+-- Bounded wait for the bridge's `kernels_listed` reply. If the bridge
+-- accepted the request but never replies (bridge bug, process wedged), the
+-- picker would never open and the user would have no recovery short of
+-- `:NotebookKernelStop`. The timeout fires the callbacks with an empty list
+-- and emits a WARN so the user understands why the picker stayed silent.
+local LIST_KERNELS_TIMEOUT_MS = 5000
 
 function Kernel:list_kernels(cb)
   if not self:_ensure_started() then return end
@@ -695,6 +864,27 @@ function Kernel:list_kernels(cb)
   end
   if not in_flight then
     self:_send({ type = "list_kernels" })
+    -- Arm a one-shot timeout. _handle_msg clears `_on_list` on reply, so
+    -- the timer callback checks whether the slot is still set — if so the
+    -- bridge missed the deadline. Cleared on Kernel:stop too.
+    if self._list_kernels_timer then
+      pcall(function() self._list_kernels_timer:stop() end)
+      pcall(function() self._list_kernels_timer:close() end)
+    end
+    self._list_kernels_timer = vim.defer_fn(function()
+      self._list_kernels_timer = nil
+      if self._on_list == nil then return end   -- reply already arrived
+      local cbs = self._on_list
+      self._on_list = nil
+      Util.notify("kernel: bridge did not reply to list_kernels within "
+        .. tostring(LIST_KERNELS_TIMEOUT_MS) .. "ms; the picker will be empty",
+        vim.log.levels.WARN)
+      if type(cbs) == "function" then
+        pcall(cbs, {})
+      else
+        for _, c in ipairs(cbs) do pcall(c, {}) end
+      end
+    end, LIST_KERNELS_TIMEOUT_MS)
   end
 end
 

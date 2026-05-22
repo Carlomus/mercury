@@ -131,29 +131,87 @@ function Notebook:rescan()
 
   self.cells = result.cells
 
-  -- Migrate side-tables for renamed ids before GC'ing the old ones. Heuristic:
-  -- if the cell at position i has a NEW id but a previously-known id at the
-  -- same position no longer exists in the new cell set, treat it as a rename
-  -- and move the side-table entries over. Conservative — only fires when the
-  -- old id has *no* surviving cell, so a duplicate-paste followed by edit
-  -- doesn't accidentally cannibalize the original.
+  -- Migrate side-tables for renamed ids before GC'ing the old ones.
+  --
+  -- A "rename" is detected when a previously-known id disappears from the
+  -- new cell set entirely AND a position-matched new cell has an id we
+  -- didn't see before. Conservative — only fires when the old id has *no*
+  -- surviving cell, so a duplicate-paste followed by edit can't
+  -- cannibalize the original.
+  --
+  -- We handle BOTH the equal-length case (the canonical "user retyped an
+  -- id-token in a separator") AND the unequal-length case (rename happened
+  -- in the same edit batch as an unrelated insert / delete elsewhere in
+  -- the buffer). For the unequal case, we look for vanished old ids and,
+  -- when exactly one is missing AND exactly one new id is new, treat
+  -- that pairing as a rename. Multiple ambiguous vanishings are left to
+  -- the GC path — preserving the conservative "if in doubt, don't migrate"
+  -- contract that prevents data corruption from heuristic guessing.
   local present = {}
   for _, c in ipairs(self.cells) do present[c.id] = true end
+  local function _migrate(old_id, new_id)
+    if self.cell_metadata[old_id] ~= nil and self.cell_metadata[new_id] == nil then
+      self.cell_metadata[new_id] = self.cell_metadata[old_id]
+    end
+    if self.outputs[old_id] ~= nil and self.outputs[new_id] == nil then
+      self.outputs[new_id] = self.outputs[old_id]
+    end
+    if self.cell_attachments[old_id] ~= nil and self.cell_attachments[new_id] == nil then
+      self.cell_attachments[new_id] = self.cell_attachments[old_id]
+    end
+    -- Migrate kernel-side pointers. Without this, a manual id rename on a
+    -- running cell leaves self.kernel.running.cell_id pointing at the
+    -- now-vanished old id — `_live_code_cell` then drops every iopub
+    -- frame the kernel keeps emitting (silent output loss) and the
+    -- running pill never clears. SPEC Invariant 4 + Invariant 47.
+    if self.kernel then
+      if self.kernel.running and self.kernel.running.cell_id == old_id then
+        self.kernel.running.cell_id = new_id
+      end
+      for _, task in ipairs(self.kernel.queue or {}) do
+        if task.cell_id == old_id then task.cell_id = new_id end
+      end
+      if self._skipped_at_save and self._skipped_at_save[old_id] then
+        self._skipped_at_save[new_id] = true
+        self._skipped_at_save[old_id] = nil
+      end
+    end
+    present[new_id] = true
+  end
   if prev_cells and #prev_cells == #self.cells then
+    -- Position-aligned walk: same length → same positions.
     for i, new_c in ipairs(self.cells) do
       local old_c = prev_cells[i]
       if old_c and old_c.id ~= new_c.id and not present[old_c.id] then
-        if self.cell_metadata[old_c.id] ~= nil and self.cell_metadata[new_c.id] == nil then
-          self.cell_metadata[new_c.id] = self.cell_metadata[old_c.id]
-        end
-        if self.outputs[old_c.id] ~= nil and self.outputs[new_c.id] == nil then
-          self.outputs[new_c.id] = self.outputs[old_c.id]
-        end
-        if self.cell_attachments[old_c.id] ~= nil and self.cell_attachments[new_c.id] == nil then
-          self.cell_attachments[new_c.id] = self.cell_attachments[old_c.id]
-        end
-        present[new_c.id] = true
+        _migrate(old_c.id, new_c.id)
       end
+    end
+  elseif prev_cells then
+    -- Unequal-length case: a rename happened alongside an insert/delete.
+    -- Find vanished old ids (had side-table entries, not in new set) and
+    -- new ids (in new set, no side-table entries). If exactly one of each,
+    -- the pairing is unambiguous — migrate. Otherwise leave to GC.
+    local prev_ids = {}
+    for _, c in ipairs(prev_cells) do prev_ids[c.id] = true end
+    local vanished = {}
+    for id in pairs(prev_ids) do
+      if not present[id]
+          and (self.cell_metadata[id] or self.outputs[id]
+               or self.cell_attachments[id]) then
+        vanished[#vanished + 1] = id
+      end
+    end
+    local newids = {}
+    for id in pairs(present) do
+      if not prev_ids[id]
+          and self.cell_metadata[id] == nil
+          and self.outputs[id] == nil
+          and self.cell_attachments[id] == nil then
+        newids[#newids + 1] = id
+      end
+    end
+    if #vanished == 1 and #newids == 1 then
+      _migrate(vanished[1], newids[1])
     end
   end
 
@@ -176,6 +234,20 @@ function Notebook:rescan()
   -- SPEC Invariant 20.
   local kinds = {}
   for _, c in ipairs(self.cells) do kinds[c.id] = c.kind end
+  -- If the user manually edited the separator of a CURRENTLY RUNNING code
+  -- cell to flip its kind (e.g., added `[markdown]`), set_kind's busy-cell
+  -- refusal (SPEC Invariant 18) is bypassed — the conversion lands via
+  -- the rescan path. Without an interrupt here, the kernel keeps executing
+  -- the code (side effects continue) while iopub frames are silently
+  -- dropped by `_live_code_cell` (Invariant 19). Send SIGINT so the kernel
+  -- work stops in a user-observable way. Symmetric with delete_cell.
+  if self.kernel and self.kernel.running then
+    local running_id = self.kernel.running.cell_id
+    if running_id and kinds[running_id] and kinds[running_id] ~= "code"
+        and type(self.kernel.interrupt) == "function" then
+      pcall(self.kernel.interrupt, self.kernel)
+    end
+  end
   for id, _ in pairs(self.outputs) do
     if kinds[id] and kinds[id] ~= "code" then self.outputs[id] = nil end
   end
@@ -201,31 +273,45 @@ end
 
 function Notebook:_apply_id_assignments(orig_lines, cells)
   -- Rewrite header lines for two cases:
-  --   (a) the separator has no id at all — splice a fresh one in
+  --   (a) the separator has no id at all — splice `id=<new>` into the
+  --       existing header line. Any unrecognized trailing text the user
+  --       had on the line (a comment, a non-token annotation) is preserved
+  --       as-is. This honors the SPEC contract that id assignment is a
+  --       *splice* over the existing line, not a rebuild from tokens.
   --   (b) scan_lines flagged the cell as `dup_rewrite` because its id
   --       collided with an earlier cell (yank-and-paste of a separator).
-  --       The line still has an id, but it's the wrong one now.
-  -- Either way, format_separator(...) rebuilds the canonical form preserving
-  -- kind + tags + extras so we don't silently drop them.
+  --       The line already has an id token but it's pointing at the wrong
+  --       cell; rewrite just the id= token in place, leaving everything
+  --       else around it untouched.
+  --
+  -- Either path preserves any text the user typed beyond the recognized
+  -- token grammar. format_separator's full rebuild is reserved for paths
+  -- where the entire separator is freshly generated (e.g. NewCellBelow);
+  -- here we treat the buffer line as authoritative for everything except
+  -- the id token.
   local new_lines = {}
   for i, ln in ipairs(orig_lines) do new_lines[i] = ln end
   for _, c in ipairs(cells) do
     if c.header_row >= 0 then
       local row = c.header_row + 1
-      local needs_rebuild = c.dup_rewrite
-        or not new_lines[row]:match("id=[%w_%-]+")
-      if needs_rebuild then
-        local md = {}
-        local extras = c.meta and c.meta.extras
-        if extras and extras.tags then
-          md.tags = vim.split(extras.tags, ",", { plain = true, trimempty = true })
+      local cur = new_lines[row] or ""
+      if c.dup_rewrite then
+        -- Replace the existing id= token with the new id, leaving the
+        -- rest of the header line text alone.
+        local replaced, n = cur:gsub("id=[%w_%-]+", "id=" .. c.id, 1)
+        if n == 0 then
+          -- Defensive: dup_rewrite without an id token shouldn't be
+          -- possible (scan_lines only sets it when parse_meta saw an id),
+          -- but if it ever happens, fall through to the splice path below.
+          replaced = cur:gsub("^(#%s*%%%%)", "%1 id=" .. c.id, 1)
         end
-        new_lines[row] = Ipynb.format_separator({
-          id = c.id,
-          kind = c.meta.kind,
-          metadata = md,
-          extras = extras,
-        })
+        new_lines[row] = replaced
+      elseif not cur:match("id=[%w_%-]+") then
+        -- Splice `id=<new>` immediately after the `# %%` marker, preserving
+        -- everything that follows. If the line is bare `# %%`, the result
+        -- is `# %% id=<new>`; if it's `# %% Cell title`, the result is
+        -- `# %% id=<new> Cell title`.
+        new_lines[row] = cur:gsub("^(#%s*%%%%)", "%1 id=" .. c.id, 1)
       end
     end
   end
@@ -382,6 +468,17 @@ function Notebook:merge_below(cell)
   local idx = self:cell_index(cell.id)
   local nextc = self.cells[idx + 1]
   if not nextc then return end
+  -- Refuse if either cell is busy. Symmetric with set_kind (SPEC Invariant
+  -- 18) and delete_cell's interrupt path: merging away a running cell
+  -- would silently lose iopub frames (`_live_code_cell` drops them once
+  -- the id is gone) while the kernel keeps executing the code with side
+  -- effects the user can no longer observe. The conservative choice is
+  -- to refuse so the user can interrupt explicitly first.
+  if self:cell_is_busy(cell.id) or self:cell_is_busy(nextc.id) then
+    Util.notify("cell is running/queued; cannot merge",
+      vim.log.levels.INFO)
+    return
+  end
   -- Delete the next cell's separator line.
   local sep_row = nextc.header_row
   self:_with_mutation(function()
@@ -623,6 +720,17 @@ function Notebook:to_ipynb_struct()
       in_flight[task.cell_id] = true
     end
   end
+  -- Record every in-flight cell in self._skipped_at_save so the kernel's
+  -- execute_done branch knows to mark the buffer modified when the cell
+  -- finally finishes. Without this, the cell's eventual output stays in
+  -- memory but the next :w is a no-op (vim only tracks `modified` on text
+  -- changes), and the user thinks the save "worked." SPEC Invariant 14.
+  if next(in_flight) ~= nil then
+    self._skipped_at_save = self._skipped_at_save or {}
+    for id in pairs(in_flight) do
+      self._skipped_at_save[id] = true
+    end
+  end
 
   local cells = {}
   local last_idx = #self.cells
@@ -664,6 +772,28 @@ function Notebook:to_ipynb_struct()
       end
     end
     md.mercury_extras = has_any and stash or nil
+    -- Persist the collapsed state under JupyterLab's canonical metadata
+    -- location so reopening the notebook in any tool (or in Mercury after
+    -- a session restart) shows the same outputs hidden / shown state.
+    -- We write BOTH the classic `metadata.collapsed` (classic Notebook,
+    -- still tolerated by Lab) AND `metadata.jupyter.outputs_hidden` (the
+    -- modern Lab/VS Code canonical key) so the file round-trips through
+    -- every tool consistently.
+    if out and out._collapsed then
+      md.collapsed = true
+      local j = md.jupyter
+      if type(j) ~= "table" then j = {} end
+      j.outputs_hidden = true
+      md.jupyter = j
+    else
+      -- Don't leave a stale `collapsed=true` lingering on a cell whose
+      -- output is now expanded; that would silently re-collapse on reload.
+      if md.collapsed ~= nil then md.collapsed = nil end
+      if type(md.jupyter) == "table" then
+        md.jupyter.outputs_hidden = nil
+        if next(md.jupyter) == nil then md.jupyter = nil end
+      end
+    end
     cells[#cells + 1] = {
       id = c.id,
       kind = c.kind,
