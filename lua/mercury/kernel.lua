@@ -362,13 +362,21 @@ function Kernel:_apply_item(out, item)
     out._pending_clear = nil
   end
   if t == "stream" then
+    -- Clamp `name` to {stdout, stderr} per nbformat schema. A buggy / non-
+    -- compliant kernel emitting `name="custom"` would otherwise propagate
+    -- through to disk and fail `nbformat.validate()` on the next pass. We
+    -- can't drop the frame outright (text would be lost), so the conservative
+    -- coercion is to route unknown names to stdout — same display path as
+    -- the default value, no information lost beyond the name itself.
+    local name = item.name
+    if name ~= "stdout" and name ~= "stderr" then name = "stdout" end
     -- Coalesce consecutive streams of the same name.
     local last = out.items[#out.items]
-    if last and last.type == "stream" and last.name == item.name then
+    if last and last.type == "stream" and last.name == name then
       last.text = (last.text or "") .. (item.text or "")
     else
       table.insert(out.items, {
-        type = "stream", name = item.name or "stdout", text = item.text or "",
+        type = "stream", name = name, text = item.text or "",
       })
     end
   elseif t == "update_display_data" then
@@ -378,50 +386,50 @@ function Kernel:_apply_item(out, item)
     -- implement this: cell A creates `display(..., display_id="x")`, cell B
     -- calls `update_display(new_obj, display_id="x")` to refresh A's display.
     local did = (item.transient or {}).display_id
-    if did then
-      local updated = false
-      local cross_cell_updated = false
-      local function update_in(items, is_other)
-        for _, it in ipairs(items or {}) do
-          if it._display_id == did then
-            it.data = item.data or it.data
-            it.metadata = item.metadata or it.metadata
-            updated = true
-            if is_other then cross_cell_updated = true end
-          end
+    -- update_display_data WITHOUT a display_id is meaningless — there's no
+    -- target to update. Real JupyterLab silently drops these. The prior
+    -- behavior here was to fall through and insert a phantom display_data
+    -- in the calling cell with `_display_id = nil`, which is both unhelpful
+    -- (the update was supposed to refresh an existing block, not create a
+    -- new one) and divergent from every other notebook UI. Drop and return.
+    if not did or did == "" then return end
+    local updated = false
+    local cross_cell_updated = false
+    local function update_in(items, is_other)
+      for _, it in ipairs(items or {}) do
+        if it._display_id == did then
+          it.data = item.data or it.data
+          it.metadata = item.metadata or it.metadata
+          updated = true
+          if is_other then cross_cell_updated = true end
         end
       end
-      update_in(out.items, false)
-      -- Walk every OTHER cell's outputs too.
-      if self.notebook and self.notebook.outputs then
-        for _, other in pairs(self.notebook.outputs) do
-          if other ~= out and other.items then update_in(other.items, true) end
-        end
+    end
+    update_in(out.items, false)
+    -- Walk every OTHER cell's outputs too.
+    if self.notebook and self.notebook.outputs then
+      for _, other in pairs(self.notebook.outputs) do
+        if other ~= out and other.items then update_in(other.items, true) end
       end
-      if updated then
-        -- Defense in depth: if a different cell's items got mutated, schedule
-        -- a render here rather than relying on the caller. on_change is
-        -- coalesced (SPEC Invariant 7) so a redundant call collapses; this
-        -- guarantees the cross-cell update lands visually even if a future
-        -- caller of _apply_item forgets to call on_change after.
-        if cross_cell_updated and self.on_change then
-          pcall(self.on_change)
-        end
-        return
+    end
+    if updated then
+      -- Defense in depth: if a different cell's items got mutated, schedule
+      -- a render here rather than relying on the caller. on_change is
+      -- coalesced (SPEC Invariant 7) so a redundant call collapses; this
+      -- guarantees the cross-cell update lands visually even if a future
+      -- caller of _apply_item forgets to call on_change after.
+      if cross_cell_updated and self.on_change then
+        pcall(self.on_change)
       end
-      -- `display_id` was provided but no existing output holds it: the
-      -- target display block was deleted (the cell that created it was
-      -- removed, or its outputs were cleared). Real JupyterLab silently
-      -- drops the update in this case; the prior behavior of inserting a
-      -- new `display_data` in the CALLING cell produced a phantom block
-      -- in the wrong place. Drop and return.
       return
     end
-    table.insert(out.items, {
-      type = "display_data", data = item.data or {},
-      metadata = item.metadata or {},
-      _display_id = did,
-    })
+    -- `display_id` was provided but no existing output holds it: the
+    -- target display block was deleted (the cell that created it was
+    -- removed, or its outputs were cleared). Real JupyterLab silently
+    -- drops the update in this case; the prior behavior of inserting a
+    -- new `display_data` in the CALLING cell produced a phantom block
+    -- in the wrong place. Drop and return.
+    return
   elseif t == "display_data" or t == "execute_result" then
     table.insert(out.items, {
       type = t,
@@ -432,10 +440,31 @@ function Kernel:_apply_item(out, item)
     })
   elseif t == "error" then
     out.status = "error"
+    -- nbformat requires traceback to be array<string>. A buggy kernel that
+    -- sends a single string would otherwise propagate to disk and fail
+    -- `nbformat.validate()`. Coerce: wrap a string in a single-element list,
+    -- and filter any non-string entries from an existing list (rare but
+    -- possible if the kernel mixed types).
+    local tb = item.traceback
+    if type(tb) == "string" then
+      tb = { tb }
+    elseif type(tb) == "table" then
+      local clean = {}
+      for _, line in ipairs(tb) do
+        if type(line) == "string" then
+          clean[#clean + 1] = line
+        else
+          clean[#clean + 1] = tostring(line)
+        end
+      end
+      tb = clean
+    else
+      tb = {}
+    end
     table.insert(out.items, {
       type = "error",
       ename = item.ename, evalue = item.evalue,
-      traceback = item.traceback or {},
+      traceback = tb,
     })
   else
     table.insert(out.items, item)

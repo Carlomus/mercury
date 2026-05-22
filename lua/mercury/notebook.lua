@@ -460,6 +460,29 @@ function Notebook:delete_cell(cell)
       })
     end)
   end
+  -- Reposition cursor onto the body of whichever cell now occupies the
+  -- deleted cell's slot — successor first, predecessor if we deleted the
+  -- tail, or the synthesized placeholder cell. Matches JupyterLab / VS Code
+  -- notebook delete behavior; without this the cursor stays at whatever
+  -- buffer row the deletion left it on, which may now be a separator line
+  -- or past the end of the buffer.
+  --
+  -- Only operates on the currently-focused window if it actually shows this
+  -- buffer; positioning a cursor in a window that's looking at something
+  -- else would yank the user across files.
+  local target = self.cells[idx] or self.cells[idx - 1] or self.cells[1]
+  if target then
+    local win = vim.api.nvim_get_current_win()
+    if vim.api.nvim_win_is_valid(win)
+        and vim.api.nvim_win_get_buf(win) == self.buf then
+      local row = math.max(target.body_start, 0)
+      local total = vim.api.nvim_buf_line_count(self.buf)
+      -- Clamp: body_start can briefly exceed line_count for a freshly-
+      -- synthesized last-cell placeholder before its body line is settled.
+      row = math.min(row, math.max(total - 1, 0))
+      pcall(vim.api.nvim_win_set_cursor, win, { row + 1, 0 })
+    end
+  end
 end
 
 function Notebook:merge_below(cell)
@@ -493,9 +516,21 @@ function Notebook:_swap_cells(i, j)
   local b = self.cells[j]
   if not (a and b) or i + 1 ~= j then return end
   local a_lines = vim.api.nvim_buf_get_lines(self.buf, a.header_row, b.header_row, false)
+  local b_is_last = (self.cells[j + 1] == nil)
   local last_row = (self.cells[j + 1] and self.cells[j + 1].header_row) or
     vim.api.nvim_buf_line_count(self.buf)
   local b_lines = vim.api.nvim_buf_get_lines(self.buf, b.header_row, last_row, false)
+  -- Visual-gap blank line handling: a_lines ends with the blank that
+  -- to_buffer_lines inserts between cells. When b is the LAST cell, b_lines
+  -- has no trailing blank — so writing b_lines + a_lines puts the gap at the
+  -- end of the buffer (trailing the new last cell, a) instead of between b
+  -- and a. Move the trailing blank from a_lines to b_lines so the gap stays
+  -- in cell-separator position after the swap. For mid-buffer swaps, both
+  -- lists end with their own gap and the natural ordering is already correct.
+  if b_is_last and #a_lines > 0 and a_lines[#a_lines] == "" then
+    table.remove(a_lines, #a_lines)
+    b_lines[#b_lines + 1] = ""
+  end
   self:_with_mutation(function()
     vim.api.nvim_buf_set_lines(self.buf, a.header_row, last_row, false,
       vim.list_extend(vim.list_extend({}, b_lines), a_lines))
@@ -572,9 +607,26 @@ function Notebook:set_kind(cell, kind)
   })
   self:_with_mutation(function()
     vim.api.nvim_buf_set_lines(self.buf, cell.header_row, cell.header_row + 1, false, { sep })
-    -- (b) Leaving code → outputs are invalid for the new kind.
+    -- (b) Leaving code → outputs are invalid for the new kind. Drop the
+    -- output side-table entry AND the output-specific metadata keys that
+    -- a stale read on next reload would resurrect: `collapsed` and
+    -- `jupyter.outputs_hidden` are output-visibility flags that have no
+    -- meaning on a markdown / raw cell. `metadata.execution` is the
+    -- ExecuteTime extension JupyterLab writes (iopub.execute_input /
+    -- shell.execute_reply timestamps), which references the previous
+    -- execution of code that the cell no longer is. Without this scrub,
+    -- converting code→markdown then back to code reopens the cell with a
+    -- phantom collapsed state, and the on-disk JSON for the markdown cell
+    -- carries output-only fields that nbformat tolerates but other tools
+    -- may flag.
     if prev_kind == "code" and kind ~= "code" then
       self.outputs[cell.id] = nil
+      md.collapsed = nil
+      md.execution = nil
+      if type(md.jupyter) == "table" then
+        md.jupyter.outputs_hidden = nil
+        if next(md.jupyter) == nil then md.jupyter = nil end
+      end
     end
     -- (c) Leaving markdown → attachments are invalid for the new kind.
     if prev_kind == "markdown" and kind ~= "markdown" then
@@ -720,6 +772,16 @@ function Notebook:to_ipynb_struct()
       in_flight[task.cell_id] = true
     end
   end
+  -- If a `:NotebookKernelRestartClear` is in flight, the user has expressed
+  -- intent to drop ALL outputs. The actual in-memory clear is deferred until
+  -- the bridge emits `restarted` (SPEC Invariant 42, to avoid resurrection
+  -- by old-kernel iopub frames still draining). A save landing between
+  -- restart() and that drain would otherwise write the stale outputs the
+  -- user just asked to discard, then the deferred clear would wipe them in
+  -- memory — the disk would still carry them until the next save. Honor
+  -- the user's clear intent at save time by treating every cell as in-flight
+  -- (so outputs serialize empty), matching the post-`restarted` state.
+  local restart_clear = self.kernel and self.kernel._restart_clear_pending
   -- Record every in-flight cell in self._skipped_at_save so the kernel's
   -- execute_done branch knows to mark the buffer modified when the cell
   -- finally finishes. Without this, the cell's eventual output stays in
@@ -747,7 +809,9 @@ function Notebook:to_ipynb_struct()
     -- For an in-flight cell, treat as if it had no output state at all. We
     -- could emit partial items, but a half-streamed tqdm bar or a missing
     -- exec_count makes the file look inconsistent on next reload.
-    if in_flight[c.id] then out = nil end
+    -- restart_clear (RestartClear pending) likewise suppresses output write
+    -- so the disk matches the post-restart intent.
+    if in_flight[c.id] or restart_clear then out = nil end
     -- Preserve metadata from the original JSON; let separator-encoded tags
     -- override, and stash unknown separator tokens under mercury_extras so
     -- they survive the JSON round-trip (the buffer is the source of truth

@@ -145,24 +145,32 @@ def _make_local_km_from_python(python_path: str):
         raise NoUsableKernel(detail=f"python not executable: {python_path}")
 
     tmpdir = tempfile.mkdtemp(prefix="mercury_kernel_")
-    spec_name = "mercury_synth"
-    spec_dir = os.path.join(tmpdir, spec_name)
-    os.makedirs(spec_dir)
-    spec = {
-        "argv": [python_path, "-m", "ipykernel_launcher",
-                 "-f", "{connection_file}"],
-        "display_name": f"Python ({_short_python_label(python_path)})",
-        "language": "python",
-    }
-    with open(os.path.join(spec_dir, "kernel.json"), "w") as f:
-        json.dump(spec, f)
+    # Anything that raises between mkdtemp and the successful attach of
+    # `_mercury_tmpdir` would otherwise leak the dir — Bridge.close() only
+    # knows about tmpdirs that landed on the km. Catch and clean.
+    try:
+        spec_name = "mercury_synth"
+        spec_dir = os.path.join(tmpdir, spec_name)
+        os.makedirs(spec_dir)
+        spec = {
+            "argv": [python_path, "-m", "ipykernel_launcher",
+                     "-f", "{connection_file}"],
+            "display_name": f"Python ({_short_python_label(python_path)})",
+            "language": "python",
+        }
+        with open(os.path.join(spec_dir, "kernel.json"), "w") as f:
+            json.dump(spec, f)
 
-    ksm = KernelSpecManager()
-    # Prepend so our synthesized spec shadows any "mercury_synth" left over
-    # from a previous session that we'd otherwise pick up.
-    ksm.kernel_dirs = [tmpdir] + list(ksm.kernel_dirs)
-    km = KernelManager(kernel_name=spec_name, kernel_spec_manager=ksm)
-    km.start_kernel()
+        ksm = KernelSpecManager()
+        # Prepend so our synthesized spec shadows any "mercury_synth" left over
+        # from a previous session that we'd otherwise pick up.
+        ksm.kernel_dirs = [tmpdir] + list(ksm.kernel_dirs)
+        km = KernelManager(kernel_name=spec_name, kernel_spec_manager=ksm)
+        km.start_kernel()
+    except Exception:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
     # Attach for cleanup by Bridge.close(). We can't remove tmpdir here
     # because km.restart_kernel() may re-read kernel.json from it; the
     # tmpdir's lifetime is tied to the KernelManager's.

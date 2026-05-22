@@ -498,13 +498,24 @@ function M.decode(json_text)
     -- Future-proof: refuse a hypothetical v5 too so we don't misinterpret it.
     return nil, ("nbformat v%d is not supported by Mercury (reads v4 only)."):format(nbformat_major)
   end
+  -- nbformat 4.5 cell id charclass + length cap. Strict per JEP 12: ids must
+  -- match ^[a-zA-Z0-9_-]+$ and be 1..64 chars. Files written by older Mercury
+  -- and almost every other tool already conform; this guards against
+  -- vendor-extended ids (dots, slashes), pathological whitespace, and
+  -- accidental over-long ids — any of which would round-trip into the
+  -- separator and break `parse_meta`'s value class on the next rescan.
+  local function _valid_nb_id(s)
+    return type(s) == "string"
+      and #s >= 1 and #s <= 64
+      and s:match("^[A-Za-z0-9_%-]+$") ~= nil
+  end
   local cells = {}
   local injected_id = false
   for _, c in ipairs(doc.cells or {}) do
     local raw_type = c.cell_type
     local kind = kind_from_cell_type(raw_type)
     local id = c.id
-    if not id or id == "" then
+    if not _valid_nb_id(id) then
       id = Util.short_id()
       injected_id = true
     end

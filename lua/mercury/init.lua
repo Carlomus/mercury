@@ -428,9 +428,29 @@ local function save_ipynb(buf, path, force)
   -- the string forms differ. Same problem for any user-symlinked project
   -- (e.g. ~/work → /Users/carlo/Work).
   local loaded = vim.b[buf].mercury_loaded_path
-  local r_loaded = loaded and (vim.loop.fs_realpath(loaded) or loaded)
-  local r_path = vim.loop.fs_realpath(path) or path
-  local saving_same_file = r_loaded and r_loaded == r_path
+  -- realpath returns nil when a path component is unreachable (broken
+  -- symlink, fs unmounted, permission denied). If EITHER side fails to
+  -- resolve we can't prove the paths refer to the same file, but we also
+  -- can't prove they're different. The previous code silently treated
+  -- nil-fallback as "different files" and skipped the mtime guard — that
+  -- failure mode would let an externally-edited file get clobbered without
+  -- warning. Resolve outcomes are tracked separately so the same-file
+  -- branch only fires on a CONFIRMED match.
+  local r_loaded = loaded and vim.loop.fs_realpath(loaded) or nil
+  local r_path = vim.loop.fs_realpath(path)
+  local resolved_match = r_loaded and r_path and r_loaded == r_path
+  -- Suspected-same: we can't resolve symlinks but the literal paths agree.
+  -- Common case is a brand-new file that doesn't exist yet (fs_realpath
+  -- returns nil on a non-existent target); fall through to the mtime guard
+  -- which itself bails when no `stat` is available.
+  local literal_match = loaded and loaded == path
+  -- Realpath inconclusive (one side resolved, the other didn't) — engage
+  -- the guard conservatively. The user can :w! to override; that's strictly
+  -- safer than the silent-overwrite path the previous code allowed.
+  local inconclusive = loaded
+    and (loaded ~= path)
+    and ((r_loaded == nil) ~= (r_path == nil))
+  local saving_same_file = resolved_match or literal_match or inconclusive
   if saving_same_file then
     local stat = vim.loop.fs_stat(path)
     local stored = vim.b[buf].mercury_file_mtime
@@ -454,8 +474,25 @@ local function save_ipynb(buf, path, force)
   -- the state we actually skipped. to_ipynb_struct reads kernel.running /
   -- kernel.queue to know which cells to write as "not yet executed".
   local skipped = in_flight_count(nb)
-  local struct = nb:to_ipynb_struct()
-  local json = Ipynb.encode(struct)
+  -- Wrap serialization in pcall: a Lua error inside to_ipynb_struct or
+  -- encode would otherwise propagate out of BufWriteCmd as a raw stack
+  -- trace, leaving the buffer modified, the file untouched, and the user
+  -- with no actionable message. Returning (false, err) keeps the failure
+  -- mode symmetric with atomic_write_file's error contract, and the user
+  -- can decide whether to retry, debug, or save elsewhere. Critically:
+  -- atomic_write_file is NEVER reached on a serialize failure, so the
+  -- on-disk file remains the previous good content.
+  local ok_struct, struct = pcall(function() return nb:to_ipynb_struct() end)
+  if not ok_struct then
+    return false, "serialize failed: " .. tostring(struct)
+  end
+  local ok_encode, json = pcall(Ipynb.encode, struct)
+  if not ok_encode then
+    return false, "encode failed: " .. tostring(json)
+  end
+  if type(json) ~= "string" or #json == 0 then
+    return false, "encode produced empty output"
+  end
   -- Atomic save: write to a sibling tempfile, fsync, rename(2). Crash /
   -- power loss during :w then leaves either the old or new file on disk,
   -- never a partial one. SPEC Invariant 22.
