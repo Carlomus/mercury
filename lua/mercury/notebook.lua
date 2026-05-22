@@ -65,6 +65,14 @@ function M.detach(buf)
   -- bufnr can't reuse a stale `_last_key` by coincidence and skip the
   -- set_included_regions call the new buffer actually needed. SPEC H15.
   pcall(function() require("mercury.markdown")._forget(buf) end)
+  -- Wipe the per-buffer augroup. Without this, a `:bd` (which fires
+  -- BufWipeout → detach but does not destroy the augroup) leaves
+  -- TextChanged / BufWinEnter / BufWipeout callbacks closing over a now-
+  -- dead Notebook. nvim recycles bufnrs aggressively, so the next file
+  -- opened against the same bufnr could inherit those autocmds. The
+  -- per-buffer augroup is named `MercuryBuf_<bufnr>` by attach_buffer in
+  -- init.lua. SPEC Invariant 30.
+  pcall(vim.api.nvim_del_augroup_by_name, "MercuryBuf_" .. buf)
   M.instances[buf] = nil
 end
 
@@ -283,8 +291,12 @@ function Notebook:_with_mutation(fn)
   local ok, err = pcall(fn)
   self._suppress_rescan = false
   if not ok then
-    -- Still rescan: the buffer may be in a partially-mutated state and we want
-    -- our cell list to reflect whatever did make it in before re-raising.
+    -- Still try to rescan: the buffer may be in a partially-mutated state and
+    -- we want our cell list to reflect whatever did make it in. The rescan
+    -- itself is pcall'd so a *second* failure (e.g., rescan inspecting a now-
+    -- invalid buffer) can't mask the original `err` — propagating that error
+    -- is the more useful signal for the caller. SPEC H — _with_mutation
+    -- recovery must not lose the original exception.
     pcall(function() self:rescan() end)
     error(err)
   end
@@ -327,6 +339,20 @@ end
 function Notebook:delete_cell(cell)
   cell = cell or self:cell_at_row()
   if not cell then return end
+  -- If the cell is currently RUNNING, interrupt the kernel so its work
+  -- actually stops instead of continuing invisibly. Jupyter SIGINT semantics:
+  -- the running cell raises KeyboardInterrupt; queued cells continue. We
+  -- intentionally don't try to "rewind" side effects the cell has already
+  -- produced — the user accepted that by choosing delete. If the cell is
+  -- merely QUEUED, the subsequent rescan drops it from kernel.queue (no
+  -- kernel signal needed). Both outputs and the in-memory state are then
+  -- discarded as the cell vanishes. SPEC Invariant 18 covers the
+  -- conversion case; this is its delete counterpart.
+  if self.kernel and self.kernel.running
+      and self.kernel.running.cell_id == cell.id
+      and type(self.kernel.interrupt) == "function" then
+    pcall(self.kernel.interrupt, self.kernel)
+  end
   local idx = self:cell_index(cell.id)
   local start_row = math.max(cell.header_row, 0)
   local end_row = (self.cells[idx + 1] and self.cells[idx + 1].header_row) or
@@ -393,20 +419,73 @@ function Notebook:move_down(cell)
   if idx and idx < #self.cells then self:_swap_cells(idx, idx + 1) end
 end
 
+-- code ↔ markdown ↔ raw conversion. Implements SPEC Invariant 23: a single
+-- structural mutation that obeys five rules so the side-tables stay
+-- coherent regardless of which kind is being entered or left.
+--
+--   (a) Refuse on a busy cell (Invariant 18). Converting a running cell
+--       leaves stale output state and means the kernel's eventual frames
+--       get silently dropped by the iopub guard while side effects (file
+--       writes, mutations) already landed.
+--   (b) Drop outputs[id] when leaving `code` (Invariant 20 menu-driven
+--       path). nbformat: only code cells carry outputs; rendering a
+--       stale `▶ Out[7]` pill below prose is incoherent.
+--   (c) Drop cell_attachments[id] when leaving `markdown`. nbformat: only
+--       markdown cells carry attachments; passing them through on a
+--       code/raw cell would either be re-emitted by the encoder (which
+--       gates emission to markdown — silent loss) or, if the encoder
+--       didn't gate, would produce invalid nbformat.
+--   (d) Preserve all non-tags cell_metadata fields. The separator owns
+--       `tags`; everything else (`scrolled`, `collapsed`, vendor extras
+--       like `vscode`, etc.) must survive the deepcopy.
+--   (e) Pass `extras` through to format_separator so mercury_extras
+--       (`foo=bar` tokens on the separator) round-trip across the
+--       conversion. Without this, toggling code↔markdown silently drops
+--       any non-tag/non-id token on the separator.
 function Notebook:set_kind(cell, kind)
   cell = cell or self:cell_at_row()
   if not cell then return end
   if cell.header_row < 0 then return end
-  -- Preserve tags currently encoded on the separator (and on stored
-  -- nbformat metadata) so toggling code↔markdown doesn't drop them.
+  -- (a) Refuse if the cell is busy. Matches Jupyter Lab's disabled
+  -- cell-type menu while a cell is running. SPEC Invariant 18.
+  if self:cell_is_busy(cell.id) then
+    Util.notify("cell is running/queued; cannot change kind",
+      vim.log.levels.INFO)
+    return
+  end
+  local prev_kind = cell.kind
+  -- (d) Deepcopy all existing metadata so unknown vendor fields survive.
   local md = vim.deepcopy(self.cell_metadata[cell.id] or {})
+  -- (e) The separator's extras table is the source of truth for
+  -- mercury_extras + tags after conversion. ALWAYS derive md.tags from
+  -- extras — not only when extras.tags is present. Without the else-branch
+  -- nullify, a user who removed `tags=foo,bar` from the separator and then
+  -- invoked :NotebookCellToMarkdown would see the deepcopied stale tags
+  -- persist in cell_metadata until the next save (to_ipynb_struct corrects
+  -- them at save time, but observers between set_kind and save would read
+  -- inconsistent state). Symmetric with the to_ipynb_struct contract.
   local extras = cell.meta and cell.meta.extras
   if extras and extras.tags then
     md.tags = vim.split(extras.tags, ",", { plain = true, trimempty = true })
+  else
+    md.tags = nil
   end
-  local sep = Ipynb.format_separator({ id = cell.id, kind = kind, metadata = md })
+  local sep = Ipynb.format_separator({
+    id = cell.id, kind = kind, metadata = md, extras = extras,
+  })
   self:_with_mutation(function()
     vim.api.nvim_buf_set_lines(self.buf, cell.header_row, cell.header_row + 1, false, { sep })
+    -- (b) Leaving code → outputs are invalid for the new kind.
+    if prev_kind == "code" and kind ~= "code" then
+      self.outputs[cell.id] = nil
+    end
+    -- (c) Leaving markdown → attachments are invalid for the new kind.
+    if prev_kind == "markdown" and kind ~= "markdown" then
+      self.cell_attachments[cell.id] = nil
+    end
+    -- Persist the just-merged metadata (deepcopy avoids the rescan path
+    -- mutating the cached table by reference on a later set_kind).
+    self.cell_metadata[cell.id] = vim.deepcopy(md)
   end)
 end
 
@@ -443,6 +522,16 @@ end
 function Notebook:select_cell(cell)
   cell = cell or self:cell_at_row()
   if not cell then return end
+  -- Empty body (header_row >= 0 but body_end < body_start): nothing to
+  -- select meaningfully. A zero-width visual block confuses both the user
+  -- and downstream operators (e.g. `d` would delete the separator below
+  -- the empty cell). Park the cursor on the separator and bail.
+  if cell.body_end < cell.body_start then
+    if cell.header_row >= 0 then
+      vim.api.nvim_win_set_cursor(0, { cell.header_row + 1, 0 })
+    end
+    return
+  end
   local s = math.max(cell.body_start, 0)
   local e = math.max(s, cell.body_end)
   vim.api.nvim_win_set_cursor(0, { s + 1, 0 })

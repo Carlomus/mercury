@@ -546,5 +546,58 @@ class ListKernelspecsResilience(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class InterruptInExistingMode(unittest.TestCase):
+    """SPEC Invariant 26: interrupt is signal-based and requires owning the
+    kernel process. In mode='existing' the bridge does NOT own the
+    subprocess, so it must emit kernel_error{kind='unsupported'} instead
+    of sending a control-channel interrupt_request that has nothing
+    SIGINT-able on the receiving end.
+    """
+
+    def test_existing_mode_emits_unsupported_kernel_error(self):
+        import io, json
+        b = bridge.Bridge()
+        # Simulate mode='existing': km is None but kc is set.
+        b.km = None
+        b.kc = object()
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            b.interrupt()
+            captured = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_stdout
+        msgs = [json.loads(line) for line in captured.splitlines() if line]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["type"], "kernel_error")
+        self.assertEqual(msgs[0]["kind"], "unsupported")
+        self.assertIn("interrupt", msgs[0]["error"])
+
+    def test_local_mode_calls_interrupt_kernel(self):
+        # Sanity: in local mode the interrupt_kernel path is still taken
+        # and an "interrupted" message lands. We stub km to record the call.
+        import io, json
+        b = bridge.Bridge()
+        called = {"n": 0}
+
+        class _StubKM:
+            def interrupt_kernel(self_inner):
+                called["n"] += 1
+
+        b.km = _StubKM()
+        b.kc = object()
+        b.current_cell_id = "c1"
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            b.interrupt()
+            captured = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(called["n"], 1)
+        msgs = [json.loads(line) for line in captured.splitlines() if line]
+        self.assertTrue(any(m.get("type") == "interrupted" for m in msgs))
+
+
 if __name__ == "__main__":
     unittest.main()

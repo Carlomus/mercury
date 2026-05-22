@@ -140,33 +140,58 @@ function Kernel:_handle_msg(msg)
       self.on_change()
     end
   elseif typ == "execute_done" then
-    local out = nb:ensure_output(msg.cell_id)
-    out.exec_count = msg.exec_count or out.exec_count
-    out.ms = msg.ms or 0
-    -- A trailing `clear_output(wait=True)` whose next output never arrives is
-    -- a Jupyter idiom: tqdm clears its progress bar before exiting the loop.
-    if out._pending_clear then
-      out.items = {}
-      out._pending_clear = nil
-    end
-    -- Preserve terminal statuses set earlier in the same execute.
-    if not _is_terminal(out.status) then
-      out.status = "ok"
-    end
-    if msg.outputs and (#out.items == 0) then
-      for _, it in ipairs(msg.outputs) do self:_apply_item(out, it) end
-    end
-    -- If this cell was in-flight at the last :w (and therefore written to
-    -- JSON as not-yet-executed), the now-available output is something the
-    -- user expects a second :w to capture. Vim only tracks `modified` on
-    -- buffer text, so we set it ourselves so a re-save isn't silently a
-    -- no-op. SPEC Invariant 14.
-    if nb._skipped_at_save and nb._skipped_at_save[msg.cell_id] then
-      nb._skipped_at_save[msg.cell_id] = nil
-      if vim.api.nvim_buf_is_valid(nb.buf) then
-        vim.bo[nb.buf].modified = true
+    -- SPEC Invariant 24: like the `output` branch, the cell may have
+    -- vanished or been converted to non-code mid-execution. We still
+    -- need to clear self.running and pump the queue (the kernel is now
+    -- free), but we must NOT resurrect a writable output entry — that
+    -- would create exactly the side-table residue rescan's GC pass works
+    -- to avoid. The buffer-modified flag in `_skipped_at_save` housekeeping
+    -- also only makes sense for a live cell.
+    local Notebook = require("mercury.notebook")
+    local live = (not Notebook._live_code_cell)
+      or Notebook._live_code_cell(nb, msg.cell_id)
+    if live then
+      local out = nb:ensure_output(msg.cell_id)
+      out.exec_count = msg.exec_count or out.exec_count
+      out.ms = msg.ms or 0
+      -- A trailing `clear_output(wait=True)` whose next output never arrives is
+      -- a Jupyter idiom: tqdm clears its progress bar before exiting the loop.
+      if out._pending_clear then
+        out.items = {}
+        out._pending_clear = nil
       end
-      if next(nb._skipped_at_save) == nil then nb._skipped_at_save = nil end
+      -- Preserve terminal statuses set earlier in the same execute.
+      if not _is_terminal(out.status) then
+        out.status = "ok"
+      end
+      if msg.outputs and (#out.items == 0) then
+        for _, it in ipairs(msg.outputs) do self:_apply_item(out, it) end
+      end
+      -- ExecuteTime nbformat extension (Invariant 27): record the iso8601
+      -- end timestamp so a notebook round-tripped Jupyter Lab ↔ Mercury
+      -- doesn't lose absolute execute timing. `out._started_iso` is set
+      -- by `_pump` when this cell started running; copy it over to the
+      -- nbformat-shaped table now.
+      if out._started_iso then
+        nb.cell_metadata[msg.cell_id] = nb.cell_metadata[msg.cell_id] or {}
+        local cm = nb.cell_metadata[msg.cell_id]
+        cm.execution = cm.execution or {}
+        cm.execution["iopub.execute_input"] = out._started_iso
+        cm.execution["shell.execute_reply"] = os.date("!%Y-%m-%dT%H:%M:%S.000000Z")
+        out._started_iso = nil
+      end
+      -- If this cell was in-flight at the last :w (and therefore written to
+      -- JSON as not-yet-executed), the now-available output is something the
+      -- user expects a second :w to capture. Vim only tracks `modified` on
+      -- buffer text, so we set it ourselves so a re-save isn't silently a
+      -- no-op. SPEC Invariant 14.
+      if nb._skipped_at_save and nb._skipped_at_save[msg.cell_id] then
+        nb._skipped_at_save[msg.cell_id] = nil
+        if vim.api.nvim_buf_is_valid(nb.buf) then
+          vim.bo[nb.buf].modified = true
+        end
+        if next(nb._skipped_at_save) == nil then nb._skipped_at_save = nil end
+      end
     end
     if self.running and self.running.cell_id == msg.cell_id then self.running = nil end
     self:_pump()
@@ -199,6 +224,15 @@ function Kernel:_handle_msg(msg)
       Util.notify("kernel: " .. (msg.error or typ), vim.log.levels.WARN)
       return
     end
+    -- Fatal/restart-failed path: if we were mid-restart, the restart didn't
+    -- land. Clear the gate so the user can recover with another execute /
+    -- restart instead of being permanently locked out by `_ensure_started`'s
+    -- refusal (SPEC Invariant 25 made bidirectional — entering AND leaving
+    -- the restart window are both bounded events). Without this, a failed
+    -- restart (e.g., existing-mode supervisor never relaunched the kernel,
+    -- or local restart raised in bridge.restart()) wedged every subsequent
+    -- :NotebookExec into the "kernel is restarting" notify forever.
+    self._restart_pending = false
     self:_cancel_in_flight("killed")
     if msg.kind == "no_kernelspec" and msg.available and #msg.available > 0 then
       Util.notify("kernel: " .. (msg.error or typ), vim.log.levels.WARN)
@@ -378,6 +412,17 @@ function Kernel:_ensure_started()
       vim.log.levels.INFO)
     return false
   end
+  -- Same logic for a restart in flight (SPEC Invariant 25). Without this,
+  -- a `<S-CR>` landing between `Kernel:restart` and the bridge's
+  -- `restarted` reply calls `_send({execute})` to the OLD kernel — the
+  -- bridge's `_restart_seq` epoch keeps the result from being reported,
+  -- but the kernel may still execute the code with side effects (file
+  -- writes, os.system calls) the user didn't expect on a "restarted" run.
+  if self._restart_pending then
+    Util.notify("kernel is restarting; try again in a moment",
+      vim.log.levels.INFO)
+    return false
+  end
   if self.job_id and vim.fn.jobwait({ self.job_id }, 0)[1] == -1 then
     return true
   end
@@ -449,6 +494,13 @@ function Kernel:_pump()
   local out = self.notebook:ensure_output(task.cell_id)
   out.status = "running"
   out.items = {}
+  -- Record an ISO-8601 UTC start timestamp on the live output; execute_done
+  -- copies it (along with a fresh end-timestamp) into
+  -- cell_metadata.execution to populate the nbformat ExecuteTime extension.
+  -- SPEC Invariant 27. Stored on `out` (not directly on cell_metadata) so
+  -- a partial in-flight execute that's later restarted doesn't leak a
+  -- start-without-end into the saved JSON.
+  out._started_iso = os.date("!%Y-%m-%dT%H:%M:%S.000000Z")
   self.on_change()
   -- Roll back the running state if _send fails (bridge died mid-flight).
   -- Without this, self.running stays set forever and _pump refuses to
@@ -462,20 +514,41 @@ function Kernel:_pump()
 end
 
 -- Bridge job has exited (clean or otherwise). Called by jobstart's on_exit
--- and by tests directly. Ignores stale callbacks whose job_id no longer
--- matches self.job_id — a Kernel:stop followed quickly by Kernel:execute
--- creates a new job and the old one's deferred on_exit must not clobber
--- the new state. SPEC § "Graceful shutdown".
+-- and by tests directly.
+--
+-- Two layers of job_id correctness here:
+--
+-- (1) Stale on_exit guard. A Kernel:stop followed quickly by Kernel:execute
+-- creates a NEW job, and the OLD job's deferred on_exit must not clobber
+-- the new state. If `job_id ~= self.job_id`, this is the old job's late
+-- callback — we still consume its expected flag (so the next tick on a
+-- live job doesn't see a leftover) but otherwise do nothing.
+--
+-- (2) Per-job `_expected_exit_for`. The pre-existing single `_expected_exit`
+-- boolean was a Kernel-level flag, which means: stop() sets it true, then
+-- before the OLD job's on_exit fires the user runs execute(), a new job
+-- is spawned, the NEW job dies instantly (bad python, etc.), and the NEW
+-- on_exit consumes the boolean — treating the new crash as expected and
+-- silently swallowing the failure. Pinning to a specific job_id closes
+-- that race: the boolean only releases when the on_exit matches the job
+-- that stop() observed. SPEC § "Graceful shutdown" — `_expected_exit_for`.
 function Kernel:_handle_exit(job_id)
   if self.job_id ~= nil and job_id ~= nil and job_id ~= self.job_id then
+    -- Old job's late callback. Reap its expected-flag entry if it owns one
+    -- so a future real death of a new job doesn't read it.
+    if self._expected_exit_for == job_id then
+      self._expected_exit_for = nil
+    end
     return
   end
-  -- _expected_exit survives across the event-loop tick — _stopping is
-  -- cleared synchronously at the end of stop() so the next execute can
-  -- respawn; _expected_exit tells THIS callback the exit was user-initiated.
-  local expected = self._expected_exit
-  self._expected_exit = false
+  local expected = (self._expected_exit_for ~= nil)
+    and (self._expected_exit_for == job_id)
+  if expected then self._expected_exit_for = nil end
   self._stopping = false
+  -- Failed restart that ends with the bridge dying (vs. emitting a
+  -- kernel_error) must also clear `_restart_pending`, or `_ensure_started`
+  -- refuses every subsequent execute forever. SPEC Invariant 25.
+  self._restart_pending = false
   self.job_id = nil
   self.chan = nil
   self.json_buf = ""
@@ -547,12 +620,24 @@ end
 function Kernel:stop()
   -- Block new executes while we tear down (SPEC Invariant 13).
   self._stopping = true
-  -- _expected_exit is a SEPARATE flag from _stopping: _stopping is cleared
-  -- synchronously at the end of stop() so the next execute can respawn the
-  -- bridge, but _expected_exit must survive until the on_exit callback runs
-  -- on a later event-loop tick. If on_exit consulted _stopping it'd already
-  -- be false by then and would treat the clean stop as a crash.
-  self._expected_exit = true
+  -- `_expected_exit_for` is a SEPARATE flag from _stopping: _stopping is
+  -- cleared synchronously at the end of stop() so the next execute can
+  -- respawn the bridge, but the expected-exit signal must survive until
+  -- the on_exit callback runs on a later event-loop tick. If on_exit
+  -- consulted _stopping it'd already be false by then and would treat the
+  -- clean stop as a crash.
+  --
+  -- We pin to the specific job_id stop() is tearing down. Without that pin,
+  -- a stop() followed by a fast execute() that spawns a new bridge that
+  -- itself dies would have its NEW on_exit consume the OLD stop's expected
+  -- signal and silently swallow the new failure (see _handle_exit comment).
+  if self.job_id then
+    self._expected_exit_for = self.job_id
+  end
+  -- Stop also exits the restart window cleanly — without this clear, a
+  -- restart that races a stop() before the bridge emits `restarted` leaves
+  -- `_restart_pending` stuck true after stop returns. SPEC Invariant 25.
+  self._restart_pending = false
   -- Mark any running / queued cells as killed BEFORE we clear them, so the
   -- UI doesn't show a permanent "Running…" or "Queued" pill on cells whose
   -- kernel is gone. (The on_exit handler does this for *unexpected* exits;

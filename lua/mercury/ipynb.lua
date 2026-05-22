@@ -68,13 +68,31 @@ end
 -- what the next read will see.
 local RESERVED_EXTRAS_KEYS = { id = true, tags = true }
 
+-- Drop tags that would corrupt the separator's tags=foo,bar grammar:
+--   - comma: collides with the value separator
+--   - whitespace: parse_meta's value class `[^%s%]]+` would truncate at first WS
+--   - `]`: same value-class exclusion
+-- nbformat treats tags as arbitrary strings, so we can't always preserve
+-- them losslessly in the separator. format_separator drops bad tags
+-- defensively; to_buffer_lines emits a one-shot WARN per bad tag so the
+-- user notices the silent data drop before the next save bakes it in.
+local function _is_valid_tag(t)
+  return type(t) == "string" and t ~= "" and not t:find("[,%s%]]")
+end
+
 local function format_separator(cell)
   local parts = { "# %%" }
   if cell.id then parts[#parts + 1] = "id=" .. cell.id end
   if cell.kind == "markdown" then parts[#parts + 1] = "[markdown]" end
   if cell.kind == "raw" then parts[#parts + 1] = "[raw]" end
   if cell.metadata and cell.metadata.tags and #cell.metadata.tags > 0 then
-    parts[#parts + 1] = "tags=" .. table.concat(cell.metadata.tags, ",")
+    local valid = {}
+    for _, t in ipairs(cell.metadata.tags) do
+      if _is_valid_tag(t) then valid[#valid + 1] = t end
+    end
+    if #valid > 0 then
+      parts[#parts + 1] = "tags=" .. table.concat(valid, ",")
+    end
   end
   -- Preserve unknown separator tokens (foo=bar) through save/load via
   -- metadata.mercury_extras. Sort keys alphabetically so the output is
@@ -496,6 +514,28 @@ end
 function M.to_buffer_lines(nb)
   local out = {}
   for _, c in ipairs(nb.cells or {}) do
+    -- Warn on tags whose contents can't survive the separator round-trip
+    -- (commas, whitespace, ']'). format_separator drops them silently —
+    -- this notify is what gives the user a chance to migrate them BEFORE
+    -- the next save erases them from the JSON. Per-cell, since the same
+    -- tag can recur across cells via a Jupyter-Lab-applied tag.
+    local md_tags = c.metadata and c.metadata.tags
+    if type(md_tags) == "table" then
+      for _, t in ipairs(md_tags) do
+        if not _is_valid_tag(t) then
+          local reason
+          if type(t) ~= "string" then reason = "non-string"
+          elseif t == "" then reason = "empty"
+          elseif t:find(",") then reason = "contains ','"
+          elseif t:find("%s") then reason = "contains whitespace"
+          elseif t:find("%]") then reason = "contains ']'"
+          else reason = "invalid" end
+          Util.notify(("cell %s: tag %q dropped from separator (%s) — fix tags in the JSON before saving to preserve them")
+            :format(c.id or "?", tostring(t), reason),
+            vim.log.levels.WARN)
+        end
+      end
+    end
     local extras = c.metadata and c.metadata.mercury_extras
     if extras then
       for k, v in pairs(extras) do

@@ -552,21 +552,27 @@ class Bridge:
         self.task_q.put((cell_id, code))
 
     def interrupt(self) -> None:
-        # For locally-owned kernels we can poke the process directly. For an
-        # `existing` connection, we have to send an `interrupt_request` on the
-        # control channel — the KernelClient has no high-level wrapper for it.
+        # Interrupt is signal-based and only works on a locally-owned
+        # kernel subprocess. In mode="existing" we don't own the process
+        # (a jupyter server / external supervisor does), so there's nothing
+        # to SIGINT. Reject explicitly with kind="unsupported" so the Lua
+        # side surfaces a WARN without clobbering running/queue state.
+        # SPEC Invariant 26.
+        if self.km is None:
+            jprint({
+                "type": "kernel_error",
+                "kind": "unsupported",
+                "error": "interrupt is not supported in mode='existing' "
+                         "(signal-based; requires owning the kernel process)",
+            })
+            return
         try:
-            if self.km is not None:
-                self.km.interrupt_kernel()
-            elif self.kc is not None:
-                try:
-                    msg = self.kc.session.msg("interrupt_request", {})
-                    self.kc.control_channel.send(msg)
-                except Exception as e:
-                    jprint({"type": "kernel_error",
-                            "error": f"interrupt failed: {type(e).__name__}: {e}"})
-        finally:
-            jprint({"type": "interrupted", "cell_id": self.current_cell_id})
+            self.km.interrupt_kernel()
+        except Exception as e:
+            jprint({"type": "kernel_error",
+                    "error": f"interrupt failed: {type(e).__name__}: {e}"})
+            return
+        jprint({"type": "interrupted", "cell_id": self.current_cell_id})
 
     def list_kernels(self) -> None:
         try:

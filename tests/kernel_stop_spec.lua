@@ -64,7 +64,7 @@ describe("kernel graceful shutdown", function()
     assert.is_nil(k.running)
   end)
 
-  it("_expected_exit survives the synchronous tail of stop() for a late on_exit", function()
+  it("_expected_exit_for survives the synchronous tail of stop() for a late on_exit", function()
     -- on_exit fires asynchronously (libuv schedules it after the process
     -- exits), so the order is:
     --   1. stop() runs synchronously, clears _stopping at the end,
@@ -73,7 +73,9 @@ describe("kernel graceful shutdown", function()
     -- intentional, by the time it ran the flag would already be false and
     -- a legitimate :NotebookKernelStop would emit a spurious
     -- "bridge exited unexpectedly" warning. The fix is the separate
-    -- _expected_exit flag, which lives until on_exit consumes it.
+    -- `_expected_exit_for` flag, which is pinned to the SPECIFIC job_id
+    -- stop() observed (so a new job spawned after stop() can't consume the
+    -- old stop()'s signal — SPEC § Graceful shutdown).
     local k = Kernel.new({ outputs = {} })
     k.job_id = 7; k.chan = 7
     k._send = function() end
@@ -91,10 +93,10 @@ describe("kernel graceful shutdown", function()
     vim.fn.jobwait = orig_jobwait
 
     -- After stop() returns: _stopping was cleared (so the next execute can
-    -- respawn — Invariant 13), but _expected_exit is still set, waiting
-    -- for the asynchronous on_exit to consume it.
+    -- respawn — Invariant 13), but _expected_exit_for is still set to the
+    -- specific job_id, waiting for the asynchronous on_exit to consume it.
     assert.is_false(k._stopping == true)
-    assert.is_true(k._expected_exit)
+    assert.equals(7, k._expected_exit_for)
   end)
 
   it("marks running + queued cells as killed so no stale pills linger", function()

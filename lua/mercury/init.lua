@@ -170,6 +170,12 @@ local function attach_buffer(buf, opts)
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)
 
+  -- Tell render-markdown.nvim to attach to this buffer if installed.
+  -- pcall'd because the plugin's per-buffer API has shifted across
+  -- versions; the shim is defensive but we don't want a probe error to
+  -- block the attach. SPEC § "Markdown rendering".
+  pcall(function() require("mercury.render_markdown").enable_buffer(buf) end)
+
   -- Let users hook into post-attach setup (statusline refresh, lazy keymaps,
   -- per-buffer LSP wiring, etc.) without monkey-patching Mercury.
   vim.schedule(function()
@@ -248,9 +254,16 @@ local function load_ipynb(buf, path)
   -- modifications and refuse to clobber them without an explicit :w!. The
   -- guard is path-scoped: :saveas to a different file is writing a copy
   -- and must not be refused on the basis of the original file's mtime
-  -- history. SPEC Invariant 21.
+  -- history. SPEC Invariant 21. mtime is stored as {sec, nsec} so two
+  -- external writes within the same second on a fast filesystem don't
+  -- masquerade as "no change" — SPEC Invariant 28.
   local stat = vim.loop.fs_stat(path)
-  if stat then vim.b[buf].mercury_file_mtime = stat.mtime.sec end
+  if stat then
+    vim.b[buf].mercury_file_mtime = {
+      sec = stat.mtime.sec,
+      nsec = stat.mtime.nsec or 0,
+    }
+  end
   vim.b[buf].mercury_loaded_path = path
 
   local nb = attach_buffer(buf, {
@@ -264,15 +277,31 @@ local function load_ipynb(buf, path)
   -- (Jupyter Lab's "Clear All Outputs" leaves execution_count intact). Without
   -- this, the encoder would write "execution_count": null on save and the
   -- next reload would show the cell as never-run — silent data loss.
+  local attachment_count = 0
   for _, c in ipairs(doc.cells) do
     nb.cell_metadata[c.id] = c.metadata
-    if c.attachments then nb.cell_attachments[c.id] = c.attachments end
+    if c.attachments and next(c.attachments) ~= nil then
+      nb.cell_attachments[c.id] = c.attachments
+      attachment_count = attachment_count + 1
+    end
     if (c.outputs and #c.outputs > 0) or c.exec_count then
       local out = nb:ensure_output(c.id)
       out.items = c.outputs or {}
       out.exec_count = c.exec_count
       out.status = "idle"
     end
+  end
+  -- Markdown-cell attachments are preserved across save/load but not
+  -- rendered inline (SPEC Non-goals + Invariant 35). Notify once so the
+  -- user understands why pasted images aren't appearing. Only emitted for
+  -- non-empty attachment tables — the empty-dict round-trip case mustn't
+  -- generate a notify.
+  if attachment_count > 0 then
+    Util.notify(
+      ("%d cell%s with markdown attachments preserved verbatim; "
+       .. "`attachment:` references won't render inline (use external viewer)")
+      :format(attachment_count, attachment_count == 1 and "" or "s"),
+      vim.log.levels.INFO)
   end
   if nb._renderer then nb._renderer:render() end
 
@@ -298,13 +327,26 @@ local function save_ipynb(buf, path, force)
   -- External-modification guard. Only fires when the save target matches
   -- the originally-loaded path — :saveas to a new file is a copy and must
   -- not be refused based on the original file's mtime history. SPEC 21.
+  -- Compares {sec, nsec} so back-to-back writes within the same second
+  -- on a fast filesystem still trip the guard. SPEC Invariant 28.
   local loaded = vim.b[buf].mercury_loaded_path
   local saving_same_file = loaded and path == loaded
   if saving_same_file then
     local stat = vim.loop.fs_stat(path)
     local stored = vim.b[buf].mercury_file_mtime
-    if not force and stat and stored and stat.mtime.sec > stored then
-      return false, "file changed on disk since load (use :w! to overwrite)"
+    if not force and stat and stored then
+      -- Accept both the new {sec, nsec} table form and the legacy bare-sec
+      -- number form (older buffers loaded before this code path was
+      -- updated would otherwise hard-fail on the first save).
+      local stored_sec = (type(stored) == "table") and stored.sec or stored
+      local stored_nsec = (type(stored) == "table") and (stored.nsec or 0) or 0
+      local disk_sec = stat.mtime.sec
+      local disk_nsec = stat.mtime.nsec or 0
+      local changed = (disk_sec > stored_sec)
+        or (disk_sec == stored_sec and disk_nsec > stored_nsec)
+      if changed then
+        return false, "file changed on disk since load (use :w! to overwrite)"
+      end
     end
   end
 
@@ -329,9 +371,12 @@ local function save_ipynb(buf, path, force)
   end
   local new_stat = vim.loop.fs_stat(path)
   if new_stat then
-    vim.b[buf].mercury_file_mtime = new_stat.mtime.sec
+    vim.b[buf].mercury_file_mtime = {
+      sec = new_stat.mtime.sec,
+      nsec = new_stat.mtime.nsec or 0,
+    }
   else
-    vim.b[buf].mercury_file_mtime = os.time()
+    vim.b[buf].mercury_file_mtime = { sec = os.time(), nsec = 0 }
   end
   -- :saveas redirected this buffer to a new path. Update the load path so
   -- subsequent saves are guarded against modifications of THIS file, not
@@ -383,6 +428,10 @@ function M.setup(opts)
   math.randomseed((os.time() * 1000 + (vim.loop.hrtime() % 1000000)) % 2147483647)
   UI.setup_highlights()
   require("mercury.lsp").setup()
+  -- Decorative: hand render-markdown.nvim our filetype so it styles
+  -- markdown cells the way users expect from a real notebook UI. Silent
+  -- no-op when the plugin isn't installed. SPEC § "Markdown rendering".
+  pcall(function() require("mercury.render_markdown").ensure_python_filetype() end)
 
   -- Sweep stale entries from the image / latex caches (>30 days). Both are
   -- keyed by content hash, so eviction never loses data — a future render

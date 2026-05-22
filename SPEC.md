@@ -26,7 +26,9 @@ reconstruct the plugin from this spec alone.
 | `lsp_view.lua` | Pure `mask_lines(lines, cells)` — prepends `# ` to markdown-cell body lines, leaves code untouched. |
 | `health.lua` | `:checkhealth mercury` — neovim version, python+modules, kernelspecs, image.nvim, LaTeX backends, treesitter parsers. |
 | `keymaps.lua` | Default keymap table; `apply(buf)` registers both normal and insert mode for `<S-CR>`/`<C-CR>`. |
-| `markdown.lua` | Markdown TS highlighting via `parser:set_included_regions`. |
+| `markdown.lua` | Markdown TS highlighting via `parser:set_included_regions` for markdown CELLS (real buffer lines). |
+| `markdown_out.lua` | Pure styler for `text/markdown` OUTPUTS. `chunks(text)` returns one virt_lines entry per source line, pre-tagged with `@markup.heading.N.markdown`, `@markup.strong`, `@markup.emphasis`, `@markup.raw.markdown*`, `@markup.list.markdown`, `@markup.quote.markdown`. Regex-based; tracks fenced-code state across lines. |
+| `render_markdown.lua` | Optional shim for `render-markdown.nvim`: probes the plugin's per-buffer enable API across v5/v6/v7 surfaces and appends `python` to its filetype list. Decorative; failures are silent. Used only for markdown CELLS; outputs are styled by `markdown_out.lua`. |
 | `lualine.lua` | Status-line components. |
 | `util.lua` | `split_lines`, `read_file`/`write_file`, `tmpfile`, `short_id` (uv-random with math.random fallback), `hash`, `debounce`, `coalesce`, `clamp`, `notify`. |
 | `ansi.lua` | `strip(s)` — removes ANSI CSI/ESC sequences and normalizes line endings. |
@@ -146,15 +148,182 @@ updating this spec.
     successful `:saveas` (detected by `nvim_buf_get_name == args.match`),
     `mercury_loaded_path` is updated so future saves to the new path are
     guarded against external modification.
-22. **Saves are atomic.** `save_ipynb` writes via `Util.atomic_write_file`
-    which writes to `<path>.mercury_save_tmp`, fsyncs, then `rename(2)`s
-    into place. POSIX rename is atomic within a single filesystem, so an
-    observer (another process, or a future `:e!` after a crash) sees
-    either the previous complete contents or the new complete contents —
-    never a torn partial write. Critical for a notebook editor where a
-    `kill -9` / power loss during `:w` would otherwise corrupt the user's
-    work. The tempfile lives next to the target so the rename stays
-    intra-filesystem.
+22. **Saves are atomic, and the fsync failure mode is loud.**
+    `save_ipynb` writes via `Util.atomic_write_file` which writes to
+    `<path>.mercury_save_tmp`, fsyncs, then `rename(2)`s into place. POSIX
+    rename is atomic within a single filesystem, so an observer (another
+    process, or a future `:e!` after a crash) sees either the previous
+    complete contents or the new complete contents — never a torn partial
+    write. Critical for a notebook editor where a `kill -9` / power loss
+    during `:w` would otherwise corrupt the user's work. The tempfile
+    lives next to the target so the rename stays intra-filesystem.
+    `fs_fsync` failures are surfaced (`return false, err`) instead of
+    being silently swallowed, so a disk-full / hardware error doesn't
+    quietly downgrade atomicity. A cross-filesystem rename (EXDEV — only
+    possible if the target path's directory itself is on a different
+    filesystem than where the tempfile landed, which is unusual since the
+    tempfile is `<path>..mercury_save_tmp`) is reported with a clear
+    error rather than silently falling back to a non-atomic copy.
+
+23. **`set_kind` is a structural mutation and obeys five rules.**
+    Single source-of-truth for code↔markdown↔raw conversion. The function:
+    (a) refuses when the cell is busy (`cell_is_busy(id)` — SPEC
+    Invariant 18 made concrete); (b) drops `outputs[id]` when the new
+    kind is not `code`; (c) drops `cell_attachments[id]` when the new
+    kind is not `markdown`; (d) preserves `cell_metadata[id]` fields
+    other than `tags` (which the separator overwrites); (e) round-trips
+    `mercury_extras` by passing the parsed `extras` table through to
+    `format_separator`. Direct text-edit conversions (user edits the
+    separator by hand) reach the same end-state via the `rescan` path
+    (SPEC Invariant 20); `set_kind` is the menu-driven path and must
+    behave symmetrically.
+
+24. **`execute_done` honours `_live_code_cell`.** Like the `output` branch
+    in `kernel.lua:_handle_msg`, the `execute_done` branch must not
+    `ensure_output` for a cell that no longer exists or is no longer
+    `code`. If the cell vanished mid-execution, `execute_done` still
+    clears `self.running` and calls `_pump` so the queue advances, but
+    it must not resurrect a writable output side-table entry that rescan
+    would then have to clean up. SPEC Invariant 19 extended.
+
+25. **Execute is blocked during the restart window.** Between
+    `Kernel:restart` being called and the bridge replying with
+    `restarted`, new `:NotebookExec` calls are refused with a notify.
+    Mirrors Invariant 13's `_stopping` handling: without this, a
+    `<S-CR>` landing in the restart window would call `_send({execute})`
+    on the old kernel — the bridge's `_restart_seq` epoch keeps the
+    result from being reported, but the kernel may still execute the
+    code with side effects the user didn't expect.
+
+26. **`interrupt` is the bridge's responsibility to reject in
+    `mode="existing"`.** The bridge must emit
+    `kernel_error{kind="unsupported"}` instead of sending a control-channel
+    `interrupt_request` — interrupt is signal-based and only works on a
+    locally-owned kernel subprocess. Pairs with Invariant 25's restart
+    handling for an explicit "what this transport can / cannot do".
+
+27. **`ExecuteTime` metadata is populated on execute.** Mercury writes
+    `cell.metadata.execution.iopub.execute_input` (started) and
+    `shell.execute_reply` (ended) as ISO-8601 timestamps. Matches Jupyter
+    Lab's nbformat `ExecuteTime` extension; preserved across save/load
+    via the standard `cell_metadata` round-trip.
+
+28. **mtime guard uses nanosecond precision.** `vim.b.mercury_file_mtime`
+    stores `{sec, nsec}`; the W12-style refusal compares both. Two
+    external writes within the same second on a fast filesystem would
+    otherwise leave the second one undetected. Falls back to seconds
+    only when `nsec` is unavailable from `fs_stat`.
+
+29. **LSP formatting can't shift markdown prose.** A formatter sees the
+    masked view (markdown lines prefixed with `# `). When it returns
+    `textDocument/formatting` / `textDocument/rangeFormatting` edits,
+    Mercury drops any edit whose range intersects a markdown cell — the
+    real buffer doesn't have those `# ` prefixes and applying the edit
+    verbatim would shift the prose by 2 columns. Code-cell edits pass
+    through unchanged.
+
+30. **`Notebook.detach` clears the per-buffer augroup.** Without this,
+    `:bd` (which fires `BufWipeout` → `detach`) leaves
+    `MercuryBuf_<bufnr>` autocmds registered; a recycled bufnr would
+    inherit them. `attach_buffer`'s `clear = true` only fires on the
+    *next* attach to the same bufnr, so the gap can leak callbacks
+    closing over a dead notebook.
+
+31. **`mask_lines` normalises CRLF in markdown bodies.** A `\r\n`
+    line-ending on a markdown line would otherwise turn into `# prose\r\n`
+    in the masked text. Most LSP servers tolerate it, but pyright is
+    known to misalign positions on CR-terminated lines. Trailing `\r` is
+    stripped before the `# ` prefix is added.
+
+32. **Diagnostic filter passes diagnostics with no `range`.** A
+    server-emitted whole-document diagnostic (e.g., pyright's "could not
+    parse file") has `range = nil`. The previous behaviour defaulted
+    `start_row` / `end_row` to 0, which suppressed those diagnostics when
+    row 0 happened to be a markdown header. The filter now keeps any
+    diagnostic without a `range`.
+
+33. **`text/markdown` outputs are styled inline via the standard
+    markdown treesitter highlight groups.** `mercury.markdown_out` walks
+    each line of the payload and emits virt_lines chunks with the
+    matching `@markup.heading.N.markdown`, `@markup.strong`,
+    `@markup.emphasis`, `@markup.raw.markdown_inline`,
+    `@markup.raw.markdown` (fenced blocks), `@markup.list.markdown`, or
+    `@markup.quote.markdown` group. `MercuryMarkdownOut` is the base
+    fallback for plain prose. We do NOT use render-markdown.nvim's
+    rendering for outputs: that plugin's decorations live as extmark
+    virt_text + conceal on the source buffer, and those decorations
+    cannot be relayed across buffers as virt_lines (extmarks attach to
+    a single buffer). The hl groups we emit are the same ones markdown
+    themes already style, so the visual result inherits the user's
+    chosen palette; on a bare terminal, `ui.lua` provides sane defaults
+    (Title for headings, bold/italic attrs for emphasis, Special for
+    inline code).
+
+34. **`application/vnd.jupyter.widget-view+json` mime is rendered as a
+    single `[widget unsupported]` line.** ipywidgets are out of scope
+    (see Non-goals); recognising the mime explicitly keeps it from
+    falling through to the unknown-mime branch that would render
+    `[empty output]` whenever no `text/plain` accompanies it.
+
+35. **Markdown-cell attachments emit a one-shot load notify.** When a
+    notebook's cells carry non-empty `attachments`, `load_ipynb` notifies
+    once that `attachment:` references won't render inline. Prevents the
+    silent "where did my pasted image go?" UX cliff.
+
+36. **Stream items merge across interleavings on the render side.** The
+    side-table preserves the exact nbformat order (so round-trip is
+    byte-stable), but the render walks the items and groups consecutive
+    `name == "stdout"` (and consecutive `name == "stderr"`) into single
+    virtual blocks even when the side-table has a stdout/stderr/stdout
+    interleave. Matches Jupyter Lab's visual grouping; loses no
+    information because the underlying items keep their per-chunk text.
+
+37. **`_restart_pending` is cleared on every restart-exit path.** SPEC
+    Invariant 25 closes the *entry* to the restart window (executes
+    refused while pending). This is the *exit* side: `_restart_pending`
+    must be cleared not only by the `restarted` reply but also by
+    `kernel_error` (non-`unsupported`), `kernel_dead`, an unexpected
+    `on_exit`, and `Kernel:stop()`. Without these clears, a restart that
+    failed (kernel didn't come back, bridge died mid-restart, transport
+    rejected) wedges every subsequent `:NotebookExec` into the
+    "kernel is restarting" notify forever. The `unsupported` kind is
+    explicitly excluded — that's a soft warning unrelated to whether
+    the restart itself landed.
+
+38. **`_expected_exit_for` is pinned to a specific job_id.** Replaces
+    the prior Kernel-level `_expected_exit` boolean. `Kernel:stop()`
+    records the job_id it is tearing down; `_handle_exit(job_id)` only
+    treats the exit as expected when its argument matches the pin. The
+    race the pin closes: stop() runs synchronously, then a fast
+    execute() spawns a NEW bridge before the OLD bridge's on_exit has
+    fired; if the NEW bridge dies instantly (bad python path, missing
+    module), its on_exit would otherwise consume the OLD stop()'s
+    expected signal and silently swallow the new failure. With the pin,
+    only the matching job_id releases — the OLD on_exit can still
+    consume on a later tick, the NEW death is reported as unexpected.
+
+39. **Tags containing `,`, whitespace, or `]` are dropped on serialize
+    with a one-shot warn on load.** `format_separator` filters the tags
+    list to those that survive `parse_meta`'s `tags=([^%s%]]+)` value
+    class plus the `,` value-separator. `to_buffer_lines` walks every
+    cell's `metadata.tags` on load and emits a WARN naming each invalid
+    tag and the reason (`contains ','`, `contains whitespace`, etc.),
+    so the user can fix the JSON before the next save bakes in the
+    silent loss. nbformat lets tags be arbitrary strings; this is a
+    documented round-trip lossiness — the alternative (URL-encoding
+    or a different in-buffer grammar) would diverge from the
+    `# %% tags=foo,bar` convention every other py:percent tool uses.
+
+40. **`delete_cell` interrupts the kernel for a running cell.** If the
+    deleted cell is currently `self.kernel.running`, `Kernel:interrupt`
+    is sent so the kernel raises `KeyboardInterrupt` and the queued
+    work continues (Jupyter SIGINT semantics — see Invariant 9). For a
+    cell that's merely queued, no interrupt is sent — the subsequent
+    rescan drops it from `kernel.queue` and interrupting would cancel
+    the unrelated running cell instead. Cell outputs are dropped
+    either way (Invariant 18 covers the conversion case; this is the
+    deletion counterpart). Side effects already produced by the running
+    cell are NOT rewound — the user accepts that by choosing delete.
 
 ## Goal
 
@@ -195,6 +364,21 @@ Edit `.ipynb` files in Neovim with the workflow you'd get in VS Code:
   `nvim-cmp` source). Possible future work; not in this spec.
 - Rich text/html rendering. HTML outputs fall back to a text-only render
   (with `text/plain` preferred when both are present).
+- **ipywidgets / interactive comms.** Mercury does not subscribe to the
+  Jupyter `comm_open` / `comm_msg` / `comm_close` channels and does not
+  render `application/vnd.jupyter.widget-view+json`. A widget mime in the
+  output is rendered as a single `[widget unsupported]` placeholder line.
+  When the kernel emits widget output alongside a `text/plain` repr the
+  text repr renders as usual (per the mime priority list). Supporting
+  widgets would require both the comm protocol and an in-buffer
+  interactive-widget renderer; both are out of scope.
+- Inline rendering of markdown-cell `attachments:` (paste-image-into-prose).
+  Attachments are preserved verbatim across save/load — see "Cell
+  attachments" — but `attachment:<filename>` references in markdown body
+  remain literal text. Mercury notifies once on load when a notebook
+  contains any non-empty attachments so the user understands why pasted
+  images don't appear inline. Adding inline rendering would require
+  image.nvim positioning math we don't do for inline-prose content today.
 
 ### Known limitation: `# %%` inside markdown cells
 
@@ -447,7 +631,8 @@ Mime preference order in `output.pick_mime`:
 2. `image/jpeg`
 3. `image/svg+xml`
 4. `text/latex` (rasterized; renders as image)
-5. `text/markdown`
+5. `text/markdown` (rendered via `render-markdown.nvim` when available —
+   see "Markdown rendering")
 6. `text/plain`
 7. `text/html` (lowest priority — pandas etc. always emit text/plain
    alongside; html_to_text is naive and loses table structure)
@@ -456,6 +641,11 @@ This deliberately differs from Jupyter Lab / nbviewer, which prefer
 `text/html` above `text/plain` (so pandas DataFrames render as HTML
 tables). In a terminal those tables degrade to soup; the plain repr is
 the readable one. Documented divergence.
+
+`application/vnd.jupyter.widget-view+json` is recognised explicitly and
+rendered as a single `[widget unsupported]` line — never falls through to
+the unknown-mime path that would otherwise emit `[empty output]` when no
+`text/plain` accompanies it. See "Non-goals" for the rationale.
 
 LSP integration: `[raw]` cells are NOT masked from the LSP. They appear
 to pyright as ordinary python text (since the buffer is filetype=python).
@@ -733,6 +923,49 @@ Treesitter: markdown highlighting in markdown cells is driven by
 `parser:set_included_regions` — Mercury hands the markdown parser the
 exact line ranges of `[markdown]` cells on every rescan. No injection
 query file or predicate setup is needed.
+
+### Markdown rendering
+
+Markdown rendering inside the notebook has TWO surfaces, with different
+mechanisms because they live in different host contexts (real lines vs.
+virt_lines).
+
+1. **Markdown cells (real buffer lines).** Cell bodies live in a
+   `filetype = "python"` buffer, but their lines parse as markdown via
+   the treesitter included-regions wiring in `markdown.lua`. Mercury's
+   setup detects `render-markdown.nvim` and, on every notebook attach,
+   tries the plugin's enable-for-buffer API (`buf_enable` if exposed)
+   and adds `python` to the plugin's `filetypes` list if it isn't
+   already there. The user-visible effect: prose in a markdown cell is
+   styled (headings, lists, emphasis) the same way it would be in a
+   `.md` file in their editor — render-markdown's icon substitutions,
+   conceals, and virt_text decorations all attach because the cell
+   body is real buffer text.
+
+2. **`text/markdown` outputs (virt_lines, styled by `mercury.markdown_out`).**
+   render-markdown.nvim's decorations only attach to real buffer lines;
+   they can't be relayed across buffers as virt_lines (extmarks attach
+   to a single buffer). So for `IPython.display.Markdown("# H")` —
+   which lives inside an extmark under the cell anchor — Mercury parses
+   the markdown source itself in `mercury.markdown_out` and emits
+   virt_lines chunks pre-tagged with the standard markdown treesitter
+   highlight groups (`@markup.heading.N.markdown`, `@markup.strong`,
+   `@markup.emphasis`, `@markup.raw.markdown_inline`,
+   `@markup.raw.markdown` for fenced blocks, `@markup.list.markdown`,
+   `@markup.quote.markdown`). A modern colorscheme already styles those
+   groups; `ui.lua` provides fallbacks (Title for headings, bold/italic
+   attrs for emphasis, Special for inline code) so the result is
+   visibly styled even on a bare terminal. The parser is regex-based
+   and intentionally conservative: common formats (headings 1–6, ATX
+   only; bullet/ordered lists; fenced code; **bold**; *italic*; `code`;
+   `> quote`; `---` rule) render correctly. Exotic markdown
+   (reference-style links, raw HTML, deeply nested emphasis) degrades
+   to plain prose, not corrupted text.
+
+Mercury does not vendor or ship `render-markdown.nvim`; it's optional.
+Without it, markdown cells still parse as markdown via treesitter and
+get syntax-highlighted prose; markdown OUTPUTS are unaffected (they
+never depended on render-markdown).
 
 ## Commands & default keymaps
 
@@ -1078,6 +1311,12 @@ tests/
   keymaps_spec.lua          -- normal + insert mode bindings; <cmd> dispatch
   mtime_spec.lua            -- BufWriteCmd refuses to clobber external mods; :w! overrides
   util_spec.lua             -- coalesce, short_id, gc_cache_dir
+  markdown_out_spec.lua     -- text/markdown output styling: headings, lists,
+                            -- bold/italic, inline code, fenced blocks, blockquotes
+  audit_fixes_spec.lua      -- regression tests for SPEC Invariants 23–40
+                            -- (set_kind contract, restart-pending clears in all
+                            -- exit paths, expected-exit per-job-id, tag filter,
+                            -- delete_cell interrupt, ExecuteTime metadata, …)
   lsp_view_spec.lua         -- masking preserves line + column counts
   lsp_spec.lua              -- notify patching + diagnostic safety-net filter
   health_spec.lua           -- health.lua loads and check() runs without raising

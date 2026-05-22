@@ -45,6 +45,13 @@ local STATUS_TEXT = {
   killed  = { glyph = "󱚢",  hl = "MercuryPillError"   },
 }
 
+-- Widgets are explicitly out-of-scope (SPEC Non-goals + Invariant 34).
+-- Recognising the mime up front avoids two bad fallbacks: (a) pick_mime
+-- falling into the unknown-application/* branch and rendering a base64
+-- blob, and (b) build_virt_lines hitting `[empty output]` when a kernel
+-- emits a widget without a `text/plain` companion repr.
+local WIDGET_MIME = "application/vnd.jupyter.widget-view+json"
+
 local function pick_mime(data)
   if not data then return nil end
   -- Prefer rich formats (image, latex, markdown) first; for text fallbacks,
@@ -56,6 +63,10 @@ local function pick_mime(data)
   }) do
     if data[m] then return m end
   end
+  -- ipywidgets: explicit recognition so the renderer can emit a clear
+  -- "[widget unsupported]" line instead of falling through to the
+  -- unknown-mime branch.
+  if data[WIDGET_MIME] then return WIDGET_MIME end
   -- Unknown-mime fallback. Prefer ANY text/* over unknown application/*
   -- (Plotly etc. emit `application/vnd.plotly.v1+json` alongside `text/plain`;
   -- alphabetical sort would pick the application/* binary blob).
@@ -146,8 +157,43 @@ function M.build_virt_lines(out, opts)
     return lines
   end
 
-  local body_lines = {}
+  -- Stream merging (SPEC Invariant 36): the side-table preserves the exact
+  -- nbformat interleaving so round-trip is byte-stable, but visually we
+  -- group consecutive same-name stream items into one block. A
+  -- stdout/stderr/stdout interleave becomes "stdout block then stderr block
+  -- then stdout block" in the buffer — matches Jupyter Lab. Walk items
+  -- once and build a merged item list, then render.
+  local items = {}
   for _, item in ipairs(out.items or {}) do
+    if item.type == "stream" then
+      local prev = items[#items]
+      if prev and prev.type == "stream" and prev.name == (item.name or "stdout") then
+        prev.text = (prev.text or "") .. (item.text or "")
+      else
+        items[#items + 1] = {
+          type = "stream", name = item.name or "stdout", text = item.text or "",
+        }
+      end
+    else
+      items[#items + 1] = item
+    end
+  end
+
+  -- LaTeX is rendered via image.nvim by extract_images(); but if rasterization
+  -- *fails* mid-flight (pdflatex package missing, on-disk write fail, etc.),
+  -- the rasterize call returns nil. We must not leave the cell with a "rendered
+  -- below" placeholder and no image — fall back to raw source instead. SPEC
+  -- Invariant 4 (LaTeX fallback). We discover failure by attempting the
+  -- rasterize ourselves up-front: cheap, content-hash cached, and necessary so
+  -- the renderer knows whether to show the placeholder.
+  local function latex_renders(src)
+    local ok, Latex = pcall(require, "mercury.latex")
+    if not ok or not Latex.available() then return false end
+    return Latex.rasterize(src) ~= nil
+  end
+
+  local body_lines = {}
+  for _, item in ipairs(items) do
     if item.type == "stream" then
       local text = item.text or ""
       text = Ansi.strip(text)
@@ -167,6 +213,12 @@ function M.build_virt_lines(out, opts)
       local mime = pick_mime(item.data)
       if not mime then
         body_lines[#body_lines + 1] = { "[empty output]", "Comment" }
+      elseif mime == WIDGET_MIME then
+        -- ipywidgets are explicitly unsupported (SPEC Non-goals +
+        -- Invariant 34). Render a single placeholder rather than the
+        -- raw JSON blob; the kernel typically emits a `text/plain` repr
+        -- alongside which picks_mime would have chosen first when present.
+        body_lines[#body_lines + 1] = { "[widget unsupported]", "Comment" }
       elseif mime == "image/png" or mime == "image/jpeg" or mime == "image/svg+xml" then
         -- When image.nvim is available it renders the image inline below the
         -- virt_lines; in that case the placeholder is just noise. Show one
@@ -181,12 +233,48 @@ function M.build_virt_lines(out, opts)
           body_lines[#body_lines + 1] = { ln, "Comment" }
         end
       elseif mime == "text/latex" then
-        local ok, Latex = pcall(require, "mercury.latex")
-        if ok and Latex.available() then
+        if latex_renders(item.data[mime]) then
           body_lines[#body_lines + 1] = { "[text/latex (rendered below)]", "Comment" }
         else
+          -- Fall through to raw source for both "no rasterizer available"
+          -- and "rasterizer configured but failed" — matches SPEC contract
+          -- ("If no rasterizer is available, the raw source is shown
+          -- verbatim").
           for _, ln in ipairs(Util.split_lines(_value_to_string(item.data[mime]))) do
             body_lines[#body_lines + 1] = { ln, "Special" }
+          end
+        end
+      elseif mime == "text/markdown" then
+        -- text/markdown is styled via mercury.markdown_out, which applies
+        -- the same treesitter highlight groups (@markup.heading.N,
+        -- @markup.strong, @markup.emphasis, @markup.raw.markdown_inline,
+        -- @markup.list.markdown, @markup.quote.markdown) that a
+        -- markdown-aware theme — render-markdown.nvim included — already
+        -- styles. SPEC § "Markdown rendering" + Invariant 33.
+        --
+        -- Why not just relay the source to render-markdown.nvim: that
+        -- plugin styles real buffer lines via extmark virt_text + conceal,
+        -- and those decorations CANNOT be relayed across buffers as
+        -- virt_lines. We render in-place with the same HL group names so
+        -- the visual result is consistent.
+        local MdOut = require("mercury.markdown_out")
+        local md_chunks = MdOut.chunks(_value_to_string(item.data[mime]))
+        if #md_chunks == 0 then
+          -- Empty markdown payload: keep a placeholder line so the cell
+          -- isn't visually empty.
+          body_lines[#body_lines + 1] = { "", "MercuryMarkdownOut" }
+        else
+          for _, line_chunks in ipairs(md_chunks) do
+            -- body_lines is a list of {text, hl} chunks (one per logical
+            -- output line) — flatten the multi-chunk lines by emitting
+            -- the first chunk as the line entry and pushing the rest as
+            -- *additional* same-line chunks via the caller's virt_lines
+            -- packing below. Since body_lines[i] is shaped as a single
+            -- {text, hl} chunk pair (later wrapped in a virt_line by the
+            -- final loop), we collapse multi-chunk markdown lines into a
+            -- single concatenated chunk-list and stash a flag for the
+            -- packer to detect.
+            body_lines[#body_lines + 1] = line_chunks
           end
         end
       else
@@ -200,7 +288,17 @@ function M.build_virt_lines(out, opts)
   local cap = opts.max_preview_lines or 9999
   local n = math.min(cap, #body_lines)
   for i = 1, n do
-    lines[#lines + 1] = { body_lines[i] }
+    -- body_lines entries are one of two shapes:
+    --   (a) single chunk `{ "text", "hl" }`  — most output types push this
+    --   (b) multi-chunk line `{ {t1,h1}, {t2,h2}, ... }` — markdown lines
+    --       carry inline styling spans and arrive pre-shaped.
+    -- Detect by checking whether the first element is itself a table.
+    local entry = body_lines[i]
+    if type(entry[1]) == "table" then
+      lines[#lines + 1] = entry
+    else
+      lines[#lines + 1] = { entry }
+    end
   end
   if #body_lines > n then
     lines[#lines + 1] =

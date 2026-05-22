@@ -30,6 +30,28 @@ function M.setup_highlights()
   set("MercuryPillError",     { fg = hl.pill_error, bold = true, default = true })
   set("MercuryPillQueued",    { fg = hl.pill_queued, default = true })
   set("MercuryPillIdle",      { fg = hl.pill_queued, default = true })
+  -- Used by `text/markdown` outputs as the BASE prose color. Inline-emphasis
+  -- spans (bold / italic / code) use the standard treesitter markdown
+  -- highlight groups (set below).
+  set("MercuryMarkdownOut",   { link = "Normal", default = true })
+  -- Treesitter @markup.* groups for markdown output styling. With a
+  -- modern theme installed (or render-markdown.nvim's defaults loaded),
+  -- these typically resolve through the theme's own markdown palette.
+  -- We use `default = true` so user/theme definitions ALWAYS win — these
+  -- only kick in when the group is otherwise undefined, so on a bare
+  -- terminal a `# Heading` doesn't render as un-styled prose.
+  set("@markup.heading.1.markdown", { link = "Title",          default = true })
+  set("@markup.heading.2.markdown", { link = "Title",          default = true })
+  set("@markup.heading.3.markdown", { link = "Title",          default = true })
+  set("@markup.heading.4.markdown", { link = "Title",          default = true })
+  set("@markup.heading.5.markdown", { link = "Title",          default = true })
+  set("@markup.heading.6.markdown", { link = "Title",          default = true })
+  set("@markup.strong",             { bold = true,             default = true })
+  set("@markup.emphasis",           { italic = true,           default = true })
+  set("@markup.raw.markdown_inline",{ link = "Special",        default = true })
+  set("@markup.raw.markdown",       { link = "Comment",        default = true })
+  set("@markup.list.markdown",      { link = "Statement",      default = true })
+  set("@markup.quote.markdown",     { link = "Comment",        default = true })
 end
 
 local Renderer = {}

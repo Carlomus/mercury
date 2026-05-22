@@ -15,6 +15,13 @@ local MARKDOWN_PREFIX = "# "
 
 -- Pure: given a list of buffer lines and the notebook's parsed cells, return
 -- the masked-lines list (same length as input). Exposed for testing.
+--
+-- Trailing \r on a markdown-cell line is stripped before the "# " prefix is
+-- applied (SPEC Invariant 31). Vim buffers can carry CR on Windows-authored
+-- ipynb that has CRLF line endings inside cell bodies; without stripping,
+-- the LSP server would see "# prose\r" with the CR breaking some servers'
+-- per-line position accounting. We don't touch code-cell lines — those
+-- pass through unchanged so identity column mapping isn't disturbed.
 function M.mask_lines(lines, cells)
   local masked = {}
   for i, ln in ipairs(lines) do masked[i] = ln end
@@ -22,8 +29,11 @@ function M.mask_lines(lines, cells)
     if c.kind == "markdown" and c.body_end >= c.body_start then
       for row = c.body_start, c.body_end do
         local idx = row + 1  -- 0-indexed row -> 1-indexed list
-        if masked[idx] ~= nil then
-          masked[idx] = MARKDOWN_PREFIX .. masked[idx]
+        local ln = masked[idx]
+        if ln ~= nil then
+          -- Strip a single trailing CR before prefixing.
+          if ln:sub(-1) == "\r" then ln = ln:sub(1, -2) end
+          masked[idx] = MARKDOWN_PREFIX .. ln
         end
       end
     end

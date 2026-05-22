@@ -40,6 +40,18 @@ end
 -- contents or the new ones, never a torn write. The tempfile lives next to
 -- the target so the rename stays intra-filesystem. SPEC Invariant 22.
 --
+-- fsync failures are surfaced (return false, err) rather than swallowed:
+-- a disk-full / hardware-error fsync would otherwise let the rename proceed
+-- with un-durable bytes, silently downgrading atomicity. The caller
+-- (save_ipynb) prefers to refuse the save and let the user retry.
+--
+-- A cross-filesystem rename (EXDEV) is reported as a clear, actionable
+-- error rather than retried with a non-atomic copy: the tempfile is by
+-- construction adjacent to the target path (`<path>.mercury_save_tmp`),
+-- so EXDEV here means the target's *directory* is on a different
+-- filesystem than where the tempfile somehow landed — very unusual, but
+-- best surfaced explicitly so the user can investigate.
+--
 -- Uses uv.fs_rename (not os.rename) so tests can stub it.
 function M.atomic_write_file(path, data)
   local tmp = path .. ".mercury_save_tmp"
@@ -55,14 +67,24 @@ function M.atomic_write_file(path, data)
   if uv and uv.fs_open then
     local fd = uv.fs_open(tmp, "r", 438)
     if fd then
-      pcall(uv.fs_fsync, fd)
+      local fsync_ok, fsync_err = pcall(uv.fs_fsync, fd)
       uv.fs_close(fd)
+      if not fsync_ok or fsync_err == false then
+        pcall(os.remove, tmp)
+        return false, "fsync failed: " .. tostring(fsync_err or "unknown")
+      end
     end
   end
   local ok2, rerr = pcall(uv.fs_rename, tmp, path)
   if not ok2 or rerr == false then
     pcall(os.remove, tmp)
-    return false, rerr or "rename failed"
+    local msg = tostring(rerr or "rename failed")
+    if msg:find("EXDEV") then
+      msg = "cross-filesystem rename refused (EXDEV): tempfile and target "
+        .. "on different filesystems; tried to move "
+        .. tostring(tmp) .. " → " .. tostring(path)
+    end
+    return false, msg
   end
   return true
 end

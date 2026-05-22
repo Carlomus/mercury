@@ -673,6 +673,98 @@ describe("kernel lifecycle messages", function()
     assert.equals("queued", nb.outputs["fresh"].status)
   end)
 
+  it("_restart_pending is cleared on kernel_error so the user can recover", function()
+    -- A restart that fails (bridge emits kernel_error before `restarted`)
+    -- must not leave _restart_pending stuck true. If it did, _ensure_started
+    -- would refuse every subsequent execute with the "kernel is restarting"
+    -- notify and the user would be locked out of running anything without
+    -- a manual :NotebookKernelStop. SPEC Invariant 25.
+    local nb = fake_notebook()
+    local k = Kernel.new(nb)
+    k.chan = 1234
+    k._restart_pending = true
+    nb:ensure_output("c1").status = "running"
+
+    k:_handle_msg({ type = "kernel_error", error = "restart failed: boom" })
+
+    assert.is_false(k._restart_pending)
+  end)
+
+  it("_restart_pending is cleared on kernel_dead so the user can recover", function()
+    -- Symmetric to the kernel_error case: if the bridge reports the kernel
+    -- died (e.g., the restart succeeded technically but the kernel didn't
+    -- come back), the same lockout would occur without this clear.
+    local nb = fake_notebook()
+    local k = Kernel.new(nb)
+    k.chan = 1234
+    k._restart_pending = true
+
+    k:_handle_msg({ type = "kernel_dead", error = "kernel died on restart" })
+
+    assert.is_false(k._restart_pending)
+  end)
+
+  it("_restart_pending is NOT cleared on a soft 'unsupported' kernel_error", function()
+    -- An "unsupported" kind from the bridge means a particular request can't
+    -- be served by this transport — nothing has actually died. The restart
+    -- is unrelated to the unsupported notification (e.g., interrupt arrived
+    -- in mode=existing while a restart was pending). Preserve _restart_pending
+    -- so the actual restart's `restarted` reply (still inbound) clears it.
+    local nb = fake_notebook()
+    local k = Kernel.new(nb)
+    k.chan = 1234
+    k._restart_pending = true
+
+    k:_handle_msg({ type = "kernel_error", kind = "unsupported",
+                    error = "interrupt not supported in existing mode" })
+
+    assert.is_true(k._restart_pending)
+  end)
+
+  it("_restart_pending is cleared on unexpected bridge exit", function()
+    -- The bridge itself dying (not just the kernel inside it) during a
+    -- restart window must also clear _restart_pending — otherwise the next
+    -- _ensure_started spawns a fresh bridge but immediately refuses to
+    -- send to it because the gate is still up.
+    local nb = fake_notebook()
+    local k = Kernel.new(nb)
+    k.job_id = 7
+    k.chan = 7
+    k._restart_pending = true
+    k._expected_exit_for = nil   -- unexpected
+    k.running = { cell_id = "live", started_at = 0 }
+    nb:ensure_output("live").status = "running"
+
+    k:_handle_exit(7)
+
+    assert.is_false(k._restart_pending)
+  end)
+
+  it("_restart_pending is cleared by Kernel:stop()", function()
+    -- :NotebookKernelStop should always leave the kernel ready to be
+    -- respawned, regardless of what state it was in. A stop() landing in
+    -- the restart window must reset _restart_pending so the next execute
+    -- can come up cleanly.
+    local k = Kernel.new({ outputs = {} })
+    k.job_id = 9; k.chan = 9
+    k._send = function() end
+    k._restart_pending = true
+    local orig_chanclose = vim.fn.chanclose
+    local orig_jobstop = vim.fn.jobstop
+    local orig_jobwait = vim.fn.jobwait
+    vim.fn.chanclose = function() end
+    vim.fn.jobstop = function() end
+    vim.fn.jobwait = function() return { 0 } end
+
+    k:stop()
+
+    vim.fn.chanclose = orig_chanclose
+    vim.fn.jobstop = orig_jobstop
+    vim.fn.jobwait = orig_jobwait
+
+    assert.is_false(k._restart_pending)
+  end)
+
   it("restarted handler cancels in-flight cells when not user-initiated", function()
     -- Defensive path: if the bridge ever spontaneously emitted `restarted`
     -- without us asking (no synchronous _cancel_in_flight has run), we must
@@ -696,7 +788,7 @@ describe("kernel lifecycle messages", function()
 
   it("unexpected bridge exit cancels in-flight cells and resets state", function()
     -- The crash path of the on_exit callback. SPEC cancellation table row 5:
-    -- "Bridge exits unexpectedly (on_exit without _expected_exit)" — must
+    -- "Bridge exits unexpectedly (on_exit without expected-exit pin)" — must
     -- mark both running and queue as killed and clear state so the next
     -- execute can respawn the bridge cleanly. Without this _pump's
     -- `if self.running then return end` guard would block every future
@@ -706,7 +798,8 @@ describe("kernel lifecycle messages", function()
     k.job_id = 42
     k.chan = 42
     k.json_buf = "leftover"
-    k._expected_exit = false
+    -- No pin: this is an unexpected exit.
+    k._expected_exit_for = nil
     k.running = { cell_id = "live", started_at = 0 }
     k.queue = { { cell_id = "q1" } }
     nb:ensure_output("live").status = "running"
@@ -719,23 +812,23 @@ describe("kernel lifecycle messages", function()
     assert.is_nil(k.job_id)
     assert.is_nil(k.chan)
     assert.equals("", k.json_buf)
-    assert.is_false(k._expected_exit)
+    assert.is_nil(k._expected_exit_for)
     assert.is_false(k._stopping)
     assert.equals("killed", nb.outputs["live"].status)
     assert.equals("killed", nb.outputs["q1"].status)
   end)
 
-  it("expected bridge exit (Kernel:stop) consumes _expected_exit without notifying", function()
-    -- The clean shutdown path: Kernel:stop set _expected_exit=true and called
-    -- jobstop. on_exit fires later. We must NOT _cancel_in_flight again
-    -- (stop() already did) and must NOT show a "kernel bridge exited
-    -- unexpectedly" warning. Crucially _expected_exit must be cleared so a
-    -- subsequent real crash isn't masked.
+  it("expected bridge exit (Kernel:stop) consumes _expected_exit_for without notifying", function()
+    -- The clean shutdown path: Kernel:stop pinned _expected_exit_for to the
+    -- specific job_id and called jobstop. on_exit fires later. We must NOT
+    -- _cancel_in_flight again (stop() already did) and must NOT show a
+    -- "kernel bridge exited unexpectedly" warning. The pin must be cleared
+    -- on consumption so a subsequent real crash isn't masked.
     local nb = fake_notebook()
     local k = Kernel.new(nb)
     k.job_id = 42
     k.chan = 42
-    k._expected_exit = true
+    k._expected_exit_for = 42
     -- running/queue were already cleared by stop(); on_exit must not flip
     -- a stray output that happens to be "killed" back to anything else.
     nb:ensure_output("alreadydone").status = "killed"
@@ -743,7 +836,7 @@ describe("kernel lifecycle messages", function()
     k:_handle_exit(42)
 
     assert.is_nil(k.job_id)
-    assert.is_false(k._expected_exit)
+    assert.is_nil(k._expected_exit_for)
     -- Pre-existing killed status is untouched (sticky terminal).
     assert.equals("killed", nb.outputs["alreadydone"].status)
   end)
@@ -756,7 +849,7 @@ describe("kernel lifecycle messages", function()
     local k = Kernel.new(nb)
     k.job_id = 999  -- the NEW bridge
     k.chan = 999
-    k._expected_exit = true  -- still expected from a prior stop()
+    k._expected_exit_for = 999  -- pin from a hypothetical pending stop on the NEW job
     k.running = { cell_id = "newly_queued", started_at = 0 }
 
     k:_handle_exit(42)  -- stale callback for an old job_id
@@ -764,9 +857,36 @@ describe("kernel lifecycle messages", function()
     -- New job state is preserved.
     assert.equals(999, k.job_id)
     assert.equals(999, k.chan)
-    assert.is_true(k._expected_exit)
+    assert.equals(999, k._expected_exit_for)
     -- Running cell is untouched.
     assert.is_not_nil(k.running)
+  end)
+
+  it("new job's on_exit does NOT consume an OLD stop()'s _expected_exit_for", function()
+    -- This is the race the per-job pin closes. Sequence:
+    --   1. stop() pins _expected_exit_for to job 42.
+    --   2. Old job 42's on_exit hasn't fired yet (event-loop tick pending).
+    --   3. execute() spawns a NEW bridge at job 99.
+    --   4. NEW bridge dies instantly (bad python, etc.).
+    --   5. NEW on_exit(99) fires.
+    -- The NEW exit must be reported as unexpected (the user needs to see
+    -- the failure), and the OLD pin must still survive for the OLD exit
+    -- to consume on a later tick.
+    local nb = fake_notebook()
+    local k = Kernel.new(nb)
+    k.job_id = 99            -- new bridge
+    k.chan = 99
+    k._expected_exit_for = 42 -- pinned by an earlier stop() on the OLD job
+    k.running = { cell_id = "live", started_at = 0 }
+    nb:ensure_output("live").status = "running"
+
+    k:_handle_exit(99)  -- NEW job dies
+
+    -- New exit treated as unexpected — cancel-in-flight fired.
+    assert.is_nil(k.running)
+    assert.equals("killed", nb.outputs["live"].status)
+    -- OLD pin survives so the OLD on_exit (when it fires) can still consume.
+    assert.equals(42, k._expected_exit_for)
   end)
 
   it("kernel_error with kind=no_kernelspec triggers the picker (H11)", function()

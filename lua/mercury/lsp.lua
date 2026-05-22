@@ -19,16 +19,55 @@ function M.filter_diagnostics(nb, diagnostics)
   end
   local kept = {}
   for _, d in ipairs(diagnostics or {}) do
-    local start_row = (d.range and d.range.start and d.range.start.line) or 0
-    local end_row = (d.range and d.range["end"] and d.range["end"].line) or start_row
-    -- Drop a diagnostic whose range touches markdown at EITHER end. A
-    -- multi-line diagnostic that starts in code and ends inside the
-    -- following markdown cell would otherwise survive and render partially
-    -- on top of prose. Raw cells are NOT dropped — SPEC documents them as
-    -- visible to the LSP (treated as ordinary python text).
-    if not (in_markdown(start_row) or in_markdown(end_row)) then
+    -- A diagnostic with no `range` (e.g., pyright's "could not parse file"
+    -- as a whole-document signal) is preserved unconditionally — defaulting
+    -- to row 0 and then filtering would silently suppress whole-document
+    -- errors whenever row 0 happens to be a markdown header. SPEC
+    -- Invariant 32.
+    if not (d.range and d.range.start and d.range.start.line ~= nil) then
       kept[#kept + 1] = d
+    else
+      local start_row = d.range.start.line
+      local end_row = (d.range["end"] and d.range["end"].line) or start_row
+      -- Drop a diagnostic whose range touches markdown at EITHER end. A
+      -- multi-line diagnostic that starts in code and ends inside the
+      -- following markdown cell would otherwise survive and render partially
+      -- on top of prose. Raw cells are NOT dropped — SPEC documents them as
+      -- visible to the LSP (treated as ordinary python text).
+      if not (in_markdown(start_row) or in_markdown(end_row)) then
+        kept[#kept + 1] = d
+      end
     end
+  end
+  return kept
+end
+
+-- Drop text edits whose range intersects a markdown cell. The masked view
+-- shown to the LSP server prepends "# " to markdown lines; if the server
+-- returns formatting edits based on that masked view, applying them
+-- verbatim against the real buffer would shift prose by 2 columns. The
+-- safe default is to refuse the edit for those ranges. SPEC Invariant 29.
+function M.filter_text_edits(nb, edits)
+  if not nb or not edits then return edits end
+  local function in_markdown(row)
+    local cell = nb:cell_at_row(row)
+    return cell and cell.kind == "markdown"
+  end
+  local kept = {}
+  for _, e in ipairs(edits or {}) do
+    local start_row = (e.range and e.range.start and e.range.start.line) or 0
+    local end_row = (e.range and e.range["end"] and e.range["end"].line) or start_row
+    -- The end position in an LSP range is exclusive (rfc says end may be
+    -- "right after" the affected text); a range that *ends* exactly on a
+    -- markdown cell's first row but doesn't touch it should still pass.
+    -- Use end_row - 1 when end_row > start_row to avoid that off-by-one.
+    local last_real_row = end_row
+    if end_row > start_row then last_real_row = end_row - 1 end
+    local touches_md = false
+    for row = start_row, last_real_row do
+      if in_markdown(row) then touches_md = true; break end
+    end
+    if not touches_md then kept[#kept + 1] = e end
   end
   return kept
 end
@@ -162,10 +201,33 @@ local function install_diag_filter()
   end
 end
 
+-- Wrap the formatting / rangeFormatting result handlers so any text edit
+-- whose range falls inside a markdown cell is dropped before vim applies
+-- it. Required because the masked LSP view prepends "# " to markdown
+-- lines: a formatter generates edits whose column positions are correct
+-- on the masked text but wrong on the real buffer (off by 2 columns).
+-- Refusing the edit is the safe default. SPEC Invariant 29. Reload-safe
+-- via the same vim.g marker pattern as the diagnostic filter.
+local function install_format_filter()
+  if vim.g._mercury_lsp_format_wrapped then return end
+  vim.g._mercury_lsp_format_wrapped = 1
+  for _, key in ipairs({ "textDocument/formatting", "textDocument/rangeFormatting" }) do
+    local prev = vim.lsp.handlers[key]
+    vim.lsp.handlers[key] = function(err, result, ctx, config)
+      if type(result) == "table" and #result > 0 and ctx and ctx.bufnr then
+        local nb = Notebook.get(ctx.bufnr)
+        if nb then result = M.filter_text_edits(nb, result) end
+      end
+      if prev then return prev(err, result, ctx, config) end
+    end
+  end
+end
+
 -- Called once from mercury.setup(). Installs the diagnostic safety-net filter
 -- and the LspAttach autocmd that patches clients and resets their view.
 function M.setup()
   install_diag_filter()
+  install_format_filter()
 
   vim.api.nvim_create_autocmd("LspAttach", {
     group = vim.api.nvim_create_augroup("MercuryLsp", { clear = true }),
