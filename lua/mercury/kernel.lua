@@ -889,6 +889,18 @@ end
 function Kernel:restart(opts)
   opts = opts or {}
   if not self.chan then
+    -- Bridge isn't running yet — typical on a freshly-opened notebook where
+    -- the user wants to wipe the outputs that came in from disk. Honor
+    -- `opts.clear` locally: no kernel to bounce, just drop the side-table.
+    -- This makes `:NotebookKernelRestartClear` work the same way before and
+    -- after the first execute.
+    if opts.clear and self.notebook and self.notebook.clear_all_outputs then
+      self.notebook:clear_all_outputs()
+      if self.on_change then pcall(self.on_change) end
+      Util.notify("outputs cleared (kernel was not running)",
+        vim.log.levels.INFO)
+      return
+    end
     Util.notify("kernel is not running", vim.log.levels.INFO)
     return
   end

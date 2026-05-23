@@ -919,6 +919,26 @@ updating this spec.
     (`y/x/width/render_offset_top/with_virtual_padding/window`), which
     is enough to detect window resizes and tab moves.
 
+    **Layout is driven by virt_lines, not by image.nvim's virtual
+    padding.** `Image:compute_dimensions` returns per-image widths +
+    heights; `Output.build_virt_lines` reserves N+1 blank virt_lines for
+    each image at its item position (N = height; +1 = 1-row visual gap
+    between consecutive images) AND emits per-image `image_offsets[i]`
+    describing the row at which the placement should anchor. `Image:render`
+    consumes those offsets via `layout.offsets` and sets
+    `with_virtual_padding = false` so image.nvim's padding doesn't
+    double-count the rows we already reserved. This is what makes the
+    cell's visible layout preserve item order — text BEFORE image i,
+    image i, text BETWEEN images, image i+1 — instead of the old
+    "all text, then all images stacked at the bottom" behavior that
+    silently re-ordered the items and let tall images paint over the
+    text below them.
+
+    Two non-interleave fallbacks remain (with `with_virtual_padding =
+    is_last`): direct callers / unit tests that don't go through
+    `Output.build_virt_lines` (no offsets available), and the
+    "image.nvim unavailable" path where no rendering happens at all.
+
 76. **Cached image handles are re-painted on every render call.** When
     `same_placement` confirms a cached handle matches the new opts,
     Mercury still calls `handle:render()` again rather than treating the
@@ -946,7 +966,17 @@ updating this spec.
     deleted cells (Invariant 17); this extends the same lifecycle to
     output virt_lines.
 
-78. **`:NotebookKernelInfo` is the single source of truth for "which
+78. **`Kernel:restart({clear=true})` clears outputs even when the bridge
+    is dormant.** The user's intent — wipe what's on the page and start
+    over — should not be tied to whether the kernel happened to be
+    running. On a freshly-opened notebook (bridge never started, outputs
+    loaded from disk), `restart({clear=true})` calls
+    `notebook:clear_all_outputs()` synchronously and notifies, instead
+    of bailing out with "kernel is not running". Plain `restart()`
+    (no clear flag) keeps the bail-out behavior since there's nothing
+    to bounce.
+
+79. **`:NotebookKernelInfo` is the single source of truth for "which
     kernel am I on?".** The command notifies a multi-line summary
     produced by `Kernel:info()` — mode, active selector
     (python/spec_path/name in resolve-order), connection_file (for
