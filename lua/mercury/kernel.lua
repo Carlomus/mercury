@@ -47,7 +47,94 @@ local function build_cmd()
   if not python then return nil, "no python interpreter found" end
   local script = find_bridge_script()
   if not script then return nil, "bridge.py not found" end
-  return { python, "-u", script }
+  return { python, "-u", script }, nil, python
+end
+
+-- Pre-bridge dependency check. The bridge itself emits a `kernel_error` with
+-- `kind=missing_module` on import failure, but only AFTER spawning python +
+-- attempting to import jupyter_client (a noticeable delay on slow
+-- filesystems / Windows). A Lua-side `python -c` probe finishes in 50-100 ms
+-- and lets us surface a clear actionable error — and the `auto_install`
+-- knob — before paying the bridge spawn cost.
+--
+-- Synchronous-return contract:
+--   * returns true  → deps are present, caller can launch the bridge now
+--   * returns false → deps missing; an install or a user prompt may have
+--                     been kicked off in the background. The caller must
+--                     bail; the user re-triggers execute() once the
+--                     install completes (we surface a notify when ready).
+--
+-- We don't block the event loop on `pip install` because the editor would
+-- otherwise hang for tens of seconds on a fresh venv. Re-execution by the
+-- user is the natural retry signal.
+function Kernel:_ensure_deps_or_offer_install()
+  local python = default_python()
+  if not python then
+    Util.notify(
+      "no python interpreter found — set vim.g.python3_host_prog, "
+      .. "activate a venv, or pass python = ... to mercury.setup()",
+      vim.log.levels.ERROR)
+    return false
+  end
+  local res = Util.check_kernel_deps(python)
+  if res.ok then return true end
+  if self._install_pending then
+    Util.notify("kernel deps install in progress; try again in a moment",
+      vim.log.levels.INFO)
+    return false
+  end
+  local missing_list = table.concat(res.missing, ", ")
+  local cfg = Cfg.get()
+  local policy = (cfg.kernel or {}).auto_install
+  if policy == nil then policy = "ask" end
+  if policy == false then
+    Util.notify(
+      ("missing python module%s in %s: %s — install with: %s -m pip install %s")
+        :format(#res.missing == 1 and "" or "s", python, missing_list,
+                python, table.concat(res.missing, " ")),
+      vim.log.levels.ERROR)
+    return false
+  end
+  local self_ref = self
+  local function do_install()
+    self_ref._install_pending = true
+    Util.notify(("installing %s into %s …"):format(missing_list, python),
+      vim.log.levels.INFO)
+    Util.install_kernel_deps(python, res.missing, function(ok, err)
+      self_ref._install_pending = false
+      if ok then
+        Util.notify(
+          ("installed %s into %s — re-run the cell to start the kernel")
+            :format(missing_list, python),
+          vim.log.levels.INFO)
+      else
+        Util.notify(
+          ("failed to install %s into %s: %s — install manually with: "
+           .. "%s -m pip install %s"):format(missing_list, python,
+            err or "unknown error", python, table.concat(res.missing, " ")),
+          vim.log.levels.ERROR)
+      end
+    end)
+  end
+  if policy == true then
+    do_install()
+    return false
+  end
+  -- "ask" path: prompt asynchronously. Same retry-after-install contract as
+  -- the silent path — when the user confirms, the install kicks off and
+  -- they re-trigger execute() once we notify that the install landed.
+  vim.schedule(function()
+    vim.ui.select(
+      { "Install now", "Cancel" },
+      {
+        prompt = ("Mercury: %s missing in %s. Install?")
+          :format(missing_list, python),
+      },
+      function(choice)
+        if choice == "Install now" then do_install() end
+      end)
+  end)
+  return false
 end
 
 function M.new(notebook, opts)
@@ -545,6 +632,14 @@ function Kernel:_ensure_started()
   if not cmd then
     Util.notify("kernel: " .. err, vim.log.levels.ERROR)
     return false
+  end
+  -- Fail fast: probe `jupyter_client` + `ipykernel` availability before paying
+  -- the bridge spawn cost. If missing, surface an actionable error (and
+  -- optionally kick off a `pip install` per `kernel.auto_install`). Bypassed
+  -- when the user has overridden `bridge_cmd` since we can't tell what
+  -- arbitrary command needs.
+  if not (Cfg.get().bridge_cmd and #Cfg.get().bridge_cmd > 0) then
+    if not self:_ensure_deps_or_offer_install() then return false end
   end
   local cwd
   if vim.api.nvim_buf_is_valid(self.notebook.buf) then

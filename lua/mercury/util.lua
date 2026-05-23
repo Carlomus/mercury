@@ -249,6 +249,103 @@ function M.notify(msg, level)
   end)
 end
 
+-- Cache the result of `check_kernel_deps` per python path so the import probe
+-- runs once per session per interpreter (a 50–100ms subprocess; not worth
+-- repeating on every notebook open). Cleared when install_kernel_deps writes
+-- new modules into a given interpreter so the cache doesn't stale on success.
+M._dep_cache = {}
+
+-- Probe a python interpreter for the modules mercury's bridge requires. Both
+-- `jupyter_client` and `ipykernel` are needed: jupyter_client to spawn /
+-- connect, ipykernel to run code in-process. Returns `{ ok = bool, missing =
+-- {...}, error = string? }`. Synchronous (small `python -c` exec).
+--
+-- Cached per-path because both kernel.lua (pre-launch fail-fast) and
+-- health.lua call this; without a cache, `:checkhealth` followed by an open
+-- would pay the cost twice for the same answer.
+function M.check_kernel_deps(python)
+  if not python or python == "" then
+    return { ok = false, missing = { "jupyter_client", "ipykernel" },
+             error = "no python interpreter" }
+  end
+  local cached = M._dep_cache[python]
+  if cached then return cached end
+  local mods = { "jupyter_client", "ipykernel" }
+  local code = "import importlib,sys\n"
+    .. "for m in ['jupyter_client','ipykernel']:\n"
+    .. "  try: importlib.import_module(m)\n"
+    .. "  except Exception as e: sys.stdout.write(m+'\\n')\n"
+  local sys_run = vim.system or function() return nil end
+  local res
+  local ok, r = pcall(function()
+    return vim.system({ python, "-c", code }, { text = true }):wait()
+  end)
+  if not ok or not r then
+    -- vim.system itself failed (e.g. python path bogus). Treat as all missing
+    -- so the install path is reachable.
+    local result = { ok = false, missing = mods,
+                     error = "could not invoke python" }
+    M._dep_cache[python] = result
+    return result
+  end
+  res = r
+  if res.code ~= 0 then
+    local result = { ok = false, missing = mods,
+                     error = "python exited " .. tostring(res.code)
+                       .. ": " .. tostring(res.stderr or "") }
+    M._dep_cache[python] = result
+    return result
+  end
+  local missing = {}
+  for line in (res.stdout or ""):gmatch("[^\n]+") do
+    line = line:gsub("%s+$", "")
+    if line ~= "" then missing[#missing + 1] = line end
+  end
+  local result = { ok = #missing == 0, missing = missing }
+  M._dep_cache[python] = result
+  return result
+end
+
+-- Invalidate the dep-check cache for a python path (or all paths if nil).
+-- Called by install_kernel_deps after a successful install so the next probe
+-- doesn't return the pre-install "missing" answer from cache.
+function M.invalidate_dep_cache(python)
+  if python then M._dep_cache[python] = nil
+  else M._dep_cache = {} end
+end
+
+-- Install kernel deps into `python` using its own pip. Async; calls `cb(ok,
+-- err)` on completion. Uses `--upgrade` only on a fresh install so users with
+-- pinned versions in their venv don't have them silently bumped.
+--
+-- We invoke `<python> -m pip install ipykernel jupyter_client` rather than the
+-- system pip so the modules land in the same environment that the bridge will
+-- spawn (a venv's site-packages, not the system site-packages).
+function M.install_kernel_deps(python, modules, cb)
+  cb = cb or function() end
+  if not python or python == "" then
+    return cb(false, "no python interpreter")
+  end
+  modules = (modules and #modules > 0) and modules
+    or { "jupyter_client", "ipykernel" }
+  local cmd = { python, "-m", "pip", "install" }
+  for _, m in ipairs(modules) do cmd[#cmd + 1] = m end
+  local ok_sys, _ = pcall(function()
+    vim.system(cmd, { text = true }, function(res)
+      vim.schedule(function()
+        M.invalidate_dep_cache(python)
+        if res.code == 0 then
+          cb(true)
+        else
+          cb(false, (res.stderr or res.stdout or
+            ("pip exited " .. tostring(res.code))):gsub("%s+$", ""))
+        end
+      end)
+    end)
+  end)
+  if not ok_sys then cb(false, "vim.system unavailable") end
+end
+
 -- Bump mtime on a cache file so age-based GC treats it as recently-used.
 -- Cheap and best-effort — failure to touch is fine, the file just becomes
 -- a slightly earlier eviction candidate.

@@ -53,7 +53,16 @@ resolve to `<root>/lua/mercury/init.lua`.
 ```lua
 require("mercury").setup({
   python = nil,                       -- path to python; auto-detected
-  kernel = { mode = "local", name = nil },
+  kernel = {
+    mode = "local", name = nil,
+    -- Behavior when `jupyter_client` / `ipykernel` aren't importable in
+    -- the resolved python:
+    --   "ask" (default)  — prompt once via vim.ui.select
+    --   true             — silently `pip install` into the resolved python
+    --   false            — never install; surface an error and let the
+    --                      user fix it manually
+    auto_install = "ask",
+  },
   output = {
     max_preview_lines = 20,
     image_max_height_rows = 40,       -- cap on rows reserved per image

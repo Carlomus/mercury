@@ -39,6 +39,7 @@ local function same_placement(a, b)
   return a.y == b.y
     and a.x == b.x
     and a.width == b.width
+    and a.height == b.height
     and a.render_offset_top == b.render_offset_top
     and a.with_virtual_padding == b.with_virtual_padding
     and a.window == b.window
@@ -179,6 +180,14 @@ function Renderer:render(cell, anchor_row, images)
   -- padding for the full stacked height. Re-use a cached handle when both the
   -- content hash and the placement opts are unchanged — re-creating on every
   -- rescan causes visible flicker on long cells.
+  --
+  -- We pass an explicit `height` to image.nvim's `from_file` so the rows it
+  -- reserves match the rows WE computed via `image_row_height`. Without an
+  -- explicit height image.nvim auto-derives from the on-disk image
+  -- dimensions, and the two estimates can disagree (different cell
+  -- pixel-aspect assumption, different rounding) — the previous behavior
+  -- where image.nvim reserved fewer rows than we'd anticipated is what made
+  -- the next cell's text get painted over by a tall image. SPEC Invariant 75.
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
@@ -194,6 +203,7 @@ function Renderer:render(cell, anchor_row, images)
         x = i - 1,                        -- distinct extmark col per image
         y = anchor_row,
         width = widths[i],
+        height = heights[i],              -- lock reservation to our row math
         render_offset_top = cumulative,
       }
       local handle = entry.handles[img.hash]
@@ -209,6 +219,17 @@ function Renderer:render(cell, anchor_row, images)
           entry.handles[img.hash] = nil
           entry.placements[img.hash] = nil
         end
+      else
+        -- Same content + same placement, BUT the terminal may have lost the
+        -- image cells (tab switch, :tabnew, terminal resize emitting fresh
+        -- DEC reset). image.nvim doesn't automatically re-paint when a
+        -- window becomes visible again. Re-calling `render()` on an already-
+        -- existing handle is idempotent (image.nvim re-emits the kitty
+        -- graphics protocol bytes against the current window) and cheap —
+        -- no disk read, no IHDR decode — so we do it unconditionally on
+        -- every reuse. Closes the "images vanish after tab switch" bug.
+        -- SPEC Invariant 76.
+        pcall(function() if handle.render then handle:render() end end)
       end
     end
     cumulative = cumulative + heights[i]

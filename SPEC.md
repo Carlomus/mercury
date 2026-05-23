@@ -863,6 +863,70 @@ updating this spec.
     silently dropped from every position-bearing proactive response,
     matching the "markdown cells are invisible to the LSP" contract.
 
+73. **Queued cells display their 1-based position in the kernel queue.**
+    When a cell is queued, its status pill renders `⏸ queued #N` where N
+    is the position in `kernel.queue` (1-indexed). The position is
+    derived in the UI render pass on every tick — not stored on `out` —
+    so an enqueue / dequeue elsewhere in the queue updates every
+    queued cell's pill in lockstep with the next render. Falls back to
+    bare "queued" when no position is supplied (non-UI callers /
+    pre-attach state).
+
+74. **`kernel.auto_install` controls dependency-install policy.** Before
+    the bridge spawns, Mercury probes the resolved python for
+    `jupyter_client` and `ipykernel` (single `python -c` exec, cached
+    per python path). On missing modules the behavior is:
+
+    * `auto_install = "ask"` (default) — prompt the user once via
+      `vim.ui.select` to confirm install. On confirm, run
+      `<python> -m pip install <modules>` asynchronously.
+    * `auto_install = true` — run the same install with no prompt.
+    * `auto_install = false` — emit an error notify with the exact
+      `pip install` command and refuse to launch.
+
+    All three paths are non-blocking. The install kicks off async and
+    the user re-triggers `:NotebookExec` once Mercury notifies that the
+    install landed. Concurrent installs are gated by `_install_pending`;
+    a second execute while one is in flight emits an INFO notify and
+    bails.
+
+75. **image.nvim receives an explicit `height` per image placement.**
+    Mercury computes the row count for each image via
+    `Output.image_row_height` and passes that height through to
+    `image.nvim`'s `from_file` opts. Without it, image.nvim auto-derives
+    height from on-disk pixel dimensions and its assumption of the
+    terminal cell aspect can disagree with Mercury's — the disagreement
+    is what made tall images paint over the next cell's lines.
+    `same_placement` includes `height` so a window resize that changes
+    the row math correctly invalidates the cached handle.
+
+76. **Cached image handles are re-painted on every render call.** When
+    `same_placement` confirms a cached handle matches the new opts,
+    Mercury still calls `handle:render()` again rather than treating the
+    cache hit as a no-op. `image.nvim`'s `render()` is idempotent (no
+    disk read, no decode — just re-emits the kitty graphics protocol
+    bytes against the current window), so the cost is negligible. The
+    motivating case: switching tabs and returning leaves image.nvim's
+    terminal-side state cleared even though the Lua handle survives;
+    re-painting on every render brings the image back. Mercury also
+    registers `TabEnter` / `WinEnter` / `VimResized` autocmds on the
+    per-buffer augroup to trigger re-renders when those events fire (the
+    callback bails when no window shows the buffer, so global events
+    only cost a render when relevant).
+
+77. **Orphan output extmarks are explicitly deleted on cell removal.**
+    When a cell vanishes from `nb.cells` (separator line deleted, cell
+    merged away), `Renderer:render` calls `nvim_buf_del_extmark` on the
+    cell's `_marks[id]` entry in addition to GC'ing the Lua table. The
+    extmark itself does NOT disappear with the deleted separator line —
+    nvim relocates it to an adjacent row — so the cell's pill + body
+    would otherwise stay rendered against the merged cell with no way
+    to clear it (`:NotebookOutputClear` operates by cell-id at cursor,
+    and the orphan's id is unreachable). Symmetric pattern: the image
+    GC in `Image:gc` already calls `:clear()` on each handle for
+    deleted cells (Invariant 17); this extends the same lifecycle to
+    output virt_lines.
+
 ## Goal
 
 Edit `.ipynb` files in Neovim with the workflow you'd get in VS Code:

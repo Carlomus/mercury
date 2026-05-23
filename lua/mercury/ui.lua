@@ -144,16 +144,29 @@ function Renderer:render()
   end
 
   -- GC tracked extmark ids whose cells no longer exist (rename/delete/merge).
-  -- The text extmark itself goes away with the line, but the lookup table
-  -- would otherwise grow without bound across a long editing session. Same
-  -- problem applies to image.nvim handles, which the plugin holds onto until
-  -- we explicitly clear them — we must drop those too or deleted cells leak
-  -- live images.
+  --
+  -- IMPORTANT: deleting the cell's separator line does NOT delete its output
+  -- extmark from the buffer — the extmark just relocates to whatever row
+  -- nvim chose (typically the row that absorbed the deletion). The Lua
+  -- lookup table forgetting the id is not enough; we have to explicitly
+  -- call `nvim_buf_del_extmark` so the virt_lines stop rendering. Without
+  -- this, a user who deletes a cell's `# %%` separator sees the old
+  -- cell's output pill and body stuck to the merged cell with no way to
+  -- clear it (`:NotebookOutputClear` operates on the cell at cursor,
+  -- whose id is the surviving one — the orphan's id is unreachable).
+  --
+  -- Same logic applies to image.nvim handles, which the plugin holds onto
+  -- until we explicitly call `:clear()` — we must drop those too or
+  -- deleted cells leak live images that linger in the terminal.
   local present = {}
   for _, c in ipairs(nb.cells) do present[c.id] = true end
   if self._marks then
-    for id in pairs(self._marks) do
-      if not present[id] then self._marks[id] = nil end
+    local ns_out = Notebook.ns(NS_OUTPUT)
+    for id, mark_id in pairs(self._marks) do
+      if not present[id] then
+        pcall(vim.api.nvim_buf_del_extmark, buf, ns_out, mark_id)
+        self._marks[id] = nil
+      end
     end
   end
   if self.image and self.image.gc then self.image:gc(present) end
@@ -204,10 +217,25 @@ function Renderer:render_cell_output(cell)
     end
   end
 
+  -- Compute the cell's position in the kernel queue (1-based) so the pill
+  -- can render `⏸ queued #N`. Searching the queue on every render is fine —
+  -- the queue is bounded by the number of cells the user has fired off and
+  -- render_cell_output runs at one tick per coalesce window (SPEC Invariant
+  -- 7). Storing the position on `out` instead would force re-walking all
+  -- queued cells on every enqueue/pop just to keep the index field current,
+  -- so this stays a derived value.
+  local queue_pos
+  if out.status == "queued" and nb.kernel and nb.kernel.queue then
+    for i, task in ipairs(nb.kernel.queue) do
+      if task.cell_id == cell.id then queue_pos = i; break end
+    end
+  end
+
   local virt = Output.build_virt_lines(out, {
     show_status_pill = cfg.show_status_pill,
     max_preview_lines = collapsed and 0 or (cfg.max_preview_lines or 9999),
     collapsed = collapsed,
+    queue_pos = queue_pos,
   })
 
   local anchor = nb:cell_anchor_row(cell)

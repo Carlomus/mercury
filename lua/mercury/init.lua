@@ -192,6 +192,26 @@ local function attach_buffer(buf, opts)
     end,
   })
 
+  -- Tab switches, window changes, and terminal resizes can leave image.nvim's
+  -- terminal-side placements stale even though the cached Lua handles
+  -- survive. These events aren't buffer-scoped (the user may have come from
+  -- a different file), so we register them globally on this buffer's
+  -- per-buffer augroup and check inside the callback that the buf is both
+  -- loaded and visible in some window before re-rendering. image.lua's
+  -- render path now re-paints reused handles via `handle:render()` on every
+  -- call, so triggering broadly here is cheap (no disk read, no decode).
+  -- Closes the "images vanish after switching tabs and coming back" bug.
+  vim.api.nvim_create_autocmd({ "TabEnter", "WinEnter", "VimResized" }, {
+    group = buf_aug,
+    callback = function()
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      if not vim.api.nvim_buf_is_loaded(buf) then return end
+      local wins = vim.fn.win_findbuf(buf) or {}
+      if #wins == 0 then return end
+      renderer:render()
+    end,
+  })
+
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)
 

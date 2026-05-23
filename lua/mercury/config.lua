@@ -13,6 +13,14 @@ M.defaults = {
     python = nil,          -- absolute path to a python executable
     spec_path = nil,       -- absolute path to a kernelspec directory
     connection_file = nil,
+    -- Behavior when ipykernel / jupyter_client are not importable in the
+    -- resolved python interpreter at bridge-launch time:
+    --   "ask"  → prompt the user once (default; same as `nil`)
+    --   true   → install silently into the resolved python with no prompt
+    --   false  → never install; surface an error and let the user fix it
+    --            manually (suitable for CI / containerised environments
+    --            where pip is read-only)
+    auto_install = "ask",
   },
   output = {
     max_preview_lines = 20,
@@ -82,6 +90,8 @@ local SCHEMA = {
       python          = { type = "string?" },
       spec_path       = { type = "string?" },
       connection_file = { type = "string?" },
+      auto_install    = { type = "string|boolean?",
+                          enum = { "ask" } },
     },
   },
   output = {

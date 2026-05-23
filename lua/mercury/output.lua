@@ -144,7 +144,19 @@ function M.build_virt_lines(out, opts)
     if out.status == "running" then
       pill[#pill + 1] = { "⏳ running…", status.hl }
     elseif out.status == "queued" then
-      pill[#pill + 1] = { "⏸ queued", status.hl }
+      -- Show the cell's 1-based position in the kernel queue when it's
+      -- known. The UI (ui.lua) computes the position from `nb.kernel.queue`
+      -- on every render and threads it through `opts.queue_pos` so the
+      -- side-table doesn't have to track it. Falls back to a bare "queued"
+      -- label when no position is available (running in a non-UI context
+      -- like tests, or when the queue was cleared by a restart in flight).
+      if opts.queue_pos and opts.queue_pos > 0 then
+        pill[#pill + 1] = {
+          ("⏸ queued #%d"):format(opts.queue_pos), status.hl,
+        }
+      else
+        pill[#pill + 1] = { "⏸ queued", status.hl }
+      end
     elseif out.status == "killed" then
       pill[#pill + 1] = { "󱚢 killed", status.hl }
     elseif out.status == "ok" or out.status == "error" or out.status == "idle" then
@@ -234,21 +246,28 @@ function M.build_virt_lines(out, opts)
         body_lines[#body_lines + 1] = { "[widget unsupported]", "Comment" }
       elseif mime == "image/png" or mime == "image/jpeg" or mime == "image/svg+xml" then
         -- When image.nvim is available it renders the image inline below the
-        -- virt_lines; in that case the placeholder is just noise. Show one
-        -- only as a fallback when no image renderer is loaded.
+        -- virt_lines; we deliberately emit NO mime-name placeholder line in
+        -- that case. Having a `[image/png]` label sit just above the actual
+        -- image (and frequently *underneath* it in terminals where image.nvim
+        -- paints over virt_lines) is the visual collision the user reported.
         --
-        -- If the image renderer is available but the per-item descriptor
-        -- carries an `unavailable` flag (set by the image driver when the
-        -- on-disk cached bytes have been evicted between extract and
-        -- render), surface a clear text placeholder so the user knows why
-        -- nothing is appearing inline. Without this, the cell shows a tiny
-        -- (1-row) blank slot and the user has no diagnostic.
+        -- Three cases — exhaustive and mutually exclusive — where we DO
+        -- emit a body line:
+        --   (a) image.nvim isn't installed or is disabled: the user has no
+        --       other signal an image exists, so we surface the mime as a
+        --       fallback placeholder.
+        --   (b) image.nvim is available BUT the cached bytes vanished
+        --       between extract and render (cache eviction race): the image
+        --       won't appear inline either, so we surface a diagnostic with
+        --       a recovery hint.
+        --   (c) image.nvim is available and bytes are present: NOTHING —
+        --       the image is the label.
         local image_ok, Image = pcall(require, "mercury.image")
         if not image_ok or not Image.available() then
           body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
         elseif item._mercury_image_unavailable then
           body_lines[#body_lines + 1] = {
-            ("[%s: image bytes unavailable; re-execute the cell]"):format(mime),
+            "[image bytes unavailable — re-execute the cell]",
             "Comment",
           }
         end
@@ -336,7 +355,8 @@ end
 -- surface here MUST mirror what `build_virt_lines` shows on screen —
 -- including the status pill, [empty output] placeholders, and the
 -- formatting rules around exec_count / ms suppression. SPEC Invariant 54.
-function M.to_plain_text(out)
+function M.to_plain_text(out, opts)
+  opts = opts or {}
   local lines = {}
   -- Status-pill line, matching build_virt_lines' suppression rules:
   --   * idle + no exec_count + ms <= 0 ⇒ no pill (fresh, never-run cell)
@@ -345,7 +365,11 @@ function M.to_plain_text(out)
   if out.status == "running" then
     lines[#lines + 1] = "running…"
   elseif out.status == "queued" then
-    lines[#lines + 1] = "queued"
+    if opts.queue_pos and opts.queue_pos > 0 then
+      lines[#lines + 1] = ("queued #%d"):format(opts.queue_pos)
+    else
+      lines[#lines + 1] = "queued"
+    end
   elseif out.status == "killed" then
     lines[#lines + 1] = "killed"
   elseif out.status == "ok" or out.status == "error" then
