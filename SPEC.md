@@ -1036,6 +1036,39 @@ updating this spec.
     (the extmark-creation block that anchors virt_lines below the
     queried row).
 
+    **I14 — Row reservation must use image.nvim's runtime cell sizes.**
+    image.nvim's height formula (from
+    [`renderer.lua`](https://github.com/3rd/image.nvim/blob/master/lua/image/renderer.lua)
+    + [`utils/term.lua`](https://github.com/3rd/image.nvim/blob/master/lua/image/utils/term.lua))
+    is:
+
+    ```
+    target_w_px  = img_cols * runtime_cell_w
+    scaled_h_px  = h_px * (target_w_px / w_px)
+    rendered_rows = ceil(scaled_h_px / runtime_cell_h)
+    ```
+
+    `runtime_cell_w` and `runtime_cell_h` come from `TIOCGWINSZ`
+    ioctl at image.nvim startup (8×16 fallback only when the terminal
+    doesn't report). Mercury MUST use those same values when
+    computing the row count to reserve in virt_lines — otherwise the
+    reservation underflows for any terminal whose cell aspect ratio
+    isn't 1:2, and the image paints over the row below it.
+
+    The width side (I1) deliberately keeps Mercury's static 8, since
+    that controls `natural_cols` and therefore the user-visible image
+    size. The height side (I14) uses image.nvim's values, so we
+    reserve exactly what image.nvim will draw. The `+25% +3` safety
+    margin from I6 stays on top of the runtime-based row count to
+    catch a failed query (image.nvim API drift / mock environment)
+    or any future image.nvim scaling pass we haven't yet modelled.
+
+    Field names are `cell_width` and `cell_height` on the table
+    returned by `require("image.utils.term").get_size()`. The
+    `_runtime_cell_size()` helper in `image.lua` is the single
+    source of truth; it returns `nil, nil` on any failure path so
+    the caller's config-default fallback runs.
+
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
     Attaching `_image_blank = true` to a `{ text, hl }` chunk made

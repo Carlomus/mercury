@@ -89,23 +89,61 @@ function Renderer:_visible_window()
   return nil
 end
 
+-- Query image.nvim's runtime cell pixel size — populated by image.nvim
+-- at startup from the terminal's TIOCGWINSZ ioctl, with 8×16 fallback
+-- for terminals that don't report (typical SSH sessions).
+--
+-- Returns `cell_w, cell_h` (numbers). Falls back to 8, 16 when
+-- image.nvim's API is unreachable, which keeps Mercury working in
+-- mock/test environments where the module isn't loaded. Field names
+-- (`cell_width`, `cell_height`) come from image.nvim's term.lua source:
+--   https://github.com/3rd/image.nvim/blob/master/lua/image/utils/term.lua
+local function _runtime_cell_size()
+  local ok, term = pcall(require, "image.utils.term")
+  if not ok or type(term) ~= "table" or type(term.get_size) ~= "function" then
+    return nil, nil
+  end
+  local ok2, sz = pcall(term.get_size)
+  if not ok2 or type(sz) ~= "table" then return nil, nil end
+  local w, h = sz.cell_width, sz.cell_height
+  if type(w) == "number" and type(h) == "number" and w > 0 and h > 0 then
+    return w, h
+  end
+  return nil, nil
+end
+
 -- Compute per-image render width (cols) and reserved height (rows).
 -- Both are consumed by the single-extmark interleave path: width is
 -- passed to image.nvim's from_file (SPEC I1), height drives how many
 -- blank virt_lines to reserve per image in our extmark (SPEC I6,
 -- I8). Caller is `Output.build_virt_lines` (via ui.lua).
 --
--- SPEC invariants:
---   I1 — width uses `cfg.cell_width_px` (default 8). Mercury does NOT
---        query image.nvim's runtime cell pixel size; doing so returned
---        larger values on common terminals and shrank images visibly.
---   I6 — reserved height = max(image_row_height + 3,
---                              ceil(image_row_height * 1.25)),
---        clamped to image_max_height_rows. The bump absorbs the
---        divergence between Mercury's static (8×16) cell-pixel
---        assumption and image.nvim's runtime terminal measurement,
---        so an intermediate image (no with_virtual_padding backstop,
---        SPEC I9) can't bleed into the row below.
+-- WIDTH (SPEC I1) — `natural_cols = ceil(w_px / 8)`. Static 8 px/cell on
+-- purpose: users have configured around the 8-px assumption and an
+-- earlier change that used image.nvim's runtime cell_width here shrank
+-- every image visibly (because most terminals' actual cell_width > 8).
+-- Keeping static 8 preserves the user's familiar image size, and
+-- image.nvim is free to render the image at its own cell_width — the
+-- image is "upscaled" pixel-wise when the runtime cell is wider, which
+-- is the visual result the user wants.
+--
+-- HEIGHT (SPEC I6, I14) — must match image.nvim's actual rendered row
+-- count or our reservation underflows and the image paints over the
+-- next row. image.nvim's height formula is:
+--     target_w_px  = img_cols * runtime_cell_w
+--     scaled_h_px  = h_px * (target_w_px / w_px)
+--     rows         = ceil(scaled_h_px / runtime_cell_h)
+-- so Mercury MUST use image.nvim's runtime cell_w / cell_h in the row
+-- math (SPEC I14). With 8×16 static we'd only be correct when the
+-- terminal's cell aspect happens to match — common but not universal,
+-- and a single percentage-point divergence accumulates across multi-
+-- image cells.
+--
+-- Even with the runtime values we keep the +25% +3 safety bump (SPEC I6)
+-- as a backstop for:
+--   * the runtime query failing (image.nvim API drift / mock env);
+--   * any future image.nvim scaling pass we haven't accounted for;
+--   * sub-cell rounding inside image.nvim's renderer.
 function Renderer:compute_dimensions(images)
   local widths, heights = {}, {}
   if not images or #images == 0 then
@@ -116,8 +154,13 @@ function Renderer:compute_dimensions(images)
   local available_cols = math.max(20, math.floor(win_w * 0.85))
   local cfg = _cfg()
   local max_rows = cfg.image_max_height_rows or 40
-  local cell_w = cfg.cell_width_px or 8
-  local cell_h = cfg.cell_height_px or 16
+  -- Static width baseline (SPEC I1).
+  local cell_w_static = cfg.cell_width_px or 8
+  -- Runtime values for the height row math (SPEC I14). Fall back to
+  -- config defaults when the runtime query isn't reachable.
+  local rt_w, rt_h = _runtime_cell_size()
+  local cell_w_runtime = rt_w or cfg.cell_width_px or 8
+  local cell_h_runtime = rt_h or cfg.cell_height_px or 16
 
   for i, img in ipairs(images) do
     local img_cols = available_cols
@@ -132,10 +175,13 @@ function Renderer:compute_dimensions(images)
       else
         local w, h = Output.image_dimensions(img.kind, data)
         if w and h then
-          local natural_cols = math.ceil(w / cell_w)
+          -- Width: keep static 8 px/cell so the image renders at the
+          -- familiar size (SPEC I1).
+          local natural_cols = math.ceil(w / cell_w_static)
           img_cols = math.min(available_cols, natural_cols)
+          -- Height: use image.nvim's runtime cell sizes (SPEC I14).
           local bare = Output.image_row_height(
-            w, h, img_cols, cell_w, cell_h, max_rows)
+            w, h, img_cols, cell_w_runtime, cell_h_runtime, max_rows)
           -- SPEC Invariant I6 safety margin.
           local safe = math.max(bare + 3, math.ceil(bare * 1.25))
           rows = math.min(safe, max_rows)

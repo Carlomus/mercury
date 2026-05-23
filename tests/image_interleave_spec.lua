@@ -528,6 +528,69 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
+  it("I14: row reservation uses image.nvim's runtime cell sizes when available", function()
+    -- When require("image.utils.term").get_size() returns custom
+    -- cell_width / cell_height, our height row count must use THOSE
+    -- values (so the reservation matches image.nvim's actual render),
+    -- not Mercury's static 8x16.
+    --
+    -- Spoof image.utils.term to return cell_width=10, cell_height=10
+    -- (square cells). For a 400x400 image at 50 cols:
+    --   target_w_px = 50 * 10 = 500
+    --   scaled_h_px = 400 * (500/400) = 500
+    --   rendered_rows = ceil(500/10) = 50
+    -- With max_rows clamp (default 40), reservation = clamp(50*1.25,
+    -- 40) = 40. Without the I14 fix (using static 8x16): rows = 400/16
+    -- = 25 → safe = 32 → clamp = 32. The two answers differ — pin the
+    -- runtime-based answer.
+    local orig_term = package.loaded["image.utils.term"]
+    package.loaded["image.utils.term"] = {
+      get_size = function() return { cell_width = 10, cell_height = 10 } end,
+    }
+    -- Force the image module to re-require term (we replaced it).
+    package.loaded["mercury.image"] = nil
+    local Image = require("mercury.image")
+    local Util_mod = require("mercury.util")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util_mod.write_file("/tmp/i14.png", fake_png_local(400, 400))
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=i14test1", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local _, heights = Image.new(nb):compute_dimensions({
+      { kind = "png", path = "/tmp/i14.png", hash = "i14a" },
+    })
+
+    -- With cell_height=10 runtime: bare rendered rows from image.nvim's
+    -- formula = 50. Plus +25% +3 safety, clamped to 40.
+    -- We just verify the runtime path produced something larger than
+    -- what static 8x16 would have given (25 base → 32 safe), so the
+    -- code IS picking up the runtime values rather than ignoring them.
+    assert.is_true(heights[1] >= 33,
+      ("SPEC I14: heights[1] must reflect runtime cell sizes; "
+        .. "got %d (static would be <=32)"):format(heights[1]))
+
+    require("mercury.notebook").detach(buf)
+    os.remove("/tmp/i14.png")
+    package.loaded["image.utils.term"] = orig_term
+    package.loaded["mercury.image"] = nil
+  end)
+
   it("I13: image with no preceding text still lands BELOW the pill (offset >= 2)", function()
     -- Single image, no text. pill_rows=1, no body before. virt_line_idx=1.
     -- render_offset_top must be 1 + 1 = 2, so the image lands at
