@@ -300,6 +300,97 @@ describe("ui shifts images below text via layout.text_offset", function()
   end)
 end)
 
+describe("compute_dimensions safety margin + runtime cell-pixel query", function()
+  it("adds a +1 safety row per image to absorb image.nvim height drift", function()
+    -- Tall image 400×600 at cell_width_px=8 / cell_height_px=16:
+    -- target_w_px = cols * 8, scaled_h_px = 600 * (cols*8 / 400),
+    -- rows = ceil(scaled_h / 16). compute_dimensions adds +1 on top
+    -- so any sub-cell off-by-one between our math and image.nvim's
+    -- actual rendering doesn't bleed into the row below the image.
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util.write_file("/tmp/safetym.png", fake_png_local(400, 600))
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=safetych", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local _, heights = Image.new(nb):compute_dimensions({
+      { kind = "png", path = "/tmp/safetym.png", hash = "safetym" },
+    })
+    -- The bare image_row_height for 400×600 with default cell sizes
+    -- gives some value; our compute_dimensions adds +1 on top of it.
+    -- Verify the safety bump is included.
+    local Output = require("mercury.output")
+    local available = math.max(20, math.floor(
+      vim.api.nvim_win_get_width(0) * 0.85))
+    local natural_cols = math.ceil(400 / 8)
+    local bare = Output.image_row_height(400, 600,
+      math.min(available, natural_cols), 8, 16, 40)
+    -- compute_dimensions clamps to max_rows; under the clamp, our
+    -- safety bump applies. If the bare value is already at max_rows
+    -- the safety has no effect (already clamped), so check both cases.
+    if bare < 40 then
+      assert.equals(bare + 1, heights[1],
+        ("expected height = bare(%d) + 1 safety; got %d"):format(bare, heights[1]))
+    else
+      assert.equals(40, heights[1])
+    end
+    require("mercury.notebook").detach(buf)
+    os.remove("/tmp/safetym.png")
+  end)
+
+  it("safety margin never exceeds image_max_height_rows clamp", function()
+    -- Image so tall that bare row count already saturates max_rows. The
+    -- +1 safety must NOT push past the clamp — that's the upper bound
+    -- the user configured to keep cells from dominating the screen.
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util.write_file("/tmp/clamp.png", fake_png_local(100, 5000))
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=clampchk", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local _, heights = Image.new(nb):compute_dimensions({
+      { kind = "png", path = "/tmp/clamp.png", hash = "clamp" },
+    })
+    -- max_rows default 40.
+    assert.is_true(heights[1] <= 40,
+      ("safety must not push past max_rows; got %d"):format(heights[1]))
+    require("mercury.notebook").detach(buf)
+    os.remove("/tmp/clamp.png")
+  end)
+end)
+
 describe(":NotebookKernelRestartClear from a fresh notebook", function()
   it("clears outputs even when the bridge has never started", function()
     Cfg.setup()

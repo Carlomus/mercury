@@ -933,7 +933,7 @@ updating this spec.
     which image `i` should anchor — and `ui.lua` threads that into
     `Image:render(..., { offsets = ... })`.
 
-    Two failure modes from a previous interleave attempt are guarded
+    Three failure modes from a previous interleave attempt are guarded
     against:
 
     * **Blank rows must not be truncated.** `max_preview_lines` cap
@@ -943,16 +943,29 @@ updating this spec.
       over the next cell. The `… N hidden` marker only counts hidden
       TEXT rows.
 
+    * **Per-image height absorbs any image.nvim drift.** The terminal's
+      runtime cell pixel size (queried at image.nvim startup) often
+      differs from Mercury's config defaults (8×16). When the
+      difference goes against us, image.nvim renders MORE rows than
+      our `image_row_height` predicts and the image bleeds into
+      whatever is below — even for intermediate images, where the
+      last-image-only safety net doesn't apply. Two layered fixes:
+      (1) `compute_dimensions` tries `require("image.utils.term")` for
+      the runtime cell pixel size and uses those values when
+      available, so the row math matches image.nvim's actual rendering;
+      (2) every image's reserved height gets a `+1` safety row,
+      clamped to `image_max_height_rows`, so any remaining sub-cell
+      mismatch stays inside the image's own reservation.
+
     * **The last image carries `with_virtual_padding = true`** as a
-      safety net against any divergence between our row-height math
-      (uses `cell_width_px` / `cell_height_px` from config) and
-      image.nvim's actual rendered height (which depends on the
-      terminal's runtime cell pixel size). image.nvim's reservation =
+      final safety net. image.nvim's reservation =
       `render_offset_top + rendered_height` for the last image, so
       whatever extra rows image.nvim's actual rendering needs are
-      added on top of Mercury's own blank-row reservation. Some
-      over-reservation is the price; an image painting over the next
-      cell is worse.
+      added on top of Mercury's own blank-row reservation. Combined
+      with the per-image +1 safety row and runtime cell-pixel query,
+      it's now overkill for typical cells — but the cost is a small
+      amount of blank space at the bottom, and the bound on the
+      failure mode is what matters.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
