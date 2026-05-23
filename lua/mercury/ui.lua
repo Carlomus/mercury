@@ -160,16 +160,29 @@ function Renderer:render()
   -- deleted cells leak live images that linger in the terminal.
   local present = {}
   for _, c in ipairs(nb.cells) do present[c.id] = true end
+  -- `_marks[cell_id]` is a LIST of extmark ids per cell (one per text /
+  -- image segment) under the multi-extmark layout. Delete every extmark
+  -- attached to a vanished cell so its virt_lines / image placements
+  -- can't survive past the cell deletion.
   if self._marks then
     local ns_out = Notebook.ns(NS_OUTPUT)
-    for id, mark_id in pairs(self._marks) do
+    for id, mark_list in pairs(self._marks) do
       if not present[id] then
-        pcall(vim.api.nvim_buf_del_extmark, buf, ns_out, mark_id)
+        for _, mark_id in ipairs(mark_list) do
+          pcall(vim.api.nvim_buf_del_extmark, buf, ns_out, mark_id)
+        end
         self._marks[id] = nil
       end
     end
   end
   if self.image and self.image.gc then self.image:gc(present) end
+end
+
+local function _delete_marks(buf, ns_out, mark_list)
+  if not mark_list then return end
+  for _, mark_id in ipairs(mark_list) do
+    pcall(vim.api.nvim_buf_del_extmark, buf, ns_out, mark_id)
+  end
 end
 
 function Renderer:render_cell_output(cell)
@@ -179,29 +192,27 @@ function Renderer:render_cell_output(cell)
   local ns_out = Notebook.ns(NS_OUTPUT)
   local cfg = Cfg.get().output
 
-  -- No output? Make sure we removed any prior decoration / images.
+  self._marks = self._marks or {}
+  -- Multi-extmark layout: every render replaces ALL prior extmarks for
+  -- this cell because the segment boundaries (and therefore the count
+  -- and content of extmarks) may have shifted. Trying to reuse extmark
+  -- ids while changing virt_lines would leave stale rows when segments
+  -- shrink.
+  _delete_marks(buf, ns_out, self._marks[cell.id])
+  self._marks[cell.id] = nil
+
+  -- No output? Done — extmarks cleared above; clear any images too.
   if not out or (out.status == "idle" and #(out.items or {}) == 0) then
-    -- Clear any prior extmark for this cell by scanning and re-creating? We
-    -- track per-cell extmark id ourselves.
-    if self["_marks"] and self._marks[cell.id] then
-      pcall(vim.api.nvim_buf_del_extmark, buf, ns_out, self._marks[cell.id])
-      self._marks[cell.id] = nil
-    end
     self.image:clear_cell(cell)
     return
   end
 
   local collapsed = (out._collapsed == true)
 
-  -- Extract images BEFORE build_virt_lines so we can mark output items whose
-  -- cached bytes vanished between extract and render. build_virt_lines reads
-  -- `item._mercury_image_unavailable` to surface a "[mime: image bytes
-  -- unavailable; re-execute the cell]" placeholder line on the virt_lines
-  -- side — without this pre-check, the placeholder would never appear
-  -- because image:render runs AFTER build_virt_lines in the original order
-  -- and the flag would be set too late to affect this render pass.
+  -- Extract images so build_virt_segments knows which item produced
+  -- which image (by walk order). Mark unavailable items so the segment
+  -- builder substitutes a diagnostic line instead of leaving a hole.
   local images
-  local image_heights
   if not collapsed and Image.available() then
     images = Output.extract_images(out)
     for _, item in ipairs(out.items or {}) do
@@ -213,22 +224,10 @@ function Renderer:render_cell_output(cell)
         out.items[img.item_index]._mercury_image_unavailable = true
       end
     end
-    -- Pre-compute per-image row counts so build_virt_lines can interleave
-    -- N+1 blank rows at each image's item position (preserving
-    -- text-image-text order end-to-end), and image:render can place each
-    -- image at the matching offset.
-    if self.image and self.image.compute_dimensions and #images > 0 then
-      _, image_heights = self.image:compute_dimensions(images)
-    end
   end
 
-  -- Compute the cell's position in the kernel queue (1-based) so the pill
-  -- can render `⏸ queued #N`. Searching the queue on every render is fine —
-  -- the queue is bounded by the number of cells the user has fired off and
-  -- render_cell_output runs at one tick per coalesce window (SPEC Invariant
-  -- 7). Storing the position on `out` instead would force re-walking all
-  -- queued cells on every enqueue/pop just to keep the index field current,
-  -- so this stays a derived value.
+  -- Queue position for `⏸ queued #N`. Derived per render so an
+  -- enqueue/pop elsewhere updates this cell's pill on the next tick.
   local queue_pos
   if out.status == "queued" and nb.kernel and nb.kernel.queue then
     for i, task in ipairs(nb.kernel.queue) do
@@ -236,43 +235,72 @@ function Renderer:render_cell_output(cell)
     end
   end
 
-  local virt, image_offsets = Output.build_virt_lines(out, {
-    show_status_pill = cfg.show_status_pill,
-    max_preview_lines = collapsed and 0 or (cfg.max_preview_lines or 9999),
-    collapsed = collapsed,
-    queue_pos = queue_pos,
-    image_heights = image_heights,
-  })
-
   local anchor = nb:cell_anchor_row(cell)
-  self._marks = self._marks or {}
-  local mark_id = self._marks[cell.id]
-  local opts = {
-    virt_lines = virt,
-    virt_lines_above = false,
-    hl_mode = "combine",
-    right_gravity = false,
-  }
-  if mark_id then opts.id = mark_id end
-  self._marks[cell.id] = vim.api.nvim_buf_set_extmark(buf, ns_out, anchor, 0, opts)
+  local mark_list = {}
+  self._marks[cell.id] = mark_list
 
-  if not collapsed then
-    if images then
-      -- Interleave layout: build_virt_lines reserved N+1 blank rows
-      -- (marked _image_blank, so cap-exempt) at each image's item
-      -- position, and image_offsets[i] is the matching row offset for
-      -- image i. image:render anchors each image into those blanks; the
-      -- LAST image still gets `with_virtual_padding = true` so image.nvim
-      -- reserves whatever extra rows it actually needs — safety net
-      -- against any divergence between our row math and image.nvim's
-      -- runtime cell-size measurement.
-      self.image:render(cell, anchor, images, {
-        offsets = image_offsets,
-      })
-    else
-      self.image:clear_cell(cell)
-    end
+  -- Multi-extmark pipeline. Each text segment gets its own extmark with
+  -- a virt_lines list of just that segment's rows. Each image segment
+  -- calls render_one, which creates an image.nvim extmark with
+  -- with_virtual_padding=true so image.nvim owns the row reservation
+  -- for that image. All extmarks anchor at the same row (cell.body_end)
+  -- and stack their virt_lines in CREATION ORDER, which gives us
+  -- document order — without Mercury having to predict image.nvim's
+  -- actual rendered height.
+  local segments
+  if collapsed then
+    -- Collapsed output: one text segment, no images. build_virt_segments
+    -- returns the collapsed marker as a single text segment.
+    segments = Output.build_virt_segments(out, {
+      show_status_pill = cfg.show_status_pill,
+      collapsed = true,
+      queue_pos = queue_pos,
+    })
   else
+    segments = Output.build_virt_segments(out, {
+      show_status_pill = cfg.show_status_pill,
+      queue_pos = queue_pos,
+    })
+  end
+
+  for _, seg in ipairs(segments) do
+    if seg.kind == "text" and seg.lines and #seg.lines > 0 then
+      local mark_id = vim.api.nvim_buf_set_extmark(buf, ns_out, anchor, 0, {
+        virt_lines = seg.lines,
+        virt_lines_above = false,
+        hl_mode = "combine",
+        right_gravity = false,
+      })
+      mark_list[#mark_list + 1] = mark_id
+    elseif seg.kind == "image" and not collapsed and images then
+      local img = images[seg.index]
+      if img then
+        -- The slot_index keeps each image's extmark column distinct so
+        -- two adjacent images don't collide. Use the segment's index in
+        -- extract_images order, not the segment list index — that way
+        -- the cache key stays stable across re-renders.
+        self.image:render_one(cell, anchor, img, seg.index)
+      end
+    end
+  end
+
+  -- Drop image cache entries for hashes no longer in this render. Avoids
+  -- ghost placements when a cell re-executes and produces different
+  -- images.
+  if not collapsed and images then
+    local present_hashes = {}
+    for _, img in ipairs(images) do present_hashes[img.hash] = true end
+    local entry = self.image.cache[cell.id]
+    if entry and entry.handles then
+      for hash, h in pairs(entry.handles) do
+        if not present_hashes[hash] then
+          pcall(function() if h.clear then h:clear() end end)
+          entry.handles[hash] = nil
+          if entry.placements then entry.placements[hash] = nil end
+        end
+      end
+    end
+  elseif collapsed or not images then
     self.image:clear_cell(cell)
   end
 end

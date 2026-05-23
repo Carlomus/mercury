@@ -165,12 +165,14 @@ describe("image rendering — explicit height + tab re-render", function()
     assert.is_true(rows >= 1 and rows <= 40)
   end)
 
-  it("re-paints cached handles on every render (idempotent re-paint on tab return)", function()
-    -- The bug: switch tab, come back, image is gone. Root cause: image.nvim's
-    -- terminal-side placement is dropped when the tab leaves, but Mercury's
-    -- cached handle survives in Lua. With the fix, every render() call
-    -- through this path calls `handle:render()` again — cheap, idempotent,
-    -- and brings the image back.
+  it("force_invalidate_all drops cached handles for the next render", function()
+    -- Tab-switch / window-revisit recovery path. The previous design
+    -- called handle:render() on cache hits to repaint, but some
+    -- image.nvim versions treated repeated render() as new placements
+    -- and rendered the image twice. Multi-extmark layout now relies on
+    -- `force_invalidate_all` (invoked from BufWinEnter / TabEnter etc.)
+    -- to drop the cached handles so the next render creates fresh ones,
+    -- giving a clean redraw without duplicate placements.
     local Image = require("mercury.image")
     Util.write_file("/tmp/tabretab.png", fake_png(200, 100))
     local buf = vim.api.nvim_create_buf(false, true)
@@ -185,22 +187,24 @@ describe("image rendering — explicit height + tab re-render", function()
 
     renderer:render(nb.cells[1], anchor, imgs)
     assert.equals(1, #recorded)
+
+    -- Second render with the same opts is a cache hit — from_file is
+    -- NOT called again, and crucially handle:render() is NOT called
+    -- again either (the duplicate-render bug).
+    renderer:render(nb.cells[1], anchor, imgs)
+    assert.equals(1, #recorded)
     assert.equals(1, fake_handle_renders[1],
-      "first render: handle:render must be called once")
+      "cache hit must not re-call render() on the handle")
 
-    -- Second render — same placement, same content. Pre-fix this was a
-    -- pure cache hit with NO re-paint. Now we must see another render
-    -- call so terminals that lost the placement get it back.
+    -- force_invalidate_all drops the cached handle so the next render
+    -- creates a fresh one.
+    renderer:force_invalidate_all()
     renderer:render(nb.cells[1], anchor, imgs)
-    -- from_file is NOT called a second time (cache hit on hash+placement).
-    assert.equals(1, #recorded)
-    assert.equals(2, fake_handle_renders[1],
-      "second render: cached handle must be re-painted via handle:render")
-
-    -- Third render: still cheap, still re-paints.
-    renderer:render(nb.cells[1], anchor, imgs)
-    assert.equals(1, #recorded)
-    assert.equals(3, fake_handle_renders[1])
+    assert.equals(2, #recorded,
+      "after force_invalidate_all, next render must call from_file again")
+    -- The new placement gets a fresh _id (2) and its own render counter.
+    assert.equals(1, fake_handle_renders[2],
+      "fresh from_file means a fresh handle with render() called once")
 
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/tabretab.png")

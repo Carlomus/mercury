@@ -186,42 +186,12 @@ describe("ui shifts images below text via layout.text_offset", function()
     package.loaded["mercury.image"] = nil
   end)
 
-  it("first image's render_offset_top >= #text_virt_lines (no pill overlap)", function()
-    local Util = require("mercury.util")
-    local UI = require("mercury.ui")
-    Util.write_file("/tmp/sa.png", fake_png(400, 300))
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-      "# %% id=shftbelow", "x = 1",
-    })
-    vim.api.nvim_set_current_buf(buf)
-    local nb = Notebook.attach(buf); nb:rescan()
-    nb:set_renderer(UI.new(nb))
-    local out = nb:ensure_output(nb.cells[1].id)
-    out.status = "ok"
-    out.exec_count = 1
-    out.ms = 42
-    out.items = {
-      { type = "display_data", data = { ["image/png"] = "x" } },
-    }
-    local orig = require("mercury.output").extract_images
-    require("mercury.output").extract_images = function()
-      return { { kind = "png", path = "/tmp/sa.png", hash = "sa", item_index = 1 } }
-    end
-    nb._renderer:render()
-    require("mercury.output").extract_images = orig
-
-    assert.equals(1, #recorded)
-    -- A pill is rendered (Out[1] line) so #text_virt_lines >= 1. The
-    -- image's render_offset_top must be at least that.
-    assert.is_true(recorded[1].opts.render_offset_top >= 1,
-      ("first image offset must be >= text rows; got %d")
-        :format(recorded[1].opts.render_offset_top))
-    Notebook.detach(buf)
-    os.remove("/tmp/sa.png")
-  end)
-
-  it("last image gets with_virtual_padding=true (reserves the stack)", function()
+  it("every image gets with_virtual_padding=true under the multi-extmark layout", function()
+    -- Multi-extmark layout: each image has its OWN extmark with
+    -- virtual_padding=true so image.nvim owns the row reservation per
+    -- image. Render order = creation order = document order, so the
+    -- pill text from the preceding text-segment extmark appears ABOVE
+    -- each image without any row-math on Mercury's side.
     local Util = require("mercury.util")
     local UI = require("mercury.ui")
     Util.write_file("/tmp/vpa.png", fake_png(400, 200))
@@ -251,13 +221,14 @@ describe("ui shifts images below text via layout.text_offset", function()
     Output_mod.extract_images = orig
 
     assert.equals(2, #recorded)
-    -- First image: padding off (it's not the last).
-    assert.is_false(recorded[1].opts.with_virtual_padding)
-    -- Last image: padding on so image.nvim reserves enough rows.
+    -- Both images get virtual_padding=true (each owns its own extmark
+    -- and image.nvim's reservation).
+    assert.is_true(recorded[1].opts.with_virtual_padding)
     assert.is_true(recorded[2].opts.with_virtual_padding)
-    -- Second image's offset > first image's, ensures stacking order.
-    assert.is_true(recorded[2].opts.render_offset_top
-                   > recorded[1].opts.render_offset_top)
+    -- render_offset_top is 0 for each — vertical positioning comes from
+    -- extmark stacking order, not from row math.
+    assert.equals(0, recorded[1].opts.render_offset_top)
+    assert.equals(0, recorded[2].opts.render_offset_top)
     Notebook.detach(buf)
     os.remove("/tmp/vpa.png"); os.remove("/tmp/vpb.png")
   end)

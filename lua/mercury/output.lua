@@ -402,6 +402,178 @@ function M.build_virt_lines(out, opts)
   return lines, image_offsets
 end
 
+-- Walk `out.items` in order and return a list of ordered SEGMENTS, used by
+-- the multi-extmark rendering path in ui.lua:
+--
+--   { kind = "text", lines = [virt_line, ...] }   — one or more text rows
+--   { kind = "image", index = N }                 — image at position N in
+--                                                   extract_images()'s walk
+--
+-- Each adjacent text segment is collapsed into one entry (so two streams
+-- in a row don't create two extmarks). The leading status pill, when
+-- emitted, is part of the first text segment.
+--
+-- Why segments instead of a flat virt_lines list: the previous design
+-- reserved blank rows for images and asked image.nvim to render INTO
+-- those blanks via `render_offset_top`. Any mismatch between our row
+-- math and image.nvim's actual rendering bled into the row below — the
+-- "image overlaps text" bug — even with safety margins. By creating a
+-- separate extmark per image (with `with_virtual_padding = true`),
+-- image.nvim owns the row reservation for each image entirely, so the
+-- math doesn't have to match anything. Extmarks at the same buffer row
+-- stack their virt_lines in creation order, which is document order.
+function M.build_virt_segments(out, opts)
+  opts = opts or {}
+  local segments = {}
+  -- The pill is part of the first text segment (or stands alone if the
+  -- first item is an image).
+  local pill_lines = {}
+  if opts.show_status_pill ~= false then
+    local status = STATUS_TEXT[out.status] or STATUS_TEXT.idle
+    local pill = {}
+    if out.status == "running" then
+      pill[#pill + 1] = { "⏳ running…", status.hl }
+    elseif out.status == "queued" then
+      if opts.queue_pos and opts.queue_pos > 0 then
+        pill[#pill + 1] = {
+          ("⏸ queued #%d"):format(opts.queue_pos), status.hl,
+        }
+      else
+        pill[#pill + 1] = { "⏸ queued", status.hl }
+      end
+    elseif out.status == "killed" then
+      pill[#pill + 1] = { "󱚢 killed", status.hl }
+    elseif out.status == "ok" or out.status == "error" or out.status == "idle" then
+      local glyph = status.glyph
+      local nstr = out.exec_count and ("[" .. tostring(out.exec_count) .. "]") or ""
+      local mstr = (out.ms and out.ms > 0) and (" " .. tostring(out.ms) .. " ms") or ""
+      local gstr = (glyph and glyph ~= "") and (" " .. glyph) or ""
+      if not (out.status == "idle" and nstr == "" and mstr == "") then
+        pill[#pill + 1] = {
+          ("▶ Out%s%s%s"):format(nstr, mstr, gstr),
+          status.hl,
+        }
+      end
+    end
+    if #pill > 0 then pill_lines[#pill_lines + 1] = pill end
+  end
+
+  if opts.collapsed then
+    -- Collapsed mode: one segment, no images.
+    local collapsed_lines = { pill_lines[1] }
+    collapsed_lines[#collapsed_lines + 1] = { { "  …  output collapsed", "Comment" } }
+    segments[#segments + 1] = { kind = "text", lines = collapsed_lines }
+    return segments
+  end
+
+  -- Item walk. `cur` is the in-progress text segment; flushed when we hit
+  -- an image item or run out of items. Pill seeds the first segment.
+  local cur = {}
+  for _, line in ipairs(pill_lines) do cur[#cur + 1] = line end
+
+  local function flush_text()
+    if #cur > 0 then
+      segments[#segments + 1] = { kind = "text", lines = cur }
+      cur = {}
+    end
+  end
+
+  -- Same stream-merging as build_virt_lines so visual stream blocks match.
+  local items = {}
+  for _, item in ipairs(out.items or {}) do
+    if item.type == "stream" then
+      local prev = items[#items]
+      if prev and prev.type == "stream" and prev.name == (item.name or "stdout") then
+        prev.text = (prev.text or "") .. (item.text or "")
+      else
+        items[#items + 1] = {
+          type = "stream", name = item.name or "stdout", text = item.text or "",
+        }
+      end
+    else
+      items[#items + 1] = item
+    end
+  end
+
+  local function latex_renders(src)
+    local ok, Latex = pcall(require, "mercury.latex")
+    if not ok or not Latex.available() then return false end
+    return Latex.rasterize(src) ~= nil
+  end
+
+  local image_idx = 0
+  for _, item in ipairs(items) do
+    if item.type == "stream" then
+      local text = item.text or ""
+      text = Ansi.strip(text)
+      local hl = item.name == "stderr" and "ErrorMsg" or "Comment"
+      for _, ln in ipairs(Util.split_lines(text)) do
+        cur[#cur + 1] = { { ln, hl } }
+      end
+    elseif item.type == "error" then
+      cur[#cur + 1] = {
+        { ("%s: %s"):format(item.ename or "Error", item.evalue or ""), "ErrorMsg" },
+      }
+      for _, tb in ipairs(item.traceback or {}) do
+        for _, ln in ipairs(Util.split_lines(Ansi.strip(tb))) do
+          cur[#cur + 1] = { { ln, "ErrorMsg" } }
+        end
+      end
+    elseif item.type == "display_data" or item.type == "execute_result" then
+      local mime = pick_mime(item.data)
+      if not mime then
+        cur[#cur + 1] = { { "[empty output]", "Comment" } }
+      elseif mime == WIDGET_MIME then
+        cur[#cur + 1] = { { "[widget unsupported]", "Comment" } }
+      elseif mime == "image/png" or mime == "image/jpeg" or mime == "image/svg+xml" then
+        image_idx = image_idx + 1
+        local image_ok, Image = pcall(require, "mercury.image")
+        if not image_ok or not Image.available() then
+          cur[#cur + 1] = { { ("[%s]"):format(mime), "Comment" } }
+        elseif item._mercury_image_unavailable then
+          cur[#cur + 1] = {
+            { "[image bytes unavailable — re-execute the cell]", "Comment" },
+          }
+        else
+          -- Flush any text accumulated above, emit the image segment,
+          -- then continue collecting text below.
+          flush_text()
+          segments[#segments + 1] = { kind = "image", index = image_idx }
+        end
+      elseif mime == "text/html" then
+        local txt = html_to_text(_value_to_string(item.data["text/html"]))
+        for _, ln in ipairs(Util.split_lines(txt)) do
+          cur[#cur + 1] = { { ln, "Comment" } }
+        end
+      elseif mime == "text/latex" then
+        if latex_renders(item.data[mime]) then
+          cur[#cur + 1] = { { "[text/latex (rendered below)]", "Comment" } }
+        else
+          for _, ln in ipairs(Util.split_lines(_value_to_string(item.data[mime]))) do
+            cur[#cur + 1] = { { ln, "Special" } }
+          end
+        end
+      elseif mime == "text/markdown" then
+        local MdOut = require("mercury.markdown_out")
+        local md_chunks = MdOut.chunks(_value_to_string(item.data[mime]))
+        if #md_chunks == 0 then
+          cur[#cur + 1] = { { "", "MercuryMarkdownOut" } }
+        else
+          for _, line_chunks in ipairs(md_chunks) do
+            cur[#cur + 1] = line_chunks
+          end
+        end
+      else
+        for _, ln in ipairs(Util.split_lines(_value_to_string(item.data[mime]))) do
+          cur[#cur + 1] = { { ln, "Comment" } }
+        end
+      end
+    end
+  end
+  flush_text()
+  return segments
+end
+
 -- Get just the plain text of an output (for copy / scratch view). The
 -- surface here MUST mirror what `build_virt_lines` shows on screen —
 -- including the status pill, [empty output] placeholders, and the

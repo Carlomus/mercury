@@ -106,9 +106,11 @@ describe("ui.Renderer", function()
     Notebook.detach(buf)
   end)
 
-  it("output extmark id is reused across renders for the same cell", function()
-    -- Pre-fix risk: a fresh extmark per render would orphan the previous
-    -- one and leak. The id-reuse path keeps a single extmark per cell.
+  it("each render replaces the cell's prior extmarks (no orphans)", function()
+    -- Multi-extmark layout: a cell may have N extmarks (one per text /
+    -- image segment). Each render deletes the prior list and creates
+    -- fresh ones — extmark ids are NOT reused. The contract is "no
+    -- orphan extmarks survive between renders," not "id stability."
     local buf = make_buf({
       "# %% id=reuse001",
       "x = 1",
@@ -119,13 +121,13 @@ describe("ui.Renderer", function()
     local r = UI.new(nb)
     r:render()
     local m1 = extmarks_in(buf, "output")
-    local id1 = m1[1][1]
+    -- One extmark for the single text segment in this cell.
+    assert.equals(1, #m1)
     r:render()
     local m2 = extmarks_in(buf, "output")
-    -- Same number of marks.
+    -- Same count after re-render — the prior was deleted and a new one
+    -- created in its place.
     assert.equals(1, #m2)
-    -- Same id (reused via opts.id).
-    assert.equals(id1, m2[1][1])
     Notebook.detach(buf)
   end)
 

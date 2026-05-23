@@ -268,11 +268,12 @@ function Renderer:render(cell, anchor_row, images, layout)
           entry.handles[img.hash] = nil
           entry.placements[img.hash] = nil
         end
-      else
-        -- Re-paint cached handle so a tab-switch round-trip gets the image
-        -- back. Idempotent + cheap (no disk read).
-        pcall(function() if handle.render then handle:render() end end)
       end
+      -- Cache hit: do NOT re-call render() — image.nvim treats some
+      -- repeated render() invocations as additional placements rather
+      -- than a refresh, which caused the "single image shows up twice"
+      -- regression. Tab-switch / window-revisit invalidation happens
+      -- via force_invalidate_* in the autocmd path.
     end
     -- 1-row visual gap row between consecutive RENDERED images. Skip the
     -- gap on unavailable images (nothing was drawn — gap would be a row
@@ -290,6 +291,88 @@ function Renderer:render(cell, anchor_row, images, layout)
 
   self.cache[cell.id] = entry
   return cumulative
+end
+
+-- Place a single image at the cell anchor. Used by the multi-extmark
+-- pipeline in ui.lua, which calls render_one in document order between
+-- text-segment extmarks. Each image owns its own extmark via
+-- `with_virtual_padding = true` — image.nvim creates the virt_lines
+-- reservation matching its actual rendered height, so any divergence
+-- between Mercury's row math and image.nvim's terminal-side rendering
+-- is contained inside image.nvim's own reservation. Row counts cannot
+-- get out of sync because Mercury never computes one for this image.
+--
+-- Returns the (possibly new) image.nvim handle so the caller can track
+-- it for GC. Caching is per-image (by content hash), shared with
+-- `render()` — repeated render_one calls with the same hash + window
+-- skip re-creating the handle.
+function Renderer:render_one(cell, anchor_row, img, slot_index)
+  local mod = api()
+  if not mod then return nil end
+  if not img or img.unavailable then return nil end
+  local win = self:_visible_window()
+  if not win then return nil end
+
+  -- Compute width on the fly (cheap — just IHDR / SVG dim parse). We
+  -- DELIBERATELY don't pass `height` to image.nvim; image.nvim derives
+  -- it from the on-disk pixel dimensions and its own runtime cell-size
+  -- measurement, which is what we want for correct vertical reservation.
+  local widths = self:compute_dimensions({ img })
+  local entry = self.cache[cell.id] or { handles = {}, placements = {} }
+  entry.placements = entry.placements or {}
+
+  local opts = {
+    buffer = self.notebook.buf,
+    window = win,
+    inline = true,
+    with_virtual_padding = true,        -- image.nvim owns reservation
+    x = (slot_index or 1) - 1,
+    y = anchor_row,
+    width = widths[1],
+    -- No render_offset_top: each image lives in its own extmark, and
+    -- extmark virt_lines from prior segments (other images, text) at
+    -- the same anchor row stack BEFORE this one in creation order.
+    -- That is what produces document-order layout — not row math.
+    render_offset_top = 0,
+  }
+
+  local handle = entry.handles[img.hash]
+  local prev = entry.placements[img.hash]
+  if not (handle and same_placement(prev, opts)) then
+    if handle and handle.clear then pcall(function() handle:clear() end) end
+    local ok, h = pcall(mod.from_file, img.path, opts)
+    if ok and h then
+      pcall(function() h:render() end)
+      entry.handles[img.hash] = h
+      entry.placements[img.hash] = opts
+      handle = h
+    else
+      entry.handles[img.hash] = nil
+      entry.placements[img.hash] = nil
+      handle = nil
+    end
+  end
+  -- IMPORTANT: do NOT re-call render() on a cache hit. Some image.nvim
+  -- versions treat repeated render() calls as new placements rather than
+  -- a refresh — that's what caused the "single image shows up twice"
+  -- regression. Tab-switch invalidation is handled by `force_invalidate`
+  -- being called from the autocmd path before the next render() pass.
+  self.cache[cell.id] = entry
+  return handle
+end
+
+-- Force-clear all cached handles for a cell so the next render() /
+-- render_one() pass creates fresh placements. Called from BufWinEnter /
+-- TabEnter / WinEnter / VimResized in init.lua: those events can leave
+-- image.nvim's terminal state out of sync with its cached handles
+-- (typically: tab moved away and back), and the safe recovery is to
+-- redraw from scratch rather than calling render() on stale handles.
+function Renderer:force_invalidate_cell(cell_id)
+  self:_clear_handles(cell_id)
+end
+
+function Renderer:force_invalidate_all()
+  for id, _ in pairs(self.cache) do self:_clear_handles(id) end
 end
 
 return M

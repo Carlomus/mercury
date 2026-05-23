@@ -919,53 +919,58 @@ updating this spec.
     (`y/x/width/render_offset_top/with_virtual_padding/window`), which
     is enough to detect window resizes and tab moves.
 
-    **Layout: text and images interleaved per item order.** The
+    **Multi-extmark layout: every image owns its own extmark.** The
     pipeline mirrors JupyterLab / VS Code notebook semantics — an
     `[image, stream, image]` output renders visually as image-then-
-    text-then-image, not "all text then all images stacked."
-    `Image:compute_dimensions` returns per-image row heights;
-    `Output.build_virt_lines(out, { image_heights = h })` walks items
-    in order, emitting text rows where the item is text and reserving
-    `h[i] + 1` blank rows where the item is an image (the +1 is a
-    visual gap so consecutive images / following text don't touch).
-    Each blank row's index is recorded in a `body_blank[]` parallel
-    array. The function also returns `image_offsets[i]` — the row at
-    which image `i` should anchor — and `ui.lua` threads that into
-    `Image:render(..., { offsets = ... })`.
+    text-then-image. `Output.build_virt_segments(out, opts)` walks
+    `out.items` in order and returns a list of ordered segments:
+    `{ kind = "text", lines = [...] }` or `{ kind = "image", index = N }`.
+    Adjacent text items collapse into one text segment.
 
-    Three failure modes from a previous interleave attempt are guarded
-    against:
+    `ui.lua` iterates the segments in order. For text segments it
+    creates a buf-local extmark at `cell.body_end` with the segment's
+    `virt_lines`. For image segments it calls `Image:render_one`,
+    which creates an image.nvim placement with `with_virtual_padding =
+    true` — image.nvim then creates ITS own extmark with virt_lines
+    matching the image's actual rendered height. All extmarks (text
+    + image) anchor at the same buffer row and stack their virt_lines
+    in CREATION order, which is document order.
 
-    * **Blank rows must not be truncated.** `max_preview_lines` cap
-      applies only to TEXT body rows; image-blank rows (the ones in
-      `body_blank`) ALWAYS emit, regardless of cap. Truncating them
-      would let the image render past Mercury's reservation and paint
-      over the next cell. The `… N hidden` marker only counts hidden
-      TEXT rows.
+    This is the third (and final) iteration of the image-layout design,
+    motivated by failure modes the previous designs all shared:
 
-    * **Per-image height absorbs any image.nvim drift.** The terminal's
-      runtime cell pixel size (queried at image.nvim startup) often
-      differs from Mercury's config defaults (8×16). When the
-      difference goes against us, image.nvim renders MORE rows than
-      our `image_row_height` predicts and the image bleeds into
-      whatever is below — even for intermediate images, where the
-      last-image-only safety net doesn't apply. Two layered fixes:
-      (1) `compute_dimensions` tries `require("image.utils.term")` for
-      the runtime cell pixel size and uses those values when
-      available, so the row math matches image.nvim's actual rendering;
-      (2) every image's reserved height gets a `+1` safety row,
-      clamped to `image_max_height_rows`, so any remaining sub-cell
-      mismatch stays inside the image's own reservation.
+    * **No row-math reservation.** Earlier designs reserved blank
+      virt_lines for each image based on Mercury's `image_row_height`
+      computation. Any divergence between that math and image.nvim's
+      actual rendered height (which depends on the terminal's runtime
+      cell pixel size, queried at image.nvim startup) bled into the
+      row below — the "image overlaps text" bug. Multi-extmark
+      delegates ALL row reservation to image.nvim per image, so
+      Mercury never computes a count that has to match anything.
 
-    * **The last image carries `with_virtual_padding = true`** as a
-      final safety net. image.nvim's reservation =
-      `render_offset_top + rendered_height` for the last image, so
-      whatever extra rows image.nvim's actual rendering needs are
-      added on top of Mercury's own blank-row reservation. Combined
-      with the per-image +1 safety row and runtime cell-pixel query,
-      it's now overkill for typical cells — but the cost is a small
-      amount of blank space at the bottom, and the bound on the
-      failure mode is what matters.
+    * **No `handle:render()` on cache hits.** A previous "tab-switch
+      recovery" patch called `handle:render()` again on every cache
+      hit so terminals that lost the placement got it back. Some
+      image.nvim versions treated repeated `render()` as a SECOND
+      placement rather than a refresh, producing the "single image
+      shows up twice" bug. Multi-extmark + `force_invalidate_all`
+      (called from `BufWinEnter` / `TabEnter` / `WinEnter` /
+      `VimResized`) gives the same recovery without the duplicate:
+      invalidate the cache → next render creates fresh handles.
+
+    The legacy single-extmark `Image:render` path (with cumulative
+    offsets + last-image `with_virtual_padding`) is still present for
+    direct callers and unit tests that don't go through
+    `build_virt_segments`. New code should always use the
+    `build_virt_segments` + `Image:render_one` pair via `ui.lua`.
+
+    Per-cell extmark bookkeeping: `Renderer:render_cell_output` stores
+    a LIST of extmark ids in `self._marks[cell.id]` (one per text
+    segment; image extmarks live inside image.nvim's cache). Each
+    render call deletes the prior list and creates fresh ids, since
+    segment boundaries can shift across renders. Orphan extmarks for
+    cells removed from `nb.cells` are deleted by the top-level GC pass
+    in `Renderer:render`.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

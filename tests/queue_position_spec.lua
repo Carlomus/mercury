@@ -55,10 +55,11 @@ describe("queue position indicator", function()
     assert.is_nil(lines[1]:match("#"))
   end)
 
-  -- End-to-end: ui.render_cell_output threads kernel.queue position through
-  -- to build_virt_lines. We bypass image.nvim with a stub so the test
-  -- doesn't hit the inline-image path.
-  it("ui.render passes the cell's queue index through to build_virt_lines", function()
+  -- End-to-end: ui.render_cell_output threads kernel.queue position
+  -- through to build_virt_segments (the multi-extmark pipeline's
+  -- segment builder). We intercept that and verify each queued cell
+  -- sees its 1-based slot.
+  it("ui.render passes the cell's queue index through to build_virt_segments", function()
     package.loaded["image"] = {
       is_enabled = function() return false end,
       from_file = function() return {} end,
@@ -77,7 +78,6 @@ describe("queue position indicator", function()
     local nb = Notebook.attach(buf); nb:rescan()
     nb:set_renderer(UI.new(nb))
 
-    -- Fake a kernel running cell #1 with cells #2 and #3 queued.
     nb:set_kernel({
       running = { cell_id = "qfirst11" },
       queue = {
@@ -85,16 +85,12 @@ describe("queue position indicator", function()
         { cell_id = "qthird11", code = "" },
       },
     })
-    -- Mark statuses so build_virt_lines exercises the queued branch.
     nb:ensure_output("qsecond1").status = "queued"
     nb:ensure_output("qthird11").status = "queued"
 
-    -- Intercept build_virt_lines to capture the opts table the UI passes.
     local seen_opts_by_cell = {}
-    local orig = Output.build_virt_lines
-    Output.build_virt_lines = function(out, opts)
-      -- Match the cell by output identity — opts has no cell_id, but we
-      -- can correlate via out (the side-table entry is unique per cell).
+    local orig = Output.build_virt_segments
+    Output.build_virt_segments = function(out, opts)
       for cid, o in pairs(nb.outputs) do
         if o == out then
           seen_opts_by_cell[cid] = opts; break
@@ -103,7 +99,7 @@ describe("queue position indicator", function()
       return orig(out, opts)
     end
     nb._renderer:render()
-    Output.build_virt_lines = orig
+    Output.build_virt_segments = orig
 
     assert.equals(1, seen_opts_by_cell["qsecond1"].queue_pos)
     assert.equals(2, seen_opts_by_cell["qthird11"].queue_pos)

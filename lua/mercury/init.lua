@@ -183,24 +183,28 @@ local function attach_buffer(buf, opts)
 
   -- image.nvim's render path requires a window currently showing the buffer.
   -- Re-render on BufWinEnter so images reappear when the buffer is revealed
-  -- in a new window.
+  -- in a new window. Force-invalidate the image cache first so the next
+  -- render creates FRESH handles (the previous design's re-paint-on-cache-hit
+  -- caused some image.nvim versions to render the image twice — second
+  -- render() treated as an additional placement, not a refresh).
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = buf_aug,
     buffer = buf,
     callback = function()
-      if vim.api.nvim_buf_is_loaded(buf) then renderer:render() end
+      if not vim.api.nvim_buf_is_loaded(buf) then return end
+      if renderer.image and renderer.image.force_invalidate_all then
+        renderer.image:force_invalidate_all()
+      end
+      renderer:render()
     end,
   })
 
   -- Tab switches, window changes, and terminal resizes can leave image.nvim's
-  -- terminal-side placements stale even though the cached Lua handles
-  -- survive. These events aren't buffer-scoped (the user may have come from
-  -- a different file), so we register them globally on this buffer's
-  -- per-buffer augroup and check inside the callback that the buf is both
-  -- loaded and visible in some window before re-rendering. image.lua's
-  -- render path now re-paints reused handles via `handle:render()` on every
-  -- call, so triggering broadly here is cheap (no disk read, no decode).
-  -- Closes the "images vanish after switching tabs and coming back" bug.
+  -- terminal-side placements stale. These events aren't buffer-scoped, so
+  -- register them globally on this buffer's per-buffer augroup and check
+  -- inside the callback that the buf is loaded and visible before
+  -- re-rendering. Force-invalidate before render() so handles get
+  -- recreated cleanly.
   vim.api.nvim_create_autocmd({ "TabEnter", "WinEnter", "VimResized" }, {
     group = buf_aug,
     callback = function()
@@ -208,6 +212,9 @@ local function attach_buffer(buf, opts)
       if not vim.api.nvim_buf_is_loaded(buf) then return end
       local wins = vim.fn.win_findbuf(buf) or {}
       if #wins == 0 then return end
+      if renderer.image and renderer.image.force_invalidate_all then
+        renderer.image:force_invalidate_all()
+      end
       renderer:render()
     end,
   })
