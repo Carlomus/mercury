@@ -908,81 +908,101 @@ updating this spec.
     modal dialogs. `select_kernel` clears the declined map because the
     new python's deps state is the user's call again.
 
-75. **Only `width` is passed to `image.nvim`'s `from_file`.** Real
-    image.nvim builds render NOTHING when both `width` AND `height` are
-    forced via `from_file`. Mercury computes its own per-image row count
-    via `Output.image_row_height` and uses it for the cumulative
-    `render_offset_top` stack and the function's row-count return value,
-    but does NOT pass `height` to image.nvim itself — image.nvim derives
-    rows from on-disk pixel dimensions plus the terminal cell aspect.
-    `same_placement` compares the placement fields we actually pass
-    (`y/x/width/render_offset_top/with_virtual_padding/window`), which
-    is enough to detect window resizes and tab moves.
+75. **Image rendering — locked invariants.** This invariant exists
+    after three failed redesigns; future changes must satisfy all of
+    these or the cell becomes visually broken in one of the documented
+    ways. Each invariant has a single source of truth and a pin in
+    `tests/image_interleave_spec.lua`.
 
-    **Multi-extmark layout: every image owns its own extmark.** The
-    pipeline mirrors JupyterLab / VS Code notebook semantics — an
-    `[image, stream, image]` output renders visually as image-then-
-    text-then-image. `Output.build_virt_segments(out, opts)` walks
-    `out.items` in order and returns a list of ordered segments:
-    `{ kind = "text", lines = [...] }` or `{ kind = "image", index = N }`.
-    Adjacent text items collapse into one text segment.
+    **I1 — Image SIZE.** Render width in editor cells =
+    `min(floor(window_cols * 0.85), ceil(image_pixel_width / cell_width_px))`.
+    `cell_width_px` is the Mercury config default (8) — NOT queried
+    from image.nvim at runtime. Querying image.nvim returned values
+    larger than 8 on common terminals, which shrank images visibly;
+    users had configured around the 8-px assumption and the
+    "image looks much smaller" regression was real. Users on terminals
+    with materially different cell widths override via `setup()`.
 
-    `ui.lua` iterates the segments in order. For text segments it
-    creates a buf-local extmark at `cell.body_end` with the segment's
-    `virt_lines`. For image segments it calls `Image:render_one`,
-    which creates an image.nvim placement with `with_virtual_padding =
-    true` — image.nvim then creates ITS own extmark with virt_lines
-    matching the image's actual rendered height. All extmarks (text
-    + image) anchor at the same buffer row and stack their virt_lines
-    in CREATION order, which is document order.
+    **I2 — Document-order interleave.** Output items render top-to-
+    bottom in the order they appear in `out.items`. For
+    `[stream, image, stream, image]`, the visible cell is:
+    `pill → stream1 → image1 → stream2 → image2`. Notebook design
+    parity (JupyterLab / VS Code) is non-negotiable.
 
-    This is the third (and final) iteration of the image-layout design,
-    motivated by failure modes the previous designs all shared:
+    **I3 — No pill / text overlap.** The Out[N] pill renders above all
+    images. Text items emitted before an image render above that
+    image; text items emitted after render below that image.
 
-    * **No row-math reservation.** Earlier designs reserved blank
-      virt_lines for each image based on Mercury's `image_row_height`
-      computation. Any divergence between that math and image.nvim's
-      actual rendered height (which depends on the terminal's runtime
-      cell pixel size, queried at image.nvim startup) bled into the
-      row below — the "image overlaps text" bug. Multi-extmark
-      delegates ALL row reservation to image.nvim per image, so
-      Mercury never computes a count that has to match anything.
+    **I4 — No inter-image overlap.** Multiple images in one cell stack
+    vertically (cumulative `render_offset_top`), each fully visible,
+    separated by a 1-row visual gap.
 
-    * **No `handle:render()` on cache hits.** A previous "tab-switch
-      recovery" patch called `handle:render()` again on every cache
-      hit so terminals that lost the placement got it back. Some
-      image.nvim versions treated repeated `render()` as a SECOND
-      placement rather than a refresh, producing the "single image
-      shows up twice" bug. The current behavior: cached handles
-      survive cache hits with no further action — image.nvim's own
-      redraw machinery repaints them as the buffer scrolls or comes
-      back from hidden.
+    **I5 — No spill into the next cell.** The LAST image carries
+    `with_virtual_padding = true`. image.nvim's reservation
+    `= render_offset_top + rendered_height` then equals the full
+    stack height relative to the anchor, pushing the next cell clear
+    even when our row math underestimates.
 
-    * **`force_invalidate_all` is `VimResized`-only.** It was briefly
-      wired to `BufWinEnter` / `TabEnter` / `WinEnter` to "clean up
-      stale terminal state" on tab returns. That made things worse:
-      image.nvim's `clear()` doesn't fully tear down the terminal
-      placement on every version, so clear-then-recreate sometimes
-      left BOTH the old placement and the new one visible — the user
-      saw two slots per image and the active one changed with scroll.
-      The terminal pixel size doesn't actually change on those
-      events, so cached handles are already correct; the only event
-      that DOES require invalidation is `VimResized`, where the cell
-      pixel size genuinely changed.
+    **I6 — Per-image height safety margin.** Each image's reserved
+    virt_lines = `max(image_row_height + 3, ceil(image_row_height * 1.25))`
+    clamped to `image_max_height_rows`. This absorbs the divergence
+    between Mercury's static (8×16) cell-pixel assumption and
+    image.nvim's runtime terminal measurement, so even an
+    intermediate image (no `with_virtual_padding` backstop) can't
+    bleed into the row below it. Querying image.nvim's runtime cell
+    size to match exactly was tried and reverted — the API isn't
+    stable across versions and the width side-effect (I1) was worse
+    than the height precision gain.
 
-    The legacy single-extmark `Image:render` path (with cumulative
-    offsets + last-image `with_virtual_padding`) is still present for
-    direct callers and unit tests that don't go through
-    `build_virt_segments`. New code should always use the
-    `build_virt_segments` + `Image:render_one` pair via `ui.lua`.
+    **I7 — Image-blank rows bypass `max_preview_lines`.** Truncating a
+    cell to N lines must apply only to TEXT rows. Image-blank rows
+    are reservation, not preview content; truncating them lets
+    image.nvim render past Mercury's reservation and paint over the
+    next cell. The hidden-lines marker counts only suppressed text.
 
-    Per-cell extmark bookkeeping: `Renderer:render_cell_output` stores
-    a LIST of extmark ids in `self._marks[cell.id]` (one per text
-    segment; image extmarks live inside image.nvim's cache). Each
-    render call deletes the prior list and creates fresh ids, since
-    segment boundaries can shift across renders. Orphan extmarks for
-    cells removed from `nb.cells` are deleted by the top-level GC pass
-    in `Renderer:render`.
+    **I8 — Single extmark for the cell's virt_lines.** ONE extmark
+    per cell at `cell.body_end` carries pill + text + image-blank
+    rows in document order. Image placements live in a parallel
+    cache (managed by image.nvim) keyed by content hash. Multi-extmark
+    layouts (one extmark per text segment + one per image) were
+    tried twice and produced two distinct visual failure modes:
+    (a) image.nvim's `inline=true` anchored each image at the
+    extmark's buffer row regardless of `render_offset_top`, so every
+    image rendered at `cell.body_end` and stacked over the pill;
+    (b) `clear()` not fully tearing down image.nvim's terminal
+    placement on cache invalidation, producing duplicate "slots."
+    Single-extmark + cumulative offsets is the only configuration
+    that satisfies I2–I5 simultaneously.
+
+    **I9 — `with_virtual_padding = false` on non-last images.**
+    Combined with I8: image.nvim's per-image virtual padding would
+    stack additively with our single-extmark virt_lines, double-
+    reserving rows below every intermediate image. Only the last
+    image needs the backstop (I5).
+
+    **I10 — `same_placement` invalidation fields.** A cached
+    image.nvim handle is reused only when ALL of these match: window
+    id, anchor row (`y`), extmark column (`x`), width, render offset
+    top, and the virtual-padding flag. Anything else mutates → clear
+    + recreate via `from_file`. No `handle:render()` is called on a
+    cache hit; some image.nvim versions treat repeat `render()` as a
+    second placement, which previously produced the
+    "single image renders twice" regression.
+
+    **I11 — `force_invalidate_all` only fires on `VimResized`.** That
+    is the one event where the terminal's cell pixel dimensions
+    actually change, invalidating image.nvim's geometry. Wiring it to
+    `BufWinEnter` / `TabEnter` / `WinEnter` produced the duplicate-
+    placement bug under I10 — clear-then-recreate left both the old
+    and new placement visible. On those events Mercury just re-runs
+    the renderer; cached handles survive and image.nvim's own redraw
+    machinery repaints them.
+
+    **I12 — `height` is NOT passed to `image.nvim`'s `from_file`.**
+    Real image.nvim builds render nothing when both `width` and
+    `height` are forced. Only `width` is passed; image.nvim derives
+    height from the on-disk pixel dimensions plus its own terminal
+    cell-size measurement.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

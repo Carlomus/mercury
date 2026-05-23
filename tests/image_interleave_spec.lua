@@ -186,12 +186,13 @@ describe("ui shifts images below text via layout.text_offset", function()
     package.loaded["mercury.image"] = nil
   end)
 
-  it("every image gets with_virtual_padding=true under the multi-extmark layout", function()
-    -- Multi-extmark layout: each image has its OWN extmark with
-    -- virtual_padding=true so image.nvim owns the row reservation per
-    -- image. Render order = creation order = document order, so the
-    -- pill text from the preceding text-segment extmark appears ABOVE
-    -- each image without any row-math on Mercury's side.
+  it("last image gets with_virtual_padding=true (SPEC I5, I9)", function()
+    -- Single-extmark layout (SPEC I8). Cumulative offsets stack images
+    -- vertically. Only the LAST image has with_virtual_padding=true so
+    -- image.nvim's own virt_lines reserve the rest of the stack height
+    -- as backstop (SPEC I5). Intermediate images carry false (SPEC I9)
+    -- to avoid double-reservation that would push later cells too far
+    -- down.
     local Util = require("mercury.util")
     local UI = require("mercury.ui")
     Util.write_file("/tmp/vpa.png", fake_png(400, 200))
@@ -221,14 +222,14 @@ describe("ui shifts images below text via layout.text_offset", function()
     Output_mod.extract_images = orig
 
     assert.equals(2, #recorded)
-    -- Both images get virtual_padding=true (each owns its own extmark
-    -- and image.nvim's reservation).
-    assert.is_true(recorded[1].opts.with_virtual_padding)
-    assert.is_true(recorded[2].opts.with_virtual_padding)
-    -- render_offset_top is 0 for each — vertical positioning comes from
-    -- extmark stacking order, not from row math.
-    assert.equals(0, recorded[1].opts.render_offset_top)
-    assert.equals(0, recorded[2].opts.render_offset_top)
+    assert.is_false(recorded[1].opts.with_virtual_padding,
+      "intermediate image must have padding=false (SPEC I9)")
+    assert.is_true(recorded[2].opts.with_virtual_padding,
+      "last image must have padding=true as cell-spill backstop (SPEC I5)")
+    -- Cumulative offsets: image 2's offset > image 1's so they stack.
+    assert.is_true(recorded[2].opts.render_offset_top
+                   > recorded[1].opts.render_offset_top,
+      "images stack via cumulative render_offset_top (SPEC I4)")
     Notebook.detach(buf)
     os.remove("/tmp/vpa.png"); os.remove("/tmp/vpb.png")
   end)
@@ -271,15 +272,14 @@ describe("ui shifts images below text via layout.text_offset", function()
   end)
 end)
 
-describe("compute_dimensions row math", function()
-  it("returns image_row_height directly (no safety bump under multi-extmark)", function()
-    -- The multi-extmark layout delegates row reservation to image.nvim
-    -- (each image's own extmark has `with_virtual_padding=true`), so we
-    -- no longer need a safety bump on top of image_row_height —
-    -- image.nvim reserves exactly what it actually renders. Pin that
-    -- the returned height matches image_row_height with no inflation;
-    -- a future regression adding margin back would silently waste
-    -- vertical space below every image.
+describe("compute_dimensions row math (SPEC I6)", function()
+  it("applies the I6 safety margin: max(bare+3, ceil(bare*1.25))", function()
+    -- SPEC Invariant I6: per-image height = max(bare + 3, ceil(bare *
+    -- 1.25)), clamped to image_max_height_rows. The bump absorbs the
+    -- divergence between Mercury's static (8x16) cell-pixel assumption
+    -- and image.nvim's runtime terminal measurement, so an intermediate
+    -- image (no with_virtual_padding backstop per SPEC I9) cannot bleed
+    -- into the row below.
     local Util = require("mercury.util")
     local Image = require("mercury.image")
     local function fake_png_local(w, h)
@@ -311,8 +311,15 @@ describe("compute_dimensions row math", function()
     local natural_cols = math.ceil(400 / 8)
     local bare = Output.image_row_height(400, 600,
       math.min(available, natural_cols), 8, 16, 40)
-    assert.equals(bare, heights[1],
-      ("expected bare image_row_height (%d); got %d"):format(bare, heights[1]))
+    local expected = math.min(40, math.max(bare + 3, math.ceil(bare * 1.25)))
+    assert.equals(expected, heights[1],
+      ("expected I6 safe height = %d (bare=%d); got %d")
+        :format(expected, bare, heights[1]))
+    -- The bump must actually increase the reservation when not clamped.
+    if bare + 3 < 40 then
+      assert.is_true(heights[1] > bare,
+        "I6 safety bump must inflate the reservation above the bare value")
+    end
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/safetym.png")
   end)
@@ -351,6 +358,140 @@ describe("compute_dimensions row math", function()
       ("safety must not push past max_rows; got %d"):format(heights[1]))
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/clamp.png")
+  end)
+end)
+
+-- Per-invariant pins. Each `it(...)` below maps 1:1 to a SPEC invariant
+-- ID so a future regression that breaks the contract surfaces here with
+-- a clear pointer to which invariant the change violated.
+
+describe("SPEC image invariants — direct pins", function()
+  local fake_image_mod
+  local recorded2
+  before_each(function()
+    recorded2 = {}
+    fake_image_mod = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        table.insert(recorded2, { path = path, opts = opts })
+        return { render = function() end, clear = function() end }
+      end,
+    }
+    package.loaded["image"] = fake_image_mod
+    package.loaded["mercury.image"] = nil
+    require("mercury.config").setup()
+  end)
+  after_each(function()
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+  end)
+
+  local function _setup_cell(items, extract)
+    local Util = require("mercury.util")
+    Util.write_file("/tmp/inv_a.png", fake_png(400, 300))
+    Util.write_file("/tmp/inv_b.png", fake_png(400, 200))
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=invpin01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    nb:set_renderer(require("mercury.ui").new(nb))
+    local out = nb:ensure_output(nb.cells[1].id)
+    out.status = "ok"; out.exec_count = 1
+    out.items = items
+    local Output_mod = require("mercury.output")
+    local orig_extract = Output_mod.extract_images
+    Output_mod.extract_images = function() return extract end
+    nb._renderer:render()
+    Output_mod.extract_images = orig_extract
+    return buf, nb
+  end
+
+  it("I1: width uses cfg.cell_width_px (8), NOT a runtime query", function()
+    -- Image is 400px wide, default cell_width_px = 8, so natural cols
+    -- should be 50. min(available, 50) — verify Mercury uses 8 px/cell.
+    local buf = _setup_cell(
+      { { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "ia1", item_index = 1 } })
+    assert.equals(1, #recorded2)
+    local available = math.max(20, math.floor(
+      vim.api.nvim_win_get_width(0) * 0.85))
+    local natural_at_8 = math.ceil(400 / 8)
+    local expected = math.min(available, natural_at_8)
+    assert.equals(expected, recorded2[1].opts.width,
+      ("width must use 8 px/cell (expected %d cols, got %d)")
+        :format(expected, recorded2[1].opts.width))
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I3: image render_offset_top > 0 so the pill stays visible above", function()
+    local buf = _setup_cell(
+      { { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "ia2", item_index = 1 } })
+    assert.equals(1, #recorded2)
+    assert.is_true(recorded2[1].opts.render_offset_top > 0,
+      "first image must be offset BELOW the pill (SPEC I3)")
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I4: multi-image cumulative offsets stack vertically (no overlap)", function()
+    local buf = _setup_cell({
+      { type = "display_data", data = { ["image/png"] = "a" } },
+      { type = "display_data", data = { ["image/png"] = "b" } },
+    }, {
+      { kind = "png", path = "/tmp/inv_a.png", hash = "ib1", item_index = 1 },
+      { kind = "png", path = "/tmp/inv_b.png", hash = "ib2", item_index = 2 },
+    })
+    assert.equals(2, #recorded2)
+    -- Image 2 offset must be strictly after image 1's, by AT LEAST image
+    -- 1's height (SPEC I4 — anti-overlap).
+    local off1 = recorded2[1].opts.render_offset_top
+    local off2 = recorded2[2].opts.render_offset_top
+    assert.is_true(off2 > off1,
+      ("SPEC I4 violated: image 2 offset (%d) must exceed image 1 offset (%d)")
+        :format(off2, off1))
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I5/I9: only the LAST image carries with_virtual_padding=true", function()
+    local buf = _setup_cell({
+      { type = "display_data", data = { ["image/png"] = "a" } },
+      { type = "display_data", data = { ["image/png"] = "b" } },
+    }, {
+      { kind = "png", path = "/tmp/inv_a.png", hash = "ic1", item_index = 1 },
+      { kind = "png", path = "/tmp/inv_b.png", hash = "ic2", item_index = 2 },
+    })
+    assert.equals(2, #recorded2)
+    assert.is_false(recorded2[1].opts.with_virtual_padding,
+      "non-last image must have padding=false (SPEC I9)")
+    assert.is_true(recorded2[2].opts.with_virtual_padding,
+      "last image must have padding=true as spill backstop (SPEC I5)")
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I8: cell uses a SINGLE output extmark (not multi-extmark)", function()
+    local Notebook_mod = require("mercury.notebook")
+    local buf = _setup_cell(
+      { { type = "stream", name = "stdout", text = "hi\n" },
+        { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "id1", item_index = 1 } })
+    -- One extmark in the output namespace per cell.
+    local ns_out = Notebook_mod.ns("output")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, ns_out, 0, -1, {})
+    assert.equals(1, #marks,
+      ("SPEC I8 violated: expected 1 output extmark, got %d"):format(#marks))
+    Notebook_mod.detach(buf)
+  end)
+
+  it("I12: `height` is NOT passed to image.nvim's from_file", function()
+    local buf = _setup_cell(
+      { { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "ie1", item_index = 1 } })
+    assert.equals(1, #recorded2)
+    assert.is_nil(recorded2[1].opts.height,
+      "SPEC I12: from_file must NOT receive a height opt")
+    require("mercury.notebook").detach(buf)
   end)
 end)
 

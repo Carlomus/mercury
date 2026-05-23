@@ -89,22 +89,23 @@ function Renderer:_visible_window()
   return nil
 end
 
--- Compute per-image render width (cols) and height (rows). Under the
--- multi-extmark layout this is mostly used for WIDTH — image.nvim derives
--- its own row count from the image's on-disk pixel dimensions plus the
--- terminal's runtime cell size, and our `with_virtual_padding = true` on
--- each image's extmark reserves exactly that many rows. The `heights[]`
--- return value is kept for the legacy single-extmark `render` path (direct
--- callers / tests).
+-- Compute per-image render width (cols) and reserved height (rows).
+-- Both are consumed by the single-extmark interleave path: width is
+-- passed to image.nvim's from_file (SPEC I1), height drives how many
+-- blank virt_lines to reserve per image in our extmark (SPEC I6,
+-- I8). Caller is `Output.build_virt_lines` (via ui.lua).
 --
--- `cell_width_px` / `cell_height_px` come from Mercury's config defaults
--- (8×16). An earlier attempt queried `image.utils.term.get_size()` for
--- the terminal's runtime values, but the API isn't stable across
--- image.nvim versions and the returned values were often LARGER than
--- our defaults — which made `natural_cols = ceil(w / cell_w)` smaller,
--- so images rendered at a smaller width than users were used to. The
--- config defaults are a known-good baseline; users can override via
--- setup() if their terminal differs.
+-- SPEC invariants:
+--   I1 — width uses `cfg.cell_width_px` (default 8). Mercury does NOT
+--        query image.nvim's runtime cell pixel size; doing so returned
+--        larger values on common terminals and shrank images visibly.
+--   I6 — reserved height = max(image_row_height + 3,
+--                              ceil(image_row_height * 1.25)),
+--        clamped to image_max_height_rows. The bump absorbs the
+--        divergence between Mercury's static (8×16) cell-pixel
+--        assumption and image.nvim's runtime terminal measurement,
+--        so an intermediate image (no with_virtual_padding backstop,
+--        SPEC I9) can't bleed into the row below.
 function Renderer:compute_dimensions(images)
   local widths, heights = {}, {}
   if not images or #images == 0 then
@@ -112,8 +113,6 @@ function Renderer:compute_dimensions(images)
   end
   local win = self:_visible_window()
   local win_w = win and vim.api.nvim_win_get_width(win) or 80
-  -- Available width: cap at 85% of the window so the image doesn't crowd
-  -- the whole pane. Hard floor of 20 cols so very narrow splits still render.
   local available_cols = math.max(20, math.floor(win_w * 0.85))
   local cfg = _cfg()
   local max_rows = cfg.image_max_height_rows or 40
@@ -135,7 +134,11 @@ function Renderer:compute_dimensions(images)
         if w and h then
           local natural_cols = math.ceil(w / cell_w)
           img_cols = math.min(available_cols, natural_cols)
-          rows = Output.image_row_height(w, h, img_cols, cell_w, cell_h, max_rows)
+          local bare = Output.image_row_height(
+            w, h, img_cols, cell_w, cell_h, max_rows)
+          -- SPEC Invariant I6 safety margin.
+          local safe = math.max(bare + 3, math.ceil(bare * 1.25))
+          rows = math.min(safe, max_rows)
         else
           -- Unknown dimensions (e.g. SVG without an intrinsic size): use the
           -- pessimistic max_rows so wide plots don't truncate. Invariant 15.
@@ -192,8 +195,8 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- collisions when many images share the same anchor row.
   --
   -- IMPORTANT: only `width` is passed to image.nvim — `height` is
-  -- computed by image.nvim itself. Forcing both `width` and `height` via
-  -- `from_file` made real image.nvim render NOTHING.
+  -- computed by image.nvim itself (SPEC I12). Forcing both `width` and
+  -- `height` via `from_file` made real image.nvim render NOTHING.
   local offsets = layout.offsets
   local text_offset = layout.text_offset or 0
   local cumulative = 0
@@ -201,6 +204,9 @@ function Renderer:render(cell, anchor_row, images, layout)
     seen[img.hash] = true
     if not img.unavailable then
       local is_last = (i == #images)
+      -- SPEC I4: cumulative offsets stack images vertically with a +1
+      -- visual gap row baked in. SPEC I9: only the last image carries
+      -- with_virtual_padding=true (SPEC I5 is the cell-spill backstop).
       local off = offsets and offsets[i] or (text_offset + cumulative)
       local opts = {
         buffer = self.notebook.buf,
@@ -254,90 +260,12 @@ function Renderer:render(cell, anchor_row, images, layout)
   return cumulative
 end
 
--- Place a single image at the cell anchor. Used by the multi-extmark
--- pipeline in ui.lua, which calls render_one in document order between
--- text-segment extmarks. Each image owns its own extmark via
--- `with_virtual_padding = true` — image.nvim creates the virt_lines
--- reservation matching its actual rendered height, so any divergence
--- between Mercury's row math and image.nvim's terminal-side rendering
--- is contained inside image.nvim's own reservation. Row counts cannot
--- get out of sync because Mercury never computes one for this image.
---
--- Returns the (possibly new) image.nvim handle so the caller can track
--- it for GC. Caching is per-image (by content hash), shared with
--- `render()` — repeated render_one calls with the same hash + window
--- skip re-creating the handle.
-function Renderer:render_one(cell, anchor_row, img, slot_index)
-  local mod = api()
-  if not mod then return nil end
-  if not img or img.unavailable then return nil end
-  local win = self:_visible_window()
-  if not win then return nil end
-
-  -- Compute width on the fly (cheap — just IHDR / SVG dim parse). We
-  -- DELIBERATELY don't pass `height` to image.nvim; image.nvim derives
-  -- it from the on-disk pixel dimensions and its own runtime cell-size
-  -- measurement, which is what we want for correct vertical reservation.
-  local widths = self:compute_dimensions({ img })
-  local entry = self.cache[cell.id] or { handles = {}, placements = {} }
-  entry.placements = entry.placements or {}
-
-  local opts = {
-    buffer = self.notebook.buf,
-    window = win,
-    inline = true,
-    with_virtual_padding = true,        -- image.nvim owns reservation
-    -- x = 0 for all images. Earlier versions used `slot_index - 1` to
-    -- "differentiate extmarks", but each image now lives in its OWN
-    -- image.nvim extmark — there's nothing to differentiate. Some
-    -- image.nvim builds interpret non-zero `x` as a literal terminal-
-    -- column offset, which would horizontally shift the 2nd / 3rd /
-    -- ... image relative to the first. Anchor everyone at column 0.
-    x = 0,
-    y = anchor_row,
-    width = widths[1],
-    -- No render_offset_top: extmark virt_lines from prior segments at
-    -- the same anchor row stack BEFORE this one in creation order, so
-    -- document-order layout falls out of the extmark sequence rather
-    -- than any row math we perform here.
-    render_offset_top = 0,
-  }
-
-  local handle = entry.handles[img.hash]
-  local prev = entry.placements[img.hash]
-  if not (handle and same_placement(prev, opts)) then
-    if handle and handle.clear then pcall(function() handle:clear() end) end
-    local ok, h = pcall(mod.from_file, img.path, opts)
-    if ok and h then
-      pcall(function() h:render() end)
-      entry.handles[img.hash] = h
-      entry.placements[img.hash] = opts
-      handle = h
-    else
-      entry.handles[img.hash] = nil
-      entry.placements[img.hash] = nil
-      handle = nil
-    end
-  end
-  -- IMPORTANT: do NOT re-call render() on a cache hit. Some image.nvim
-  -- versions treat repeated render() calls as new placements rather than
-  -- a refresh — that's what caused the "single image shows up twice"
-  -- regression. Tab-switch invalidation is handled by `force_invalidate`
-  -- being called from the autocmd path before the next render() pass.
-  self.cache[cell.id] = entry
-  return handle
-end
-
--- Force-clear all cached handles for a cell so the next render() /
--- render_one() pass creates fresh placements. Called from BufWinEnter /
--- TabEnter / WinEnter / VimResized in init.lua: those events can leave
--- image.nvim's terminal state out of sync with its cached handles
--- (typically: tab moved away and back), and the safe recovery is to
--- redraw from scratch rather than calling render() on stale handles.
-function Renderer:force_invalidate_cell(cell_id)
-  self:_clear_handles(cell_id)
-end
-
+-- Force-clear all cached handles for ALL cells so the next render
+-- creates fresh placements. Called from init.lua's `VimResized`
+-- autocmd (SPEC I11): the terminal's cell pixel size has actually
+-- changed, so cached image.nvim handles reference stale geometry.
+-- Wiring this to BufWinEnter / TabEnter / WinEnter was tried and
+-- produced the "two slots per image" bug (SPEC I11).
 function Renderer:force_invalidate_all()
   for id, _ in pairs(self.cache) do self:_clear_handles(id) end
 end

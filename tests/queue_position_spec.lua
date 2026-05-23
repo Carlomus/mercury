@@ -59,7 +59,7 @@ describe("queue position indicator", function()
   -- through to build_virt_segments (the multi-extmark pipeline's
   -- segment builder). We intercept that and verify each queued cell
   -- sees its 1-based slot.
-  it("ui.render passes the cell's queue index through to build_virt_segments", function()
+  it("ui.render passes the cell's queue index through to build_virt_lines", function()
     package.loaded["image"] = {
       is_enabled = function() return false end,
       from_file = function() return {} end,
@@ -89,8 +89,8 @@ describe("queue position indicator", function()
     nb:ensure_output("qthird11").status = "queued"
 
     local seen_opts_by_cell = {}
-    local orig = Output.build_virt_segments
-    Output.build_virt_segments = function(out, opts)
+    local orig = Output.build_virt_lines
+    Output.build_virt_lines = function(out, opts)
       for cid, o in pairs(nb.outputs) do
         if o == out then
           seen_opts_by_cell[cid] = opts; break
@@ -99,7 +99,7 @@ describe("queue position indicator", function()
       return orig(out, opts)
     end
     nb._renderer:render()
-    Output.build_virt_segments = orig
+    Output.build_virt_lines = orig
 
     assert.equals(1, seen_opts_by_cell["qsecond1"].queue_pos)
     assert.equals(2, seen_opts_by_cell["qthird11"].queue_pos)
