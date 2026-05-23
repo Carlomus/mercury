@@ -201,7 +201,6 @@ function Renderer:render_cell_output(cell)
   -- because image:render runs AFTER build_virt_lines in the original order
   -- and the flag would be set too late to affect this render pass.
   local images
-  local image_widths, image_heights
   if not collapsed and Image.available() then
     images = Output.extract_images(out)
     -- Clear and re-mark availability on every render: a cache file that
@@ -215,14 +214,6 @@ function Renderer:render_cell_output(cell)
       if (not data or data == "") and out.items[img.item_index] then
         out.items[img.item_index]._mercury_image_unavailable = true
       end
-    end
-    -- Pre-compute per-image dimensions so build_virt_lines can interleave
-    -- N+1 blank rows per image at its item position (preserving item order
-    -- end-to-end + visual gap between consecutive images), and image:render
-    -- can place each image at the matching offset without repeating the
-    -- read+decode pass.
-    if self.image and self.image.compute_dimensions and #images > 0 then
-      image_widths, image_heights = self.image:compute_dimensions(images)
     end
   end
 
@@ -240,12 +231,11 @@ function Renderer:render_cell_output(cell)
     end
   end
 
-  local virt, image_offsets = Output.build_virt_lines(out, {
+  local virt = Output.build_virt_lines(out, {
     show_status_pill = cfg.show_status_pill,
     max_preview_lines = collapsed and 0 or (cfg.max_preview_lines or 9999),
     collapsed = collapsed,
     queue_pos = queue_pos,
-    image_heights = image_heights,
   })
 
   local anchor = nb:cell_anchor_row(cell)
@@ -262,15 +252,13 @@ function Renderer:render_cell_output(cell)
 
   if not collapsed then
     if images then
-      -- Pass the offsets we just baked into virt_lines (and the widths /
-      -- heights we already computed) so image:render lines up exactly
-      -- with the blank rows we reserved. Without offsets, image:render
-      -- falls back to cumulative geometric stacking — which is what
-      -- direct callers and the test mocks rely on.
+      -- Shift the entire image stack down by the number of text virt_lines
+      -- so the Out[N] pill and any stream/markdown lines render ABOVE the
+      -- images instead of being painted over by them. image.nvim's
+      -- `with_virtual_padding=true` on the last image is what reserves
+      -- enough buffer rows so the next cell stays below the image stack.
       self.image:render(cell, anchor, images, {
-        offsets = image_offsets,
-        widths = image_widths,
-        heights = image_heights,
+        text_offset = #virt,
       })
     else
       self.image:clear_cell(cell)

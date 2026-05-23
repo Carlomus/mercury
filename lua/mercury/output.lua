@@ -132,26 +132,25 @@ local function html_to_text(html)
   return html
 end
 
--- Build the cell's virtual lines for output rendering. Returns:
---   lines           — the virt_lines list (each entry = list of {text, hl}
---                     chunks). Includes status pill, text items, AND blank
---                     rows reserving space for image items so the cell's
---                     visual layout preserves item order.
---   image_offsets   — list parallel to extract_images(out): for each image
---                     descriptor, the row offset (anchored against the
---                     cell's body_end) where image.nvim should place it.
---                     Empty list when no images / image.nvim unavailable.
+-- Build the cell's text virtual lines for output rendering. Image items
+-- contribute either nothing (image.nvim available and will render below
+-- via its own placement) or a `[mime]` placeholder line (fallback when
+-- image.nvim isn't loaded). Image positioning is handled by the renderer
+-- — it shifts placements down by the number of text virt_lines so they
+-- don't paint over the Out[N] pill, and image.nvim's
+-- `with_virtual_padding=true` on the last image reserves enough room
+-- below so the next cell isn't covered.
 --
--- The interleave is driven by `opts.image_heights` — when provided, image
--- items get N+1 blank virt_lines reserved (N = height; +1 for the visual
--- gap below). When omitted, image items emit either a fallback `[mime]`
--- placeholder line (image.nvim unavailable) or nothing at all (image.nvim
--- available, no interleave info — caller falls back to the geometric
--- stacking path in Image:render).
+-- An earlier design interleaved image-height blank rows here to preserve
+-- item order between text and images. That approach failed because the
+-- blank rows counted against `max_preview_lines` and got truncated on
+-- long outputs, and any divergence between our row-height math and
+-- image.nvim's actual rendering bled into the next cell. The simpler
+-- design — text-then-images stack — gives up item-order in mixed
+-- text/image cells but is robust against both failure modes.
 function M.build_virt_lines(out, opts)
   opts = opts or {}
   local lines = {}
-  local image_offsets = {}
 
   if opts.show_status_pill ~= false then
     local status = STATUS_TEXT[out.status] or STATUS_TEXT.idle
@@ -194,7 +193,7 @@ function M.build_virt_lines(out, opts)
 
   if opts.collapsed then
     lines[#lines + 1] = { { "  …  output collapsed", "Comment" } }
-    return lines, image_offsets
+    return lines
   end
 
   -- Stream merging (SPEC Invariant 36): the side-table preserves the exact
@@ -233,53 +232,6 @@ function M.build_virt_lines(out, opts)
   end
 
   local body_lines = {}
-  -- Counter that walks alongside the image_heights[] array (which is
-  -- ordered by extract_images()'s walk of `out.items`). Each time we
-  -- encounter an image-bearing item we bump this and record the
-  -- placeholder offset, so image_offsets[i] tells the renderer "place
-  -- image i at this row offset within the cell's virt_lines stack".
-  local _img_idx = 0
-  -- Pill rows occupy positions 0..#lines-1; everything below pushed by
-  -- #lines (1 when the pill is present, 0 when suppressed).
-  local _pill_rows = #lines
-  local function _next_image_emit(item, mime)
-    _img_idx = _img_idx + 1
-    if opts.image_heights and opts.image_heights[_img_idx] then
-      -- Interleave path: reserve N blank rows for the image at this
-      -- exact position so subsequent items render BELOW it. Visual gap
-      -- (1 row) added between this image and whatever follows so two
-      -- adjacent images don't visually touch.
-      local h = opts.image_heights[_img_idx]
-      -- Offset is anchored against `anchor_row` = cell.body_end. The
-      -- virt_lines extmark renders its lines starting at row anchor+1
-      -- visually; image.nvim places the image at anchor + render_offset_top,
-      -- which means render_offset_top = N puts the image's top edge at
-      -- visual row anchor+1+N for image.nvim's geometry. Our offset is
-      -- "row index in body_lines AT WHICH this image starts" — which is
-      -- `#body_lines` BEFORE we push the blanks, plus `_pill_rows`
-      -- for the pill prefix.
-      image_offsets[_img_idx] = _pill_rows + #body_lines
-      for _ = 1, h do
-        body_lines[#body_lines + 1] = { "", "Normal" }
-      end
-      -- Trailing 1-row visual gap so following content (text OR another
-      -- image) doesn't visually touch this image.
-      body_lines[#body_lines + 1] = { "", "Normal" }
-      return
-    end
-    -- No image_heights provided (image.nvim available but caller chose
-    -- the non-interleave path, OR image.nvim unavailable). Fall through
-    -- to the original placeholder logic.
-    local image_ok, Image = pcall(require, "mercury.image")
-    if not image_ok or not Image.available() then
-      body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
-    elseif item._mercury_image_unavailable then
-      body_lines[#body_lines + 1] = {
-        "[image bytes unavailable — re-execute the cell]",
-        "Comment",
-      }
-    end
-  end
   for _, item in ipairs(items) do
     if item.type == "stream" then
       local text = item.text or ""
@@ -307,12 +259,21 @@ function M.build_virt_lines(out, opts)
         -- alongside which picks_mime would have chosen first when present.
         body_lines[#body_lines + 1] = { "[widget unsupported]", "Comment" }
       elseif mime == "image/png" or mime == "image/jpeg" or mime == "image/svg+xml" then
-        -- Delegate to `_next_image_emit` so interleave-mode renders N
-        -- blank rows here (preserving item order with text), and
-        -- non-interleave mode falls back to the original placeholder
-        -- logic. The image itself is drawn by image.nvim via the
-        -- `image_offsets[_img_idx]` we record here.
-        _next_image_emit(item, mime)
+        -- The actual image is drawn by image.nvim below the text
+        -- virt_lines. Emit a body line only in the two cases where the
+        -- inline image WON'T appear: (a) image.nvim isn't available, in
+        -- which case the user has no other signal an image exists; (b)
+        -- the cached bytes vanished (eviction race) and the renderer
+        -- won't have anything to render — surface a diagnostic.
+        local image_ok, Image = pcall(require, "mercury.image")
+        if not image_ok or not Image.available() then
+          body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
+        elseif item._mercury_image_unavailable then
+          body_lines[#body_lines + 1] = {
+            "[image bytes unavailable — re-execute the cell]",
+            "Comment",
+          }
+        end
       elseif mime == "text/html" then
         local txt = html_to_text(_value_to_string(item.data["text/html"]))
         for _, ln in ipairs(Util.split_lines(txt)) do
@@ -390,7 +351,7 @@ function M.build_virt_lines(out, opts)
     lines[#lines + 1] =
       { { ("  … %d lines hidden"):format(#body_lines - n), "Comment" } }
   end
-  return lines, image_offsets
+  return lines
 end
 
 -- Get just the plain text of an output (for copy / scratch view). The

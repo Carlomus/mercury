@@ -919,25 +919,30 @@ updating this spec.
     (`y/x/width/render_offset_top/with_virtual_padding/window`), which
     is enough to detect window resizes and tab moves.
 
-    **Layout is driven by virt_lines, not by image.nvim's virtual
-    padding.** `Image:compute_dimensions` returns per-image widths +
-    heights; `Output.build_virt_lines` reserves N+1 blank virt_lines for
-    each image at its item position (N = height; +1 = 1-row visual gap
-    between consecutive images) AND emits per-image `image_offsets[i]`
-    describing the row at which the placement should anchor. `Image:render`
-    consumes those offsets via `layout.offsets` and sets
-    `with_virtual_padding = false` so image.nvim's padding doesn't
-    double-count the rows we already reserved. This is what makes the
-    cell's visible layout preserve item order — text BEFORE image i,
-    image i, text BETWEEN images, image i+1 — instead of the old
-    "all text, then all images stacked at the bottom" behavior that
-    silently re-ordered the items and let tall images paint over the
-    text below them.
+    **Layout: text virt_lines first, image stack below.** The renderer
+    treats text and images as two separate regions. `build_virt_lines`
+    emits only text rows; `Image:render` receives `layout.text_offset`
+    (= the count of those text rows) and shifts each image's
+    `render_offset_top` by it, so images stack BELOW the Out[N] pill
+    instead of painting over it. Between images the offset adds +1 for
+    a 1-row visual gap. The LAST image gets `with_virtual_padding =
+    true`, which tells image.nvim to reserve enough virt_lines below it
+    that the next cell stays clear of the image stack — image.nvim's
+    reservation = `render_offset_top + rendered_height`, which for the
+    last image is the full stack height relative to the anchor.
 
-    Two non-interleave fallbacks remain (with `with_virtual_padding =
-    is_last`): direct callers / unit tests that don't go through
-    `Output.build_virt_lines` (no offsets available), and the
-    "image.nvim unavailable" path where no rendering happens at all.
+    An earlier design interleaved image-height blank rows directly in
+    `build_virt_lines` to preserve item order between text and images.
+    That failed two ways: (a) the blank rows counted against
+    `max_preview_lines` and got truncated on long outputs, leaving the
+    image rendering past the truncation and painting over the next
+    cell; (b) any divergence between our row-height math and
+    image.nvim's actual rendered height (which depends on the
+    terminal's runtime cell pixel size, not Mercury's config defaults)
+    bled into the next cell. Giving up item-order in mixed text/image
+    cells is the price of robustness; image.nvim's
+    `with_virtual_padding` is the safety net that catches any height
+    mismatch by reserving whatever image.nvim actually needs.
 
 76. **Cached image handles are re-painted on every render call.** When
     `same_placement` confirms a cached handle matches the new opts,

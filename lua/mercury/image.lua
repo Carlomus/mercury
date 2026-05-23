@@ -145,15 +145,16 @@ function Renderer:compute_dimensions(images)
   return widths, heights, available_cols
 end
 
--- Render images for a cell. Two layout modes, chosen by `layout.offsets`:
---   * `layout.offsets` is a list of per-image row offsets (anchored against
---     `anchor_row`) — used by the interleave path (output.lua reserved
---     blank rows in virt_lines for each image; we place at those rows).
---   * No `layout.offsets` — fallback to cumulative geometric stack
---     (back-compat for direct callers / tests).
+-- Render images for a cell. `layout.text_offset` (default 0) is the row
+-- count of text virt_lines emitted ABOVE the image stack — we shift the
+-- first image's `render_offset_top` by this amount so images render
+-- BELOW the Out[N] pill / stream output instead of painting over it.
 --
--- `layout.widths` and `layout.heights` may be supplied to skip the
--- compute_dimensions pass when the caller already has them.
+-- `with_virtual_padding=true` is set on the LAST image so image.nvim
+-- reserves enough virt_lines below it to make the next cell stay clear
+-- of the image stack. image.nvim's reservation = render_offset_top +
+-- rendered_height, which for the last image is the full stack height
+-- relative to the anchor — exactly what we need.
 function Renderer:render(cell, anchor_row, images, layout)
   layout = layout or {}
   local mod = api()
@@ -173,43 +174,32 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- when the buffer is revealed; cached handles survive the gap.
   if not win then return 0 end
 
-  local widths, heights = layout.widths, layout.heights
-  if not widths or not heights then
-    widths, heights = self:compute_dimensions(images)
-  end
+  local widths, heights = self:compute_dimensions(images)
 
   -- Place each image. Distinct extmark `x` columns prevent extmark
   -- collisions when many images share the same anchor row.
   --
-  -- When `layout.offsets` is provided we trust it — output.lua reserved
-  -- the exact blank rows we're placing into, and the geometry is
-  -- already interleaved with the cell's text. Otherwise we fall back to
-  -- cumulative stacking with a 1-row visual gap between consecutive
-  -- images so the user can tell where one ends and the next begins.
-  --
   -- IMPORTANT: only `width` is passed to image.nvim — `height` is
   -- computed by image.nvim itself. Forcing both `width` and `height` via
   -- `from_file` made real image.nvim render NOTHING.
-  local offsets = layout.offsets
+  local text_offset = layout.text_offset or 0
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
     if not img.unavailable then
       local is_last = (i == #images)
-      local off = offsets and offsets[i] or cumulative
       local opts = {
         buffer = self.notebook.buf,
         window = win,
         inline = true,
-        -- With explicit offsets, the caller has reserved blank virt_lines
-        -- below the anchor — virtual_padding from image.nvim would
-        -- double-count. Without offsets, the last image still reserves
-        -- padding so following cells aren't covered (back-compat).
-        with_virtual_padding = (offsets == nil) and is_last or false,
+        -- Last image reserves the full stack height as virtual padding,
+        -- pushing the next cell clear of the image stack. Without this,
+        -- a tall image would paint over the next cell's separator.
+        with_virtual_padding = is_last,
         x = i - 1,
         y = anchor_row,
         width = widths[i],
-        render_offset_top = off,
+        render_offset_top = text_offset + cumulative,
       }
       local handle = entry.handles[img.hash]
       local prev = entry.placements[img.hash]
@@ -232,8 +222,7 @@ function Renderer:render(cell, anchor_row, images, layout)
     end
     -- 1-row visual gap row between consecutive RENDERED images. Skip the
     -- gap on unavailable images (nothing was drawn — gap would be a row
-    -- of empty space with no visual separation purpose) so the rest of
-    -- the row math stays predictable for direct callers / fallback mode.
+    -- of empty space with no visual separation purpose).
     cumulative = cumulative + heights[i] + (img.unavailable and 0 or 1)
   end
 
