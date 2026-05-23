@@ -231,7 +231,10 @@ describe("image rendering — explicit height + tab re-render", function()
       { kind = "png", path = "/tmp/ov_c.png", hash = "ovc" },
     })
     assert.equals(3, #recorded)
-    assert.equals(0, recorded[1].opts.render_offset_top)
+    -- SPEC I13: first image's render_offset_top = virt_line_idx (0) + 1
+    -- so it lands at virt_line[0] (one row BELOW body_end), not on the
+    -- body_end content row itself.
+    assert.equals(1, recorded[1].opts.render_offset_top)
     for i = 2, 3 do
       assert.is_true(
         recorded[i].opts.render_offset_top > recorded[i - 1].opts.render_offset_top,

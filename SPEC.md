@@ -1004,6 +1004,38 @@ updating this spec.
     height from the on-disk pixel dimensions plus its own terminal
     cell-size measurement.
 
+    **I13 — `render_offset_top = virt_line_index + 1`.** image.nvim's
+    `renderer.lua` computes the image's on-screen position as:
+
+    ```
+    absolute_y = screenpos(window, y+1, x+1).row + render_offset_top
+    ```
+
+    `screenpos.row` returns the screen row of `body_end` ITSELF, not
+    the row below it. The first virt_line that any extmark anchored
+    at `body_end` attaches to that row displays at
+    `body_end_screen + 1`. So if Mercury wants the image to land at
+    its reserved virt_line index `K` (0-indexed within our virt_lines
+    stack), `render_offset_top` MUST be `K + 1`.
+
+    `Output.build_virt_lines` returns `image_offsets[i]` as the
+    0-indexed virt_line index. `Image:render` adds the `+1` when
+    setting `opts.render_offset_top`. Forgetting this conversion
+    makes the image render exactly one row too high — the first
+    image ends up on the pill row (the "image overlaps Out[N]"
+    regression), and subsequent images each shift one row earlier
+    than their reserved blanks (the "image overlaps text" regression).
+    The +1 lives in `image.lua` so future refactors of the
+    output-builder cannot reintroduce the off-by-one without also
+    changing the image renderer.
+
+    The conversion is sourced from image.nvim's
+    [`renderer.lua`](https://github.com/3rd/image.nvim/blob/master/lua/image/renderer.lua)
+    (the `screenpos + render_offset_top` block) and
+    [`image.lua`](https://github.com/3rd/image.nvim/blob/master/lua/image/image.lua)
+    (the extmark-creation block that anchors virt_lines below the
+    queried row).
+
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
     Attaching `_image_blank = true` to a `{ text, hl }` chunk made

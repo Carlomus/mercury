@@ -493,6 +493,54 @@ describe("SPEC image invariants — direct pins", function()
       "SPEC I12: from_file must NOT receive a height opt")
     require("mercury.notebook").detach(buf)
   end)
+
+  it("I13: render_offset_top = virt_line_idx + 1 (image lands BELOW body_end)", function()
+    -- Build a cell with one stream item, then one image. The image's
+    -- virt_line_idx (from build_virt_lines) is pill_rows (1) + 1 text
+    -- row = 2. SPEC I13 says render_offset_top = idx + 1 = 3, so the
+    -- image lands at the row corresponding to "first image blank" in
+    -- the cell's virt_lines stack — BELOW the pill AND below the text
+    -- row, not on top of them.
+    local Output_mod = require("mercury.output")
+    local buf = _setup_cell({
+      { type = "stream", name = "stdout", text = "hi\n" },
+      { type = "display_data", data = { ["image/png"] = "a" } },
+    }, {
+      { kind = "png", path = "/tmp/inv_a.png", hash = "if1", item_index = 2 },
+    })
+    assert.equals(1, #recorded2)
+    -- Re-derive the expected virt_line_idx from build_virt_lines so the
+    -- test stays robust against future heading changes — but the +1 is
+    -- the contract we're pinning here.
+    local nb = require("mercury.notebook").get(buf)
+    local out = nb.outputs[nb.cells[1].id]
+    local image_heights = ({ require("mercury.image").new(nb):compute_dimensions({
+      { kind = "png", path = "/tmp/inv_a.png", hash = "if1" },
+    }) })[2]
+    local _, image_offsets = Output_mod.build_virt_lines(out, {
+      show_status_pill = true, image_heights = image_heights,
+    })
+    assert.equals(image_offsets[1] + 1, recorded2[1].opts.render_offset_top,
+      ("SPEC I13: render_offset_top must be virt_line_idx + 1. "
+        .. "idx=%d, expected=%d, got=%d"):format(
+        image_offsets[1], image_offsets[1] + 1,
+        recorded2[1].opts.render_offset_top))
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I13: image with no preceding text still lands BELOW the pill (offset >= 2)", function()
+    -- Single image, no text. pill_rows=1, no body before. virt_line_idx=1.
+    -- render_offset_top must be 1 + 1 = 2, so the image lands at
+    -- virt_line[1] = the first image-blank, NOT at virt_line[0] = pill.
+    local buf = _setup_cell(
+      { { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "ig1", item_index = 1 } })
+    assert.equals(1, #recorded2)
+    assert.is_true(recorded2[1].opts.render_offset_top >= 2,
+      ("SPEC I13: first image (after pill) must have offset >= 2; got %d")
+        :format(recorded2[1].opts.render_offset_top))
+    require("mercury.notebook").detach(buf)
+  end)
 end)
 
 describe(":NotebookKernelRestartClear from a fresh notebook", function()

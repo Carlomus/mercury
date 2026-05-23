@@ -197,6 +197,17 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- IMPORTANT: only `width` is passed to image.nvim — `height` is
   -- computed by image.nvim itself (SPEC I12). Forcing both `width` and
   -- `height` via `from_file` made real image.nvim render NOTHING.
+  --
+  -- screenpos / render_offset_top semantics (SPEC I13).
+  -- image.nvim renders the image at:
+  --     absolute_y = screenpos(window, y+1, x+1).row + render_offset_top
+  -- `screenpos.row` is the SCREEN ROW of body_end itself (NOT below it).
+  -- The first virt_line we attach to that row displays at body_end_screen
+  -- + 1. So to render the image at virt_line[K] (0-indexed within our
+  -- virt_lines stack), `render_offset_top` must be `K + 1`.
+  -- `layout.offsets[i]` is the 0-indexed K from output.lua; we add 1 here
+  -- to convert. Forgetting this +1 makes the image render at virt_line[K-1]
+  -- — concretely, the first image ends up on the pill row (overlap).
   local offsets = layout.offsets
   local text_offset = layout.text_offset or 0
   local cumulative = 0
@@ -207,7 +218,8 @@ function Renderer:render(cell, anchor_row, images, layout)
       -- SPEC I4: cumulative offsets stack images vertically with a +1
       -- visual gap row baked in. SPEC I9: only the last image carries
       -- with_virtual_padding=true (SPEC I5 is the cell-spill backstop).
-      local off = offsets and offsets[i] or (text_offset + cumulative)
+      local virt_line_idx = offsets and offsets[i] or (text_offset + cumulative)
+      local off = virt_line_idx + 1   -- SPEC I13: convert idx → screen offset
       local opts = {
         buffer = self.notebook.buf,
         window = win,
