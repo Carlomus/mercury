@@ -602,7 +602,21 @@ function Kernel:_emit_line(line)
   end, 100)
 end
 
-function Kernel:_ensure_started()
+-- Three deps policies, controlled by `opts`:
+--
+--   default                 — probe deps; if missing, prompt the user per
+--                             `kernel.auto_install` and return false.
+--   silent_deps_check=true  — probe deps; if missing, return false WITHOUT
+--                             prompting. Used by `:NotebookKernelSelect`'s
+--                             `list_kernels` so opening the picker doesn't
+--                             nag the user with an install dialog — the
+--                             picker is itself the recovery path (switch
+--                             to a venv that has deps).
+--   skip_deps_check=true    — don't probe deps at all. Used by tests that
+--                             stub `_send` so the bridge subprocess never
+--                             actually runs.
+function Kernel:_ensure_started(opts)
+  opts = opts or {}
   -- Refuse to start (or piggy-back on) the bridge while a shutdown is in
   -- flight. Without this, a keystroke that lands during the ~500ms `jobwait`
   -- window inside `Kernel:stop` would push onto self.queue, the cell would
@@ -637,9 +651,20 @@ function Kernel:_ensure_started()
   -- the bridge spawn cost. If missing, surface an actionable error (and
   -- optionally kick off a `pip install` per `kernel.auto_install`). Bypassed
   -- when the user has overridden `bridge_cmd` since we can't tell what
-  -- arbitrary command needs.
-  if not (Cfg.get().bridge_cmd and #Cfg.get().bridge_cmd > 0) then
-    if not self:_ensure_deps_or_offer_install() then return false end
+  -- arbitrary command needs, OR when the caller opted out via the
+  -- `skip_deps_check` / `silent_deps_check` flags (see this function's
+  -- header for policy details).
+  if not opts.skip_deps_check
+      and not (Cfg.get().bridge_cmd and #Cfg.get().bridge_cmd > 0) then
+    if opts.silent_deps_check then
+      local python = default_python()
+      if python then
+        local res = Util.check_kernel_deps(python)
+        if not res.ok then return false end
+      end
+    else
+      if not self:_ensure_deps_or_offer_install() then return false end
+    end
   end
   local cwd
   if vim.api.nvim_buf_is_valid(self.notebook.buf) then
@@ -973,7 +998,17 @@ end
 local LIST_KERNELS_TIMEOUT_MS = 5000
 
 function Kernel:list_kernels(cb)
-  if not self:_ensure_started() then return end
+  -- The picker can populate itself from discovered pythons + manual entry
+  -- even when registered kernelspecs aren't available — so don't block the
+  -- user with the install prompt when they're trying to switch kernels.
+  -- `silent_deps_check = true` makes _ensure_started probe deps but skip
+  -- the install prompt; on a missing-deps verdict it returns false and we
+  -- hand the caller an empty list so the picker opens with the other
+  -- two sources (the user's natural recovery path).
+  if not self:_ensure_started({ silent_deps_check = true }) then
+    vim.schedule(function() pcall(cb, {}) end)
+    return
+  end
   -- Queue multiple callers. Without this, a second list_kernels call before
   -- the bridge reply lands silently overwrites the first caller's callback.
   -- If a request is already in-flight, just append the callback — the

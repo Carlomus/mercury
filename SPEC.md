@@ -890,6 +890,13 @@ updating this spec.
     a second execute while one is in flight emits an INFO notify and
     bails.
 
+    `:NotebookKernelSelect` does NOT trigger this prompt — it calls
+    `_ensure_started({ silent_deps_check = true })` so the picker opens
+    immediately even with missing deps, populated from discovered
+    pythons + manual entry. The picker is itself the recovery path
+    (switch to a venv with deps installed), so blocking it on the
+    install prompt would create a deadlock.
+
 75. **Only `width` is passed to `image.nvim`'s `from_file`.** Real
     image.nvim builds render NOTHING when both `width` AND `height` are
     forced via `from_file`. Mercury computes its own per-image row count
