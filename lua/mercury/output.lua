@@ -132,25 +132,30 @@ local function html_to_text(html)
   return html
 end
 
--- Build the cell's text virtual lines for output rendering. Image items
--- contribute either nothing (image.nvim available and will render below
--- via its own placement) or a `[mime]` placeholder line (fallback when
--- image.nvim isn't loaded). Image positioning is handled by the renderer
--- — it shifts placements down by the number of text virt_lines so they
--- don't paint over the Out[N] pill, and image.nvim's
--- `with_virtual_padding=true` on the last image reserves enough room
--- below so the next cell isn't covered.
+-- Build the cell's virtual lines for output rendering. Returns:
+--   lines           — the virt_lines list. Walks `out.items` in order, so
+--                     a `[image, stream, image]` output renders visually
+--                     as image-then-text-then-image. Image items contribute
+--                     blank rows tagged with `_image_blank = true`; image.nvim
+--                     paints the actual pixels into those rows.
+--   image_offsets   — list parallel to `extract_images(out)`: for each
+--                     image, the row offset (anchored against
+--                     cell.body_end) at which the placement should sit.
 --
--- An earlier design interleaved image-height blank rows here to preserve
--- item order between text and images. That approach failed because the
--- blank rows counted against `max_preview_lines` and got truncated on
--- long outputs, and any divergence between our row-height math and
--- image.nvim's actual rendering bled into the next cell. The simpler
--- design — text-then-images stack — gives up item-order in mixed
--- text/image cells but is robust against both failure modes.
+-- The `_image_blank` tag is load-bearing: those rows ALWAYS emit, bypassing
+-- `max_preview_lines`. Counting them against the cap was the bug that made
+-- long outputs truncate the image's reservation and let the image paint
+-- over the next cell.
+--
+-- Driven by `opts.image_heights[i]` — when omitted (legacy callers / tests
+-- that don't go through the UI renderer), image items emit either a
+-- `[mime]` fallback placeholder (image.nvim unavailable) or nothing at
+-- all (image.nvim available, no interleave info — caller stacks images
+-- below the text via the renderer's `text_offset` parameter).
 function M.build_virt_lines(out, opts)
   opts = opts or {}
   local lines = {}
+  local image_offsets = {}
 
   if opts.show_status_pill ~= false then
     local status = STATUS_TEXT[out.status] or STATUS_TEXT.idle
@@ -193,7 +198,7 @@ function M.build_virt_lines(out, opts)
 
   if opts.collapsed then
     lines[#lines + 1] = { { "  …  output collapsed", "Comment" } }
-    return lines
+    return lines, image_offsets
   end
 
   -- Stream merging (SPEC Invariant 36): the side-table preserves the exact
@@ -232,6 +237,51 @@ function M.build_virt_lines(out, opts)
   end
 
   local body_lines = {}
+  -- Parallel array, same length as body_lines, marking which entries
+  -- are image-blank rows (cap-exempt; always emitted). We use a separate
+  -- table instead of attaching a field to the chunk because Neovim's
+  -- `virt_lines` extmark option does a strict conversion that rejects
+  -- tables with non-integer keys (silently produced "Invalid 'virt_lines'"
+  -- crashes on the first real render).
+  local body_blank = {}
+  -- Bookkeeping for the interleave path. `_img_idx` tracks position in
+  -- extract_images()'s ordering (= item order, since both walk
+  -- `out.items` and only image-bearing items count). `_pill_rows` is
+  -- the number of virt_lines emitted above body_lines (just the pill,
+  -- if present) — the renderer's offset is relative to body_end, so
+  -- offset = _pill_rows + #body_lines at the point we reserve the
+  -- blanks.
+  local _img_idx = 0
+  local _pill_rows = #lines
+  local function _push_blank()
+    body_lines[#body_lines + 1] = { "", "Normal" }
+    body_blank[#body_lines] = true
+  end
+  local function _next_image_emit(item, mime)
+    _img_idx = _img_idx + 1
+    if opts.image_heights and opts.image_heights[_img_idx] then
+      local h = opts.image_heights[_img_idx]
+      image_offsets[_img_idx] = _pill_rows + #body_lines
+      for _ = 1, h do _push_blank() end
+      -- Trailing visual gap so consecutive images (or text immediately
+      -- after) don't touch the image.
+      _push_blank()
+      return
+    end
+    -- No image_heights provided. Caller is either rendering without
+    -- image.nvim, or rendering via the renderer's fallback path
+    -- (text_offset shift, no interleave). Emit a diagnostic only when
+    -- the image WON'T appear inline.
+    local image_ok, Image = pcall(require, "mercury.image")
+    if not image_ok or not Image.available() then
+      body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
+    elseif item._mercury_image_unavailable then
+      body_lines[#body_lines + 1] = {
+        "[image bytes unavailable — re-execute the cell]",
+        "Comment",
+      }
+    end
+  end
   for _, item in ipairs(items) do
     if item.type == "stream" then
       local text = item.text or ""
@@ -259,21 +309,7 @@ function M.build_virt_lines(out, opts)
         -- alongside which picks_mime would have chosen first when present.
         body_lines[#body_lines + 1] = { "[widget unsupported]", "Comment" }
       elseif mime == "image/png" or mime == "image/jpeg" or mime == "image/svg+xml" then
-        -- The actual image is drawn by image.nvim below the text
-        -- virt_lines. Emit a body line only in the two cases where the
-        -- inline image WON'T appear: (a) image.nvim isn't available, in
-        -- which case the user has no other signal an image exists; (b)
-        -- the cached bytes vanished (eviction race) and the renderer
-        -- won't have anything to render — surface a diagnostic.
-        local image_ok, Image = pcall(require, "mercury.image")
-        if not image_ok or not Image.available() then
-          body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
-        elseif item._mercury_image_unavailable then
-          body_lines[#body_lines + 1] = {
-            "[image bytes unavailable — re-execute the cell]",
-            "Comment",
-          }
-        end
+        _next_image_emit(item, mime)
       elseif mime == "text/html" then
         local txt = html_to_text(_value_to_string(item.data["text/html"]))
         for _, ln in ipairs(Util.split_lines(txt)) do
@@ -332,26 +368,38 @@ function M.build_virt_lines(out, opts)
     end
   end
 
+  -- Emit body_lines. The `max_preview_lines` cap only applies to TEXT
+  -- rows — image-blank rows (recorded in `body_blank` by _push_blank)
+  -- always emit, because truncating them would let the image render
+  -- past our reservation and paint over the next cell.
+  --
+  -- body_lines entries are one of two shapes:
+  --   (a) single chunk `{ "text", "hl" }`  — most output types push this
+  --   (b) multi-chunk line `{ {t1,h1}, {t2,h2}, ... }` — markdown lines
+  --       carry inline styling spans and arrive pre-shaped.
+  -- Detect (b) by checking whether the first element is itself a table.
   local cap = opts.max_preview_lines or 9999
-  local n = math.min(cap, #body_lines)
-  for i = 1, n do
-    -- body_lines entries are one of two shapes:
-    --   (a) single chunk `{ "text", "hl" }`  — most output types push this
-    --   (b) multi-chunk line `{ {t1,h1}, {t2,h2}, ... }` — markdown lines
-    --       carry inline styling spans and arrive pre-shaped.
-    -- Detect by checking whether the first element is itself a table.
+  local text_seen, text_hidden = 0, 0
+  for i = 1, #body_lines do
     local entry = body_lines[i]
-    if type(entry[1]) == "table" then
-      lines[#lines + 1] = entry
-    else
+    if body_blank[i] then
       lines[#lines + 1] = { entry }
+    elseif text_seen < cap then
+      text_seen = text_seen + 1
+      if type(entry[1]) == "table" then
+        lines[#lines + 1] = entry
+      else
+        lines[#lines + 1] = { entry }
+      end
+    else
+      text_hidden = text_hidden + 1
     end
   end
-  if #body_lines > n then
+  if text_hidden > 0 then
     lines[#lines + 1] =
-      { { ("  … %d lines hidden"):format(#body_lines - n), "Comment" } }
+      { { ("  … %d lines hidden"):format(text_hidden), "Comment" } }
   end
-  return lines
+  return lines, image_offsets
 end
 
 -- Get just the plain text of an output (for copy / scratch view). The

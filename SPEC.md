@@ -919,30 +919,47 @@ updating this spec.
     (`y/x/width/render_offset_top/with_virtual_padding/window`), which
     is enough to detect window resizes and tab moves.
 
-    **Layout: text virt_lines first, image stack below.** The renderer
-    treats text and images as two separate regions. `build_virt_lines`
-    emits only text rows; `Image:render` receives `layout.text_offset`
-    (= the count of those text rows) and shifts each image's
-    `render_offset_top` by it, so images stack BELOW the Out[N] pill
-    instead of painting over it. Between images the offset adds +1 for
-    a 1-row visual gap. The LAST image gets `with_virtual_padding =
-    true`, which tells image.nvim to reserve enough virt_lines below it
-    that the next cell stays clear of the image stack — image.nvim's
-    reservation = `render_offset_top + rendered_height`, which for the
-    last image is the full stack height relative to the anchor.
+    **Layout: text and images interleaved per item order.** The
+    pipeline mirrors JupyterLab / VS Code notebook semantics — an
+    `[image, stream, image]` output renders visually as image-then-
+    text-then-image, not "all text then all images stacked."
+    `Image:compute_dimensions` returns per-image row heights;
+    `Output.build_virt_lines(out, { image_heights = h })` walks items
+    in order, emitting text rows where the item is text and reserving
+    `h[i] + 1` blank rows where the item is an image (the +1 is a
+    visual gap so consecutive images / following text don't touch).
+    Each blank row's index is recorded in a `body_blank[]` parallel
+    array. The function also returns `image_offsets[i]` — the row at
+    which image `i` should anchor — and `ui.lua` threads that into
+    `Image:render(..., { offsets = ... })`.
 
-    An earlier design interleaved image-height blank rows directly in
-    `build_virt_lines` to preserve item order between text and images.
-    That failed two ways: (a) the blank rows counted against
-    `max_preview_lines` and got truncated on long outputs, leaving the
-    image rendering past the truncation and painting over the next
-    cell; (b) any divergence between our row-height math and
-    image.nvim's actual rendered height (which depends on the
-    terminal's runtime cell pixel size, not Mercury's config defaults)
-    bled into the next cell. Giving up item-order in mixed text/image
-    cells is the price of robustness; image.nvim's
-    `with_virtual_padding` is the safety net that catches any height
-    mismatch by reserving whatever image.nvim actually needs.
+    Two failure modes from a previous interleave attempt are guarded
+    against:
+
+    * **Blank rows must not be truncated.** `max_preview_lines` cap
+      applies only to TEXT body rows; image-blank rows (the ones in
+      `body_blank`) ALWAYS emit, regardless of cap. Truncating them
+      would let the image render past Mercury's reservation and paint
+      over the next cell. The `… N hidden` marker only counts hidden
+      TEXT rows.
+
+    * **The last image carries `with_virtual_padding = true`** as a
+      safety net against any divergence between our row-height math
+      (uses `cell_width_px` / `cell_height_px` from config) and
+      image.nvim's actual rendered height (which depends on the
+      terminal's runtime cell pixel size). image.nvim's reservation =
+      `render_offset_top + rendered_height` for the last image, so
+      whatever extra rows image.nvim's actual rendering needs are
+      added on top of Mercury's own blank-row reservation. Some
+      over-reservation is the price; an image painting over the next
+      cell is worse.
+
+    Marker storage detail: the blank-row marker lives in a parallel
+    `body_blank[i]` array, NOT as a field on the chunk table.
+    Attaching `_image_blank = true` to a `{ text, hl }` chunk made
+    Neovim's strict `virt_lines` extmark converter reject the table
+    ("Invalid 'virt_lines': Cannot convert given Lua table") — chunks
+    must be pure 2-element arrays.
 
 76. **Cached image handles are re-painted on every render call.** When
     `same_placement` confirms a cached handle matches the new opts,

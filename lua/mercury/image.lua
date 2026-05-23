@@ -145,16 +145,24 @@ function Renderer:compute_dimensions(images)
   return widths, heights, available_cols
 end
 
--- Render images for a cell. `layout.text_offset` (default 0) is the row
--- count of text virt_lines emitted ABOVE the image stack — we shift the
--- first image's `render_offset_top` by this amount so images render
--- BELOW the Out[N] pill / stream output instead of painting over it.
+-- Render images for a cell. Two layout modes, chosen by `layout`:
 --
--- `with_virtual_padding=true` is set on the LAST image so image.nvim
--- reserves enough virt_lines below it to make the next cell stay clear
--- of the image stack. image.nvim's reservation = render_offset_top +
--- rendered_height, which for the last image is the full stack height
--- relative to the anchor — exactly what we need.
+--   * `layout.offsets[i]` is per-image row offsets. The caller
+--     (Output.build_virt_lines via ui.lua) reserved N+1 blank rows for
+--     each image at its item position, and offsets[i] is the matching
+--     row. We anchor image i there.
+--   * No `layout.offsets` — fallback to cumulative geometric stacking
+--     anchored at `layout.text_offset` (or 0). Used by direct callers
+--     and tests that don't go through build_virt_lines.
+--
+-- The LAST image ALWAYS gets `with_virtual_padding = true` — image.nvim
+-- reserves `render_offset_top + rendered_height` rows of virt_lines,
+-- which sits BELOW our own virt_lines extmark and pushes the next cell
+-- clear of the image stack. This is the safety net against any
+-- divergence between our row math (uses `cell_width_px`/`cell_height_px`
+-- from config) and image.nvim's actual rendering (queries the terminal
+-- at runtime). Some over-reservation is the price; an image painting
+-- over the next cell would be worse.
 function Renderer:render(cell, anchor_row, images, layout)
   layout = layout or {}
   local mod = api()
@@ -182,24 +190,27 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- IMPORTANT: only `width` is passed to image.nvim — `height` is
   -- computed by image.nvim itself. Forcing both `width` and `height` via
   -- `from_file` made real image.nvim render NOTHING.
+  local offsets = layout.offsets
   local text_offset = layout.text_offset or 0
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
     if not img.unavailable then
       local is_last = (i == #images)
+      local off = offsets and offsets[i] or (text_offset + cumulative)
       local opts = {
         buffer = self.notebook.buf,
         window = win,
         inline = true,
-        -- Last image reserves the full stack height as virtual padding,
-        -- pushing the next cell clear of the image stack. Without this,
-        -- a tall image would paint over the next cell's separator.
+        -- Last image: image.nvim reserves the rest of the rows it
+        -- actually needs (catches under-reserving from our height
+        -- math). Others: no padding from image.nvim — our virt_lines
+        -- already reserved the rows.
         with_virtual_padding = is_last,
         x = i - 1,
         y = anchor_row,
         width = widths[i],
-        render_offset_top = text_offset + cumulative,
+        render_offset_top = off,
       }
       local handle = entry.handles[img.hash]
       local prev = entry.placements[img.hash]

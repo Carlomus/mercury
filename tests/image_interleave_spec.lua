@@ -37,6 +37,97 @@ local function fake_png(w, h)
     .. "\0\0\0\0IEND\174B`\130"
 end
 
+describe("build_virt_lines interleave (item-order layout)", function()
+  it("[image, text, image] preserves item order via reserved blanks", function()
+    -- The user's notebook-parity case. With image_heights provided,
+    -- build_virt_lines walks items in order and reserves blanks at the
+    -- image positions — so the text between image 1 and image 2 stays
+    -- VISIBLE between the two image rows.
+    local virt, offsets = Output.build_virt_lines({
+      status = "ok", exec_count = 1, ms = 10, items = {
+        { type = "display_data", data = { ["image/png"] = "img1" } },
+        { type = "stream", name = "stdout", text = "middle\n" },
+        { type = "display_data", data = { ["image/png"] = "img2" } },
+      },
+    }, {
+      image_heights = { 4, 6 },
+    })
+    -- Pill row (1) + img1 blanks (4) + gap (1) + "middle" (1) + img2 (6) + gap (1) = 14
+    assert.equals(14, #virt)
+    -- offsets are anchored to body_end. Pill is at 0 (1 row). img1 starts
+    -- at row 1. After 4 blanks + 1 gap (5 rows) + "middle" (1 row) = 7,
+    -- img2 starts at row 7.
+    assert.equals(1, offsets[1])
+    assert.equals(7, offsets[2])
+    -- The "middle" line is at row 6 — between the two image reservations,
+    -- not pushed to the bottom. Verify the row's text.
+    local middle_idx = 1 + 4 + 1 + 1   -- 1-indexed: pill + 4 blanks + gap + middle
+    assert.matches("middle", virt[middle_idx][1][1])
+  end)
+
+  it("image-blank rows are exempt from max_preview_lines truncation", function()
+    -- The cap is set to 2 and there are 3 text lines + a 5-row image.
+    -- Pre-fix, the cap counted image-blank rows and chopped them off so
+    -- the image rendered past Mercury's reservation. With the fix, the
+    -- 5+1=6 image-blank rows ALWAYS emit; only the TEXT past the cap is
+    -- replaced with a "… N hidden" marker. The marker emits after the
+    -- last body row.
+    local virt = Output.build_virt_lines({
+      status = "ok", items = {
+        { type = "stream", name = "stdout",
+          text = "line1\nline2\nline3\n" },
+        { type = "display_data", data = { ["image/png"] = "img" } },
+      },
+    }, {
+      show_status_pill = false,
+      max_preview_lines = 2,
+      image_heights = { 5 },
+    })
+    -- Expected: line1, line2, [6 image-blanks], "… 1 hidden" = 9 rows.
+    assert.equals(9, #virt)
+    assert.matches("line1", virt[1][1][1])
+    assert.matches("line2", virt[2][1][1])
+    -- Image blanks at rows 3..8 (5 image rows + 1 gap).
+    for i = 3, 8 do
+      assert.equals("", virt[i][1][1],
+        ("row %d should be an empty image-blank, got %q")
+          :format(i, virt[i][1][1]))
+    end
+    -- Hidden marker at the end.
+    assert.matches("1 lines hidden", virt[9][1][1])
+  end)
+
+  it("interleave passes through to a clean virt_lines structure (no Invalid table)", function()
+    -- Regression: a previous design attached `_image_blank` directly to
+    -- the chunk table. Neovim's strict virt_lines converter rejected
+    -- those tables. Now the blank marker lives in a parallel array so
+    -- the emitted chunks are pure {text, hl} pairs.
+    local virt = Output.build_virt_lines({
+      status = "ok", items = {
+        { type = "display_data", data = { ["image/png"] = "img" } },
+      },
+    }, { image_heights = { 3 } })
+    -- Every chunk in every line must have exactly two elements: text + hl.
+    for _, line in ipairs(virt) do
+      for _, chunk in ipairs(line) do
+        -- A chunk is `{ text, hl }`; if the first element is a table the
+        -- line is multi-chunk and each sub-element should be a chunk.
+        local function check_clean(c)
+          assert.equals("string", type(c[1]))
+          assert.equals("string", type(c[2]))
+          -- No leaking marker fields.
+          assert.is_nil(c._image_blank)
+        end
+        if type(chunk[1]) == "table" then
+          for _, sub in ipairs(chunk) do check_clean(sub) end
+        else
+          check_clean(chunk)
+        end
+      end
+    end
+  end)
+end)
+
 describe("build_virt_lines text-only (no image rows)", function()
   it("image items contribute NO virt_lines when image.nvim is available", function()
     -- Image is rendered separately by image.nvim below the text virt_lines.
