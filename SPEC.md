@@ -890,15 +890,16 @@ updating this spec.
     a second execute while one is in flight emits an INFO notify and
     bails.
 
-75. **image.nvim receives an explicit `height` per image placement.**
-    Mercury computes the row count for each image via
-    `Output.image_row_height` and passes that height through to
-    `image.nvim`'s `from_file` opts. Without it, image.nvim auto-derives
-    height from on-disk pixel dimensions and its assumption of the
-    terminal cell aspect can disagree with Mercury's — the disagreement
-    is what made tall images paint over the next cell's lines.
-    `same_placement` includes `height` so a window resize that changes
-    the row math correctly invalidates the cached handle.
+75. **Only `width` is passed to `image.nvim`'s `from_file`.** Real
+    image.nvim builds render NOTHING when both `width` AND `height` are
+    forced via `from_file`. Mercury computes its own per-image row count
+    via `Output.image_row_height` and uses it for the cumulative
+    `render_offset_top` stack and the function's row-count return value,
+    but does NOT pass `height` to image.nvim itself — image.nvim derives
+    rows from on-disk pixel dimensions plus the terminal cell aspect.
+    `same_placement` compares the placement fields we actually pass
+    (`y/x/width/render_offset_top/with_virtual_padding/window`), which
+    is enough to detect window resizes and tab moves.
 
 76. **Cached image handles are re-painted on every render call.** When
     `same_placement` confirms a cached handle matches the new opts,
@@ -926,6 +927,16 @@ updating this spec.
     GC in `Image:gc` already calls `:clear()` on each handle for
     deleted cells (Invariant 17); this extends the same lifecycle to
     output virt_lines.
+
+78. **`:NotebookKernelInfo` is the single source of truth for "which
+    kernel am I on?".** The command notifies a multi-line summary
+    produced by `Kernel:info()` — mode, active selector
+    (python/spec_path/name in resolve-order), connection_file (for
+    existing-mode), bridge state, currently-executing cell, and queue
+    length. The lualine `kernel` component shows the same selector but
+    abbreviated via `Discover.short_label` for absolute python paths;
+    `Kernel:info()` always shows the full path. Default keymap is
+    `<leader>k?` to match the `<leader>k*` kernel-action prefix.
 
 ## Goal
 

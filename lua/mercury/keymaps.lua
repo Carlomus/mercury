@@ -46,6 +46,7 @@ M.defaults = {
   ["<leader>kR"]  = "NotebookKernelRestartClear",
   ["<leader>ki"]  = "NotebookKernelInterrupt",
   ["<leader>ks"]  = "NotebookKernelStop",
+  ["<leader>k?"]  = "NotebookKernelInfo",
 }
 
 -- Keys that should also fire while in insert mode — typical "execute and

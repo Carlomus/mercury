@@ -110,6 +110,7 @@ injection query file or predicate setup is required.
 | `:NotebookOutputClearAll` | `<leader>oC` | Clear all outputs |
 | `:NotebookOutputCopy` | `<leader>oy` | Copy output text to `+` |
 | `:NotebookOutputView` | `<leader>ov` | Open output in scratch buffer |
+| `:NotebookKernelInfo` | `<leader>k?` | Notify the active kernel (selector, mode, bridge state) |
 | `:NotebookKernelSelect` | `<leader>kk` | Pick a kernelspec |
 | `:NotebookKernelRestart` | `<leader>kr` | Restart kernel |
 | `:NotebookKernelRestartClear` | `<leader>kR` | Restart + clear outputs |

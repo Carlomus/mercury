@@ -806,6 +806,18 @@ function M._register_commands()
     end)
   end), {})
 
+  cmd("NotebookKernelInfo", with_nb(function(nb)
+    -- Surface the kernel currently bound to this buffer as a single notify.
+    -- Useful when the user wants confirmation of "which interpreter am I
+    -- actually running on" without inspecting the lualine glyph or the
+    -- notebook's metadata directly. The lines come from Kernel:info() so
+    -- the message stays in sync with what other code paths see as the
+    -- active selector.
+    local info = nb.kernel:info()
+    vim.notify("[mercury] kernel\n  " .. table.concat(info, "\n  "),
+      vim.log.levels.INFO)
+  end), {})
+
   cmd("NotebookKernelRestart",      with_nb(function(nb) nb.kernel:restart() end), {})
   cmd("NotebookKernelRestartClear", with_nb(function(nb) nb.kernel:restart({ clear = true }) end), {})
   cmd("NotebookKernelInterrupt",    with_nb(function(nb) nb.kernel:interrupt() end), {})

@@ -19,6 +19,24 @@ local function nb()
   return Notebook.get(vim.api.nvim_get_current_buf())
 end
 
+-- Short display label for an arbitrary kernel selector string. If the
+-- selector looks like an absolute python path, run it through
+-- `Discover.short_label` (e.g. `/work/proj/.venv/bin/python` → `.venv (proj)`)
+-- so the lualine doesn't get crowded; otherwise return it as-is.
+local function _short(selector)
+  if type(selector) ~= "string" or selector == "" then return selector end
+  -- Heuristic: absolute path containing a `/` AND ending in `python*` is a
+  -- python executable. Anything else (kernelspec name, registered alias) is
+  -- already short.
+  if selector:sub(1, 1) == "/" and selector:match("python[^/]*$") then
+    local ok, Discover = pcall(require, "mercury.discover")
+    if ok and Discover.short_label then
+      return Discover.short_label(selector)
+    end
+  end
+  return selector
+end
+
 function M.kernel()
   local n = nb(); if not n then return "" end
   -- Prefer the active selector (b:mercury_kernel_name is updated by
@@ -30,7 +48,7 @@ function M.kernel()
   local name = active
     or (n.meta and n.meta.kernelspec and n.meta.kernelspec.name)
     or "python3"
-  return ("⎈ %s"):format(name)
+  return ("⎈ %s"):format(_short(name))
 end
 
 function M.queue()

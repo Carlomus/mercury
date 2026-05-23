@@ -1012,6 +1012,50 @@ function Kernel:list_kernels(cb)
   end
 end
 
+-- Summarise the kernel selection in human-readable form: which selector is
+-- active (python path / spec_path / kernelspec name), the mode, and the
+-- bridge's live/idle status. Used by `:NotebookKernelInfo` to surface
+-- everything the user might want to know about "which kernel am I running?"
+-- without digging into b:mercury_kernel_name.
+function Kernel:info()
+  local opts = self.kernel_opts or {}
+  local mode = opts.mode or "local"
+  local lines = { ("mode: %s"):format(mode) }
+  -- Active selector lines — priority matches resolve order
+  -- (python > spec_path > name) so the line list reads top-to-bottom in
+  -- the same order Mercury actually consults.
+  if opts.python then
+    lines[#lines + 1] = "python: " .. opts.python
+  end
+  if opts.spec_path then
+    lines[#lines + 1] = "spec_path: " .. opts.spec_path
+  end
+  if opts.name then
+    lines[#lines + 1] = "kernelspec: " .. opts.name
+  end
+  if mode == "existing" and opts.connection_file then
+    lines[#lines + 1] = "connection_file: " .. opts.connection_file
+  end
+  -- If NONE of those are set, the bridge falls back to "python3" on launch.
+  if not opts.python and not opts.spec_path and not opts.name
+      and not opts.connection_file then
+    lines[#lines + 1] = "kernelspec: python3 (default fallback)"
+  end
+  -- Bridge status: alive vs idle. `jobwait({job}, 0)[1] == -1` means the
+  -- process is still running; anything else means it's gone or never started.
+  local alive = self.job_id ~= nil
+    and (vim.fn.jobwait({ self.job_id }, 0)[1] == -1)
+  lines[#lines + 1] = "bridge: " .. (alive and "running" or "not started")
+  if self.running then
+    lines[#lines + 1] = "currently executing: " ..
+      (tostring(self.running.cell_id):sub(1, 8))
+  end
+  if self.queue and #self.queue > 0 then
+    lines[#lines + 1] = ("queue length: %d"):format(#self.queue)
+  end
+  return lines
+end
+
 -- Accept any of:
 --   string                                — registered kernelspec name
 --   { name, display_name?, language? }    — registered kernelspec

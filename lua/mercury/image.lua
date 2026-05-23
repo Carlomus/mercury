@@ -39,7 +39,6 @@ local function same_placement(a, b)
   return a.y == b.y
     and a.x == b.x
     and a.width == b.width
-    and a.height == b.height
     and a.render_offset_top == b.render_offset_top
     and a.with_virtual_padding == b.with_virtual_padding
     and a.window == b.window
@@ -181,13 +180,15 @@ function Renderer:render(cell, anchor_row, images)
   -- content hash and the placement opts are unchanged — re-creating on every
   -- rescan causes visible flicker on long cells.
   --
-  -- We pass an explicit `height` to image.nvim's `from_file` so the rows it
-  -- reserves match the rows WE computed via `image_row_height`. Without an
-  -- explicit height image.nvim auto-derives from the on-disk image
-  -- dimensions, and the two estimates can disagree (different cell
-  -- pixel-aspect assumption, different rounding) — the previous behavior
-  -- where image.nvim reserved fewer rows than we'd anticipated is what made
-  -- the next cell's text get painted over by a tall image. SPEC Invariant 75.
+  -- IMPORTANT: only `width` is passed to image.nvim — `height` is computed by
+  -- image.nvim itself from the image's on-disk pixel dimensions + the
+  -- terminal cell aspect. Forcing both `width` and `height` via `from_file`
+  -- caused real-image.nvim builds to render NOTHING (the regression that
+  -- showed up against the user's matplotlib cell). The cumulative height we
+  -- track here is still our authoritative count for `render_offset_top` so
+  -- stacked images don't collide, and the function's return value
+  -- (`cumulative`) tells the caller how many rows the stack occupies for
+  -- downstream layout decisions.
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
@@ -203,7 +204,6 @@ function Renderer:render(cell, anchor_row, images)
         x = i - 1,                        -- distinct extmark col per image
         y = anchor_row,
         width = widths[i],
-        height = heights[i],              -- lock reservation to our row math
         render_offset_top = cumulative,
       }
       local handle = entry.handles[img.hash]

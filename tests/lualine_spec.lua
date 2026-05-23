@@ -31,12 +31,21 @@ describe("mercury.lualine", function()
     -- A user who selected an explicit venv with :NotebookKernelSelect has
     -- the python path stored in b:mercury_kernel_name. Lualine must
     -- surface the active selector, NOT the fallback meta.kernelspec.name
-    -- (which is "python3" by default and would be misleading).
+    -- (which is "python3" by default and would be misleading). Absolute
+    -- python paths are routed through `Discover.short_label` so the
+    -- statusline doesn't get crowded — see the dedicated test below for
+    -- the short-label format.
     local buf = fresh_buf()
     local nb = Notebook.attach(buf); nb:rescan()
     nb.meta = { kernelspec = { name = "python3" } }
     vim.b[buf].mercury_kernel_name = "/abs/venv/bin/python"
-    assert.equals("⎈ /abs/venv/bin/python", Lualine.kernel())
+    local rendered = Lualine.kernel()
+    assert.matches("⎈", rendered)
+    -- Shortened label contains the venv directory name; full path does not
+    -- appear verbatim.
+    assert.matches("venv", rendered)
+    assert.is_nil(rendered:match("/abs/venv/bin/python"),
+      "absolute python paths should be shortened in lualine")
     Notebook.detach(buf)
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
