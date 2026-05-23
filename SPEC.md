@@ -897,6 +897,17 @@ updating this spec.
     (switch to a venv with deps installed), so blocking it on the
     install prompt would create a deadlock.
 
+    **Prompt frequency.** The probe is gated by the bridge lifecycle —
+    once the bridge is running successfully, subsequent executes return
+    from `_ensure_started`'s "is the job alive?" early-exit and don't
+    re-probe. The `ask`-policy modal prompt itself is further gated:
+    after the user picks "Cancel" once for a given python, mercury
+    records `_install_declined[python] = true` and surfaces a terse
+    error notify (manual `pip install` command + a
+    `:NotebookKernelSelect` hint) on subsequent executes — no further
+    modal dialogs. `select_kernel` clears the declined map because the
+    new python's deps state is the user's call again.
+
 75. **Only `width` is passed to `image.nvim`'s `from_file`.** Real
     image.nvim builds render NOTHING when both `width` AND `height` are
     forced via `from_file`. Mercury computes its own per-image row count

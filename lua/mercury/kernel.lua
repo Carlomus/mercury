@@ -84,6 +84,20 @@ function Kernel:_ensure_deps_or_offer_install()
     return false
   end
   local missing_list = table.concat(res.missing, ", ")
+  -- "Don't nag on every execute" guard. Once the user has explicitly
+  -- declined an install for THIS python in this session, we surface a
+  -- terse error notify (with the manual install command and a pointer to
+  -- :NotebookKernelSelect) instead of re-firing the modal prompt. Cleared
+  -- on `select_kernel` because that introduces a (potentially different)
+  -- python whose deps state the user hasn't decided on yet.
+  if self._install_declined and self._install_declined[python] then
+    Util.notify(
+      ("missing %s in %s — install with: %s -m pip install %s, "
+       .. "or switch kernel via :NotebookKernelSelect"):format(
+        missing_list, python, python, table.concat(res.missing, " ")),
+      vim.log.levels.ERROR)
+    return false
+  end
   local cfg = Cfg.get()
   local policy = (cfg.kernel or {}).auto_install
   if policy == nil then policy = "ask" end
@@ -123,6 +137,8 @@ function Kernel:_ensure_deps_or_offer_install()
   -- "ask" path: prompt asynchronously. Same retry-after-install contract as
   -- the silent path — when the user confirms, the install kicks off and
   -- they re-trigger execute() once we notify that the install landed.
+  -- On Cancel we record the decline so subsequent executes don't re-prompt
+  -- — the modal-style nagging was the user's complaint.
   vim.schedule(function()
     vim.ui.select(
       { "Install now", "Cancel" },
@@ -131,7 +147,12 @@ function Kernel:_ensure_deps_or_offer_install()
           :format(missing_list, python),
       },
       function(choice)
-        if choice == "Install now" then do_install() end
+        if choice == "Install now" then
+          do_install()
+        else
+          self_ref._install_declined = self_ref._install_declined or {}
+          self_ref._install_declined[python] = true
+        end
       end)
   end)
   return false
@@ -1133,6 +1154,10 @@ function Kernel:select_kernel(spec)
     python = spec.python,
     spec_path = spec.spec_path,
   }
+  -- New kernel = potentially different python = the user hasn't decided
+  -- about ITS deps state yet. Reset the declined-install gate so the
+  -- normal "ask once" flow fires fresh on the next execute.
+  self._install_declined = nil
 
   local nb = self.notebook
   if nb then

@@ -161,6 +161,91 @@ describe("kernel pre-launch dep check", function()
     os.remove(stub)
   end)
 
+  it("with auto_install=\"ask\" + user declines, does NOT re-prompt on next execute", function()
+    -- The user's exact complaint: every Shift-Enter triggered the install
+    -- modal again. After one decline, mercury must surface a terse error
+    -- notify (manual fix command + :NotebookKernelSelect hint) without
+    -- firing vim.ui.select again, until the kernel changes.
+    local stub = vim.fn.tempname() .. ".sh"
+    local f = io.open(stub, "w")
+    f:write("#!/bin/sh\necho jupyter_client\necho ipykernel\nexit 0\n")
+    f:close()
+    os.execute("chmod +x " .. stub)
+
+    Cfg.setup({
+      python = stub,
+      kernel = { auto_install = "ask" },
+    })
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=noredecl", "x = 1",
+    })
+    local nb = Notebook.attach(buf); nb:rescan()
+    local kernel = Kernel.new(nb)
+    nb:set_kernel(kernel)
+
+    -- Stub vim.ui.select to count invocations and force "Cancel" on the
+    -- first call.
+    local ui_select_calls = 0
+    local orig_select = vim.ui.select
+    vim.ui.select = function(items, opts, cb)
+      ui_select_calls = ui_select_calls + 1
+      cb("Cancel")
+    end
+
+    local ok1 = kernel:_ensure_deps_or_offer_install()
+    assert.is_false(ok1)
+    -- vim.ui.select is scheduled, so flush.
+    vim.wait(50, function() return ui_select_calls > 0 end)
+    assert.equals(1, ui_select_calls)
+    -- The decline persisted under the python path key.
+    assert.is_truthy(kernel._install_declined
+      and kernel._install_declined[stub])
+
+    -- Second execute attempt: must NOT re-prompt.
+    local ok2 = kernel:_ensure_deps_or_offer_install()
+    assert.is_false(ok2)
+    vim.wait(50, function() return false end)
+    assert.equals(1, ui_select_calls,
+      "decline must persist; no second modal prompt")
+
+    -- Third execute attempt: still no prompt.
+    kernel:_ensure_deps_or_offer_install()
+    vim.wait(50, function() return false end)
+    assert.equals(1, ui_select_calls)
+
+    vim.ui.select = orig_select
+    Notebook.detach(buf)
+    os.remove(stub)
+  end)
+
+  it("kernel switch clears the declined gate so the new kernel can prompt", function()
+    local stub = vim.fn.tempname() .. ".sh"
+    local f = io.open(stub, "w")
+    f:write("#!/bin/sh\necho jupyter_client\nexit 0\n")
+    f:close()
+    os.execute("chmod +x " .. stub)
+    Cfg.setup({ python = stub, kernel = { auto_install = "ask" } })
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=ksrclear", "x = 1",
+    })
+    local nb = Notebook.attach(buf); nb:rescan()
+    local kernel = Kernel.new(nb)
+    nb:set_kernel(kernel)
+    kernel._install_declined = { [stub] = true }
+
+    -- Switch kernel to a different python identifier — declined gate must clear.
+    kernel:select_kernel({ name = "python3" })
+    assert.is_nil(kernel._install_declined,
+      "select_kernel must clear declined state so a new python can prompt")
+
+    Notebook.detach(buf)
+    os.remove(stub)
+  end)
+
   it("with auto_install=true, kicks off install and reports it asynchronously", function()
     -- Stub python: first call reports both modules missing (the probe);
     -- subsequent `python -m pip install ...` invocations succeed (exit 0).
