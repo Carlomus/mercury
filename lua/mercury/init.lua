@@ -181,31 +181,40 @@ local function attach_buffer(buf, opts)
     callback = function() Notebook.detach(buf) end,
   })
 
-  -- image.nvim's render path requires a window currently showing the buffer.
   -- Re-render on BufWinEnter so images reappear when the buffer is revealed
-  -- in a new window. Force-invalidate the image cache first so the next
-  -- render creates FRESH handles (the previous design's re-paint-on-cache-hit
-  -- caused some image.nvim versions to render the image twice — second
-  -- render() treated as an additional placement, not a refresh).
+  -- in a new window. We do NOT force-invalidate the image cache here —
+  -- image.nvim's `clear()` isn't always a clean teardown of the terminal
+  -- placement, so clear-then-recreate produced visible duplicates ("2 slots
+  -- per image, image shows in either depending on scroll"). The cached
+  -- handles survive the buffer-revisit and image.nvim re-paints them
+  -- through its own redraw machinery.
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = buf_aug,
     buffer = buf,
     callback = function()
+      if vim.api.nvim_buf_is_loaded(buf) then renderer:render() end
+    end,
+  })
+
+  -- Tab / window switches: just re-run the renderer. Same rationale as
+  -- BufWinEnter — no force-invalidate, no duplicates.
+  vim.api.nvim_create_autocmd({ "TabEnter", "WinEnter" }, {
+    group = buf_aug,
+    callback = function()
+      if not vim.api.nvim_buf_is_valid(buf) then return end
       if not vim.api.nvim_buf_is_loaded(buf) then return end
-      if renderer.image and renderer.image.force_invalidate_all then
-        renderer.image:force_invalidate_all()
-      end
+      local wins = vim.fn.win_findbuf(buf) or {}
+      if #wins == 0 then return end
       renderer:render()
     end,
   })
 
-  -- Tab switches, window changes, and terminal resizes can leave image.nvim's
-  -- terminal-side placements stale. These events aren't buffer-scoped, so
-  -- register them globally on this buffer's per-buffer augroup and check
-  -- inside the callback that the buf is loaded and visible before
-  -- re-rendering. Force-invalidate before render() so handles get
-  -- recreated cleanly.
-  vim.api.nvim_create_autocmd({ "TabEnter", "WinEnter", "VimResized" }, {
+  -- Terminal resize: the cell pixel size genuinely changed, so cached
+  -- handles point at stale geometry. THIS is the one case where
+  -- force-invalidating is appropriate — image.nvim has to recompute
+  -- the placement at the new pixel scale. Without invalidation, cached
+  -- handles render at the old size on the resized terminal.
+  vim.api.nvim_create_autocmd("VimResized", {
     group = buf_aug,
     callback = function()
       if not vim.api.nvim_buf_is_valid(buf) then return end

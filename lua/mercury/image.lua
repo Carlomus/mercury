@@ -89,55 +89,22 @@ function Renderer:_visible_window()
   return nil
 end
 
--- Query image.nvim for the terminal's runtime cell pixel size. image.nvim
--- detects this at startup via XTSMGRAPHICS / CSI 14 t and uses it to scale
--- images. Mercury's config defaults (8×16) are a guess that often diverges
--- from the actual terminal — and the divergence is what makes our reserved
--- row counts differ from image.nvim's actual rendered height, which in
--- turn lets a tall image paint over content below it. Falls back to nil
--- if image.nvim isn't loaded or its API has shifted; the caller then uses
--- the config defaults.
-local function _runtime_cell_pixels()
-  local ok, term = pcall(require, "image.utils.term")
-  if not ok or type(term) ~= "table" then return nil, nil end
-  local getters = { term.get_size, term.dimensions }
-  for _, get in ipairs(getters) do
-    if type(get) == "function" then
-      local ok2, sz = pcall(get)
-      if ok2 and type(sz) == "table" then
-        -- image.nvim has used a few field names across versions; try all.
-        local w = sz.cell_size_x or sz.cell_width or sz.cell_pixel_width
-        local h = sz.cell_size_y or sz.cell_height or sz.cell_pixel_height
-        if type(w) == "number" and type(h) == "number" and w > 0 and h > 0 then
-          return w, h
-        end
-      end
-    end
-  end
-  return nil, nil
-end
-
--- Compute per-image render width (cols) and height (rows) without doing
--- any image.nvim placement. Returns:
---   widths[]          — per-image render width in columns
---   heights[]         — per-image render height in rows (incl. small
---                       safety margin — see below)
---   available_cols    — the window-width-derived cap used as the upper
---                       bound for each image's width
+-- Compute per-image render width (cols) and height (rows). Under the
+-- multi-extmark layout this is mostly used for WIDTH — image.nvim derives
+-- its own row count from the image's on-disk pixel dimensions plus the
+-- terminal's runtime cell size, and our `with_virtual_padding = true` on
+-- each image's extmark reserves exactly that many rows. The `heights[]`
+-- return value is kept for the legacy single-extmark `render` path (direct
+-- callers / tests).
 --
--- Used by output.lua to interleave image-blank rows with text in the
--- cell's virt_lines stack: it needs to know how many blank lines to
--- reserve per image BEFORE the placements are finalised. `image.unavailable`
--- is mutated on each image whose bytes can't be read (the renderer
--- surfaces a text placeholder for those).
---
--- Row count = `image_row_height(...) + 1` safety row. The +1 absorbs
--- off-by-one differences between our math and image.nvim's actual
--- terminal rendering (sub-pixel rounding, terminal-row spacing, cursor
--- bias). Without it, a tall image painted exactly on the boundary
--- spills into the row below, which is then the user's text — the
--- "image overlaps text" bug. One extra blank row per image is cheap
--- vertical space; an overlap that hides a print() line is not.
+-- `cell_width_px` / `cell_height_px` come from Mercury's config defaults
+-- (8×16). An earlier attempt queried `image.utils.term.get_size()` for
+-- the terminal's runtime values, but the API isn't stable across
+-- image.nvim versions and the returned values were often LARGER than
+-- our defaults — which made `natural_cols = ceil(w / cell_w)` smaller,
+-- so images rendered at a smaller width than users were used to. The
+-- config defaults are a known-good baseline; users can override via
+-- setup() if their terminal differs.
 function Renderer:compute_dimensions(images)
   local widths, heights = {}, {}
   if not images or #images == 0 then
@@ -150,12 +117,8 @@ function Renderer:compute_dimensions(images)
   local available_cols = math.max(20, math.floor(win_w * 0.85))
   local cfg = _cfg()
   local max_rows = cfg.image_max_height_rows or 40
-  -- Prefer image.nvim's runtime cell pixel size when available so our
-  -- height math matches its actual rendering. Fall back to config defaults
-  -- (8×16) when the API isn't reachable.
-  local rt_w, rt_h = _runtime_cell_pixels()
-  local cell_w = rt_w or cfg.cell_width_px or 8
-  local cell_h = rt_h or cfg.cell_height_px or 16
+  local cell_w = cfg.cell_width_px or 8
+  local cell_h = cfg.cell_height_px or 16
 
   for i, img in ipairs(images) do
     local img_cols = available_cols
@@ -173,8 +136,6 @@ function Renderer:compute_dimensions(images)
           local natural_cols = math.ceil(w / cell_w)
           img_cols = math.min(available_cols, natural_cols)
           rows = Output.image_row_height(w, h, img_cols, cell_w, cell_h, max_rows)
-          -- Per-image safety margin (+1 row). See header doc.
-          rows = math.min(rows + 1, max_rows)
         else
           -- Unknown dimensions (e.g. SVG without an intrinsic size): use the
           -- pessimistic max_rows so wide plots don't truncate. Invariant 15.
@@ -326,13 +287,19 @@ function Renderer:render_one(cell, anchor_row, img, slot_index)
     window = win,
     inline = true,
     with_virtual_padding = true,        -- image.nvim owns reservation
-    x = (slot_index or 1) - 1,
+    -- x = 0 for all images. Earlier versions used `slot_index - 1` to
+    -- "differentiate extmarks", but each image now lives in its OWN
+    -- image.nvim extmark — there's nothing to differentiate. Some
+    -- image.nvim builds interpret non-zero `x` as a literal terminal-
+    -- column offset, which would horizontally shift the 2nd / 3rd /
+    -- ... image relative to the first. Anchor everyone at column 0.
+    x = 0,
     y = anchor_row,
     width = widths[1],
-    -- No render_offset_top: each image lives in its own extmark, and
-    -- extmark virt_lines from prior segments (other images, text) at
-    -- the same anchor row stack BEFORE this one in creation order.
-    -- That is what produces document-order layout — not row math.
+    -- No render_offset_top: extmark virt_lines from prior segments at
+    -- the same anchor row stack BEFORE this one in creation order, so
+    -- document-order layout falls out of the extmark sequence rather
+    -- than any row math we perform here.
     render_offset_top = 0,
   }
 

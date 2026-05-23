@@ -953,10 +953,22 @@ updating this spec.
       hit so terminals that lost the placement got it back. Some
       image.nvim versions treated repeated `render()` as a SECOND
       placement rather than a refresh, producing the "single image
-      shows up twice" bug. Multi-extmark + `force_invalidate_all`
-      (called from `BufWinEnter` / `TabEnter` / `WinEnter` /
-      `VimResized`) gives the same recovery without the duplicate:
-      invalidate the cache → next render creates fresh handles.
+      shows up twice" bug. The current behavior: cached handles
+      survive cache hits with no further action — image.nvim's own
+      redraw machinery repaints them as the buffer scrolls or comes
+      back from hidden.
+
+    * **`force_invalidate_all` is `VimResized`-only.** It was briefly
+      wired to `BufWinEnter` / `TabEnter` / `WinEnter` to "clean up
+      stale terminal state" on tab returns. That made things worse:
+      image.nvim's `clear()` doesn't fully tear down the terminal
+      placement on every version, so clear-then-recreate sometimes
+      left BOTH the old placement and the new one visible — the user
+      saw two slots per image and the active one changed with scroll.
+      The terminal pixel size doesn't actually change on those
+      events, so cached handles are already correct; the only event
+      that DOES require invalidation is `VimResized`, where the cell
+      pixel size genuinely changed.
 
     The legacy single-extmark `Image:render` path (with cumulative
     offsets + last-image `with_virtual_padding`) is still present for

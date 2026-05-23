@@ -271,13 +271,15 @@ describe("ui shifts images below text via layout.text_offset", function()
   end)
 end)
 
-describe("compute_dimensions safety margin + runtime cell-pixel query", function()
-  it("adds a +1 safety row per image to absorb image.nvim height drift", function()
-    -- Tall image 400×600 at cell_width_px=8 / cell_height_px=16:
-    -- target_w_px = cols * 8, scaled_h_px = 600 * (cols*8 / 400),
-    -- rows = ceil(scaled_h / 16). compute_dimensions adds +1 on top
-    -- so any sub-cell off-by-one between our math and image.nvim's
-    -- actual rendering doesn't bleed into the row below the image.
+describe("compute_dimensions row math", function()
+  it("returns image_row_height directly (no safety bump under multi-extmark)", function()
+    -- The multi-extmark layout delegates row reservation to image.nvim
+    -- (each image's own extmark has `with_virtual_padding=true`), so we
+    -- no longer need a safety bump on top of image_row_height —
+    -- image.nvim reserves exactly what it actually renders. Pin that
+    -- the returned height matches image_row_height with no inflation;
+    -- a future regression adding margin back would silently waste
+    -- vertical space below every image.
     local Util = require("mercury.util")
     local Image = require("mercury.image")
     local function fake_png_local(w, h)
@@ -303,29 +305,19 @@ describe("compute_dimensions safety margin + runtime cell-pixel query", function
     local _, heights = Image.new(nb):compute_dimensions({
       { kind = "png", path = "/tmp/safetym.png", hash = "safetym" },
     })
-    -- The bare image_row_height for 400×600 with default cell sizes
-    -- gives some value; our compute_dimensions adds +1 on top of it.
-    -- Verify the safety bump is included.
     local Output = require("mercury.output")
     local available = math.max(20, math.floor(
       vim.api.nvim_win_get_width(0) * 0.85))
     local natural_cols = math.ceil(400 / 8)
     local bare = Output.image_row_height(400, 600,
       math.min(available, natural_cols), 8, 16, 40)
-    -- compute_dimensions clamps to max_rows; under the clamp, our
-    -- safety bump applies. If the bare value is already at max_rows
-    -- the safety has no effect (already clamped), so check both cases.
-    if bare < 40 then
-      assert.equals(bare + 1, heights[1],
-        ("expected height = bare(%d) + 1 safety; got %d"):format(bare, heights[1]))
-    else
-      assert.equals(40, heights[1])
-    end
+    assert.equals(bare, heights[1],
+      ("expected bare image_row_height (%d); got %d"):format(bare, heights[1]))
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/safetym.png")
   end)
 
-  it("safety margin never exceeds image_max_height_rows clamp", function()
+  it("max_rows clamp still applies (no overflow on huge images)", function()
     -- Image so tall that bare row count already saturates max_rows. The
     -- +1 safety must NOT push past the clamp — that's the upper bound
     -- the user configured to keep cells from dominating the screen.
