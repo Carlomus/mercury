@@ -1113,6 +1113,31 @@ updating this spec.
     1-row gap below every image absorbs typical drift; users on
     unusual terminals override `output.cell_height_px` via setup().
 
+    **I17 — Mercury fully REMOVES images from image.nvim's registry,
+    not just clears them.** `Image:clear()` deletes the buffer
+    extmark and clears the terminal pixels, but does NOT remove the
+    Image object from image.nvim's `state.images` table. image.nvim's
+    `WinScrolled` / `WinResized` autocmds iterate that table and
+    call `render()` on every entry — recreating extmarks and
+    re-painting cleared images. The user-visible bug:
+    `:NotebookKernelRestartClear` would clear outputs and Mercury's
+    image handles, but the images would reappear on the next scroll
+    event because image.nvim's registry still held them.
+
+    image.nvim doesn't expose a public removal API. Mercury reaches
+    into `image.global_state.images[image.id] = nil` after calling
+    `Image:clear()`. This is a bounded internal-state hack — if
+    image.nvim ever ships a public `api.destroy(id)`, swap to that.
+
+    Applied at three sites in `image.lua`:
+      * `_clear_handles(cell_id)` — when a cell is deleted, merged,
+        or its output cleared.
+      * Cache-eviction loop inside `Renderer:render` — when an
+        image's hash disappears from the current render's image set
+        (cell re-execution producing different output).
+      * Cache-miss replacement inside the render loop — when a new
+        image replaces an old one at the same cell.
+
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
     Attaching `_image_blank = true` to a `{ text, hl }` chunk made

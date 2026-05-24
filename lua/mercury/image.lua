@@ -45,11 +45,35 @@ local function same_placement(a, b)
     and a.window == b.window
 end
 
+-- Fully remove an image.nvim image from its global registry.
+-- `Image:clear()` removes the buffer extmark and clears the terminal
+-- pixels, but image.nvim KEEPS the image object in `state.images`. Its
+-- WinScrolled / WinResized autocmds then iterate that registry and
+-- call `render()` on each image — recreating extmarks and re-painting
+-- the kitty graphics. That's why "RestartClear doesn't work": Mercury
+-- clears, image.nvim brings the images back.
+--
+-- image.nvim doesn't expose a public removal API, but each Image holds
+-- a reference to the global state table via `image.global_state`. We
+-- reach into `global_state.images` and nil out the entry after a
+-- standard clear, so the next autocmd-driven render can't find it.
+-- This is a bounded hack; if image.nvim ever ships a public
+-- `api.destroy(id)`, swap to that.
+local function _fully_remove_image(img)
+  if not img then return end
+  pcall(function() if img.clear then img:clear() end end)
+  pcall(function()
+    if img.global_state and img.global_state.images and img.id then
+      img.global_state.images[img.id] = nil
+    end
+  end)
+end
+
 function Renderer:_clear_handles(cell_id)
   local entry = self.cache[cell_id]
   if not entry then return end
   for _, img in pairs(entry.handles) do
-    pcall(function() if img and img.clear then img:clear() end end)
+    _fully_remove_image(img)
   end
   self.cache[cell_id] = nil
 end
@@ -293,7 +317,9 @@ function Renderer:render(cell, anchor_row, images, layout)
       local handle = entry.handles[img.hash]
       local prev = entry.placements[img.hash]
       if not (handle and same_placement(prev, opts)) then
-        if handle and handle.clear then pcall(function() handle:clear() end) end
+        -- Fully remove the prior image from image.nvim's registry so
+        -- it can't be re-rendered by autocmds (SPEC I17).
+        if handle then _fully_remove_image(handle) end
         local ok, h = pcall(mod.from_file, img.path, opts)
         if ok and h then
           pcall(function() h:render() end)
@@ -318,7 +344,9 @@ function Renderer:render(cell, anchor_row, images, layout)
 
   for hash, h in pairs(entry.handles) do
     if not seen[hash] then
-      pcall(function() if h.clear then h:clear() end end)
+      -- Fully remove (not just clear) so image.nvim's autocmds can't
+      -- re-render this stale image. SPEC I17.
+      _fully_remove_image(h)
       entry.handles[hash] = nil
       entry.placements[hash] = nil
     end

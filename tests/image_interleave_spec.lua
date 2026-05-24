@@ -592,6 +592,73 @@ describe("SPEC image invariants — direct pins", function()
     package.loaded["mercury.image"] = nil
   end)
 
+  it("I17: clearing an image removes it from image.nvim's global_state.images", function()
+    -- image.nvim's autocmds iterate state.images and call render() on
+    -- each, recreating extmarks. Just calling Image:clear() leaves the
+    -- entry behind — cleared images come back on next scroll. SPEC I17
+    -- says Mercury reaches into image.global_state.images and nils the
+    -- entry to fully evict.
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util.write_file("/tmp/inv_clear.png", fake_png_local(400, 200))
+
+    -- Spoof a fake image module that tracks state.images registry.
+    local fake_registry = {}
+    package.loaded["image"] = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        local handle
+        handle = {
+          id = path,
+          buffer = opts.buffer,
+          global_state = { images = fake_registry },
+          render = function() fake_registry[path] = handle end,
+          clear = function() end,        -- no-op, like real image.nvim
+        }
+        return handle
+      end,
+    }
+    package.loaded["mercury.image"] = nil
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=invclr01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local renderer = require("mercury.image").new(nb)
+    renderer:render(nb.cells[1], nb:cell_anchor_row(nb.cells[1]),
+      { { kind = "png", path = "/tmp/inv_clear.png", hash = "iclr" } })
+    assert.is_not_nil(fake_registry["/tmp/inv_clear.png"],
+      "after render, image must be registered in image.nvim state")
+
+    -- Clear the cell — Mercury should fully remove from state.images.
+    renderer:clear_cell(nb.cells[1])
+    assert.is_nil(fake_registry["/tmp/inv_clear.png"],
+      ("SPEC I17 violated: cleared image must NOT survive in "
+        .. "image.nvim's state.images registry; otherwise the "
+        .. "WinScrolled autocmd re-renders it and the user sees "
+        .. "the image come back after :NotebookKernelRestartClear"))
+
+    require("mercury.notebook").detach(buf)
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+    os.remove("/tmp/inv_clear.png")
+  end)
+
   it("I13: image with no preceding text still lands BELOW the pill (offset >= 2)", function()
     -- Single image, no text. pill_rows=1, no body before. virt_line_idx=1.
     -- render_offset_top must be 1 + 1 = 2, so the image lands at
