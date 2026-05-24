@@ -1138,31 +1138,64 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — Known limitation: partial-scroll lock.** image.nvim's
-    renderer has a branch:
+    **I18 — Mercury detects image.nvim's partial-scroll lock and
+    pre-clears images so the lock branch has nothing to lock.**
+    image.nvim's renderer has a branch:
 
     ```lua
     if original_y + 1 == win_info.topline then
       absolute_y = win_info.winrow      -- lock at top of viewport
     ```
 
-    When the user scrolls into a cell's virt_lines, Vim keeps
-    `topline` pinned to the row holding the virt_lines (the cell's
-    `body_end`). image.nvim's check fires and locks the image at
-    `winrow` while buffer text scrolls past — visually the image
-    "stays fixed on the terminal" / "moves below the text".
+    Fires when (a) the image's anchor row equals `topline` AND (b)
+    `screenpos(window, anchor_row+1, 1)` returns 0,0 (anchor itself
+    isn't visible — Vim is showing the cell's virt_lines area past
+    winrow). Without intervention the image pins to `winrow` and
+    stays put as buffer text scrolls past, violating "images stay
+    inside their cell outputs" (the user-visible "images scroll with
+    the terminal" complaint).
 
-    Mercury attempted a fix using `window = nil` + manual
-    `image:move` on WinScrolled (formerly I18 / I19). That broke
-    layout entirely (images all over the place, overlapping,
-    floating). REVERTED. Current code keeps `window = current_win`;
-    image.nvim's scroll lock remains a known limitation pending
-    upstream support for disabling the partial-scroll path per
-    image. No public option for that exists today.
+    Fix lives in `init.lua` (per-buffer WinScrolled autocmd):
+      * Compute the set of cells currently satisfying both (a) and
+        (b). Call this the **lock zone**.
+      * For each cell newly entering the lock zone, call
+        `Renderer.image:_clear_handles(cell_id)` — this fully evicts
+        the cell's image handles from image.nvim's `state.images`
+        (SPEC I17). The lock-fire branch then finds no image to
+        lock; the image vanishes for the duration of the in-virt_lines
+        scroll. Vanishing is the lesser evil: image scrolling with
+        its cell off-screen matches user expectations far better than
+        image staying glued to winrow.
+      * For each cell newly leaving the lock zone, call
+        `renderer:render()` so the (empty) cache hits the cache-miss
+        path and recreates the handle via `from_file`.
 
-    Workaround for users: avoid scrolling INTO a cell's image area;
-    scroll past the whole cell instead. The lock only fires when
-    `topline` is exactly on the cell's `body_end`.
+    Additionally the same WinScrolled callback invokes
+    `Renderer.image:rerender_all_handles()` (a new helper that calls
+    `handle:render()` on every cached handle). image.nvim's own
+    WinScrolled handler defers its render through `vim.schedule`
+    (see `render_scheduler.lua`), so there is one event-loop tick of
+    latency between the scroll and image.nvim moving the image to
+    its new screen position. During that tick the image is at the
+    previous tick's pixel coordinates while the text has already
+    moved — perceived as "image lags the scroll" / "image scrolls
+    with the terminal". Calling `handle:render()` inline gives
+    image.nvim a fresh screen_pos read on the same tick.
+
+    Earlier failed attempt (formerly I18 / I19): `window = nil` +
+    manual `image:move` on WinScrolled. That broke layout entirely
+    (images all over the place, overlapping, floating). REVERTED.
+    The current detect-and-clear approach is cheaper (no
+    monkey-patching, no `image:move` math), targets only the
+    pathological frames, and degrades gracefully (worst case: image
+    briefly hidden during scroll-through-virt_lines).
+
+    Coalescing: the WinScrolled hook is NOT coalesced — coalescing
+    would reintroduce the lag. Work per scroll is small (cheap
+    screenpos query per cell + `handle:render()` per handle, no disk
+    read because image bytes are already in image.nvim's
+    `transmitted_images` cache and the placement is just a re-emit
+    of the kitty graphics command).
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

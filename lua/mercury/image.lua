@@ -345,4 +345,20 @@ function Renderer:force_invalidate_all()
   for id, _ in pairs(self.cache) do self:_clear_handles(id) end
 end
 
+-- Force image.nvim to re-render every cached handle. Used by the
+-- WinScrolled autocmd in init.lua to compensate for image.nvim's own
+-- scroll handler lagging — without this prompt re-render, the image
+-- can stay anchored to its previous terminal-cell position while the
+-- buffer text scrolls past it (the "images scroll with the terminal,
+-- not with the cell" complaint). image:render() is cheap on a
+-- previously-loaded handle (no disk read, no decode); it just
+-- re-computes screen_pos and re-emits the kitty graphics placement.
+function Renderer:rerender_all_handles()
+  for _, entry in pairs(self.cache or {}) do
+    for _, handle in pairs(entry.handles or {}) do
+      pcall(function() if handle.render then handle:render() end end)
+    end
+  end
+end
+
 return M

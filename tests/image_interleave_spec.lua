@@ -660,6 +660,69 @@ describe("SPEC image invariants — direct pins", function()
     os.remove("/tmp/inv_clear.png")
   end)
 
+  it("I18: rerender_all_handles calls render() on every cached handle", function()
+    -- SPEC I18 (issue 2): image.nvim's WinScrolled handler defers its
+    -- render via vim.schedule, so the image lags one event-loop tick
+    -- behind the buffer text on every scroll. Mercury's WinScrolled
+    -- hook calls Renderer:rerender_all_handles() inline to emit a
+    -- fresh placement on the same tick.
+    --
+    -- Pin the behavior: after a render, calling rerender_all_handles
+    -- must invoke handle:render() once per cached handle (without
+    -- creating new handles or going through from_file again).
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    Util.write_file("/tmp/inv_rer_a.png", fake_png(400, 200))
+    Util.write_file("/tmp/inv_rer_b.png", fake_png(400, 200))
+
+    local from_file_calls = 0
+    local render_calls = 0
+    package.loaded["image"] = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        from_file_calls = from_file_calls + 1
+        return {
+          id = path,
+          render = function() render_calls = render_calls + 1 end,
+          clear = function() end,
+        }
+      end,
+    }
+    package.loaded["mercury.image"] = nil
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=invrer01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local renderer = require("mercury.image").new(nb)
+    renderer:render(nb.cells[1], nb:cell_anchor_row(nb.cells[1]),
+      {
+        { kind = "png", path = "/tmp/inv_rer_a.png", hash = "rer_a" },
+        { kind = "png", path = "/tmp/inv_rer_b.png", hash = "rer_b" },
+      })
+    -- Two from_file calls and two render() calls from the initial
+    -- render path.
+    assert.equals(2, from_file_calls)
+    assert.equals(2, render_calls)
+
+    -- Now invoke rerender_all_handles. from_file MUST NOT be called
+    -- again (no disk read / decode), but render() MUST fire once per
+    -- cached handle.
+    renderer:rerender_all_handles()
+    assert.equals(2, from_file_calls,
+      "rerender_all_handles must NOT re-decode images (no from_file)")
+    assert.equals(4, render_calls,
+      ("SPEC I18: rerender_all_handles must call render() once per "
+        .. "cached handle (expected 4 total, got %d)"):format(render_calls))
+
+    require("mercury.notebook").detach(buf)
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+    os.remove("/tmp/inv_rer_a.png"); os.remove("/tmp/inv_rer_b.png")
+  end)
+
   it("I13: image with no preceding text still lands BELOW the pill (offset >= 2)", function()
     -- Single image, no text. pill_rows=1, no body before. virt_line_idx=1.
     -- render_offset_top must be 1 + 1 = 2, so the image lands at
