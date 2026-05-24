@@ -228,6 +228,26 @@ local function attach_buffer(buf, opts)
     end,
   })
 
+  -- SPEC I18: Mercury owns image positioning under `window=nil` mode.
+  -- image.nvim's WinScrolled autocmd filters by `(window, buffer)` —
+  -- our `window=nil` images don't match, so image.nvim never repaints
+  -- them on scroll. We hook WinScrolled ourselves and update each
+  -- cached image's terminal `y` via `image:move(x, y)`. Bypasses the
+  -- partial-scroll lock that previously made images stay fixed on
+  -- the screen while text scrolled past them.
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = buf_aug,
+    callback = function()
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      if not vim.api.nvim_buf_is_loaded(buf) then return end
+      local wins = vim.fn.win_findbuf(buf) or {}
+      if #wins == 0 then return end
+      if renderer.image and renderer.image.reposition_for_scroll then
+        renderer.image:reposition_for_scroll()
+      end
+    end,
+  })
+
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)
 

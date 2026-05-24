@@ -1138,6 +1138,55 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
+    **I18 — Mercury uses image.nvim's `window=nil` absolute-position
+    mode and owns scroll updates itself.** image.nvim's
+    `window=current_win` mode triggers a "partial-scroll" branch in
+    `renderer.lua` when the user scrolls into a cell's virt_lines:
+    Vim pins `topline` to the row holding those virt_lines, and
+    image.nvim's `if original_y + 1 == topline` check fires, locking
+    the image at `winrow` while the buffer text scrolls past it.
+    That produced the "image stays fixed on terminal", "image
+    appears below text after scrolling", and "second image at fixed
+    position" reports.
+
+    Under `window=nil`, image.nvim's renderer uses
+    `absolute_y = original_y + render_offset_top` — straight terminal
+    coordinates, no scroll branches. AND image.nvim's `WinScrolled`
+    autocmd path filters `api.get_images({window=winid, buffer=bufnr})`
+    by both window and buffer, with each image's `window` checked
+    against the filter's `window`. Our images carry `window=nil`,
+    fail the filter, and are NOT iterated by image.nvim's autocmd.
+    Mercury holds full control over scroll-driven re-rendering.
+
+    `Renderer:render` computes the screen row of the cell's
+    `body_end` via `vim.fn.screenpos(focused_win, body_end+1, 1)` at
+    render time and passes it as the image's `y`. The buffer-relative
+    `anchor_row` is stashed on the cache entry so the scroll handler
+    can recompute terminal coords later. `Renderer:reposition_for_scroll`
+    iterates every cached image, recomputes the screen row, and calls
+    `image:move(x, new_y)` to update the placement; image.nvim's
+    `move()` invokes its render() which paints at the new terminal
+    coordinates.
+
+    Off-screen handling: when `screenpos` returns `0,0` (anchor not
+    in viewport), Mercury substitutes a sentinel `y = -1000`. image.nvim's
+    `is_above` bounds check (`absolute_y + height <= 0`) fires and the
+    backend clears the terminal pixels for that image until the
+    next scroll brings the anchor back into view.
+
+    init.lua hooks `WinScrolled` on the per-buffer augroup; the
+    callback only runs when the notebook buffer is currently visible
+    in some window. `image:move` is cheap (no disk read, no decode)
+    so per-scroll repositioning is acceptable performance-wise.
+
+    Multi-window caveat: when the same notebook buffer is open in
+    multiple windows, `_visible_window()` returns the focused window
+    (or the first one). Images render at THAT window's screen
+    coordinates — they don't show correctly in other splits showing
+    the same buffer. Known limitation; image.nvim itself has the
+    same single-window restriction for its `window=winid` mode, so
+    this matches its baseline.
+
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
     Attaching `_image_blank = true` to a `{ text, hl }` chunk made

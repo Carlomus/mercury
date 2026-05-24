@@ -592,6 +592,102 @@ describe("SPEC image invariants — direct pins", function()
     package.loaded["mercury.image"] = nil
   end)
 
+  it("I18: image opts pass window=nil so image.nvim's scroll path is bypassed", function()
+    -- Under SPEC I18 Mercury uses image.nvim's absolute-position mode:
+    -- `window = nil`. image.nvim's `WinScrolled` autocmd filters by
+    -- (window, buffer) and our nil-window images miss the filter, so
+    -- image.nvim never re-renders them on scroll. Mercury owns scroll
+    -- updates via reposition_for_scroll.
+    local buf = _setup_cell(
+      { { type = "display_data", data = { ["image/png"] = "a" } } },
+      { { kind = "png", path = "/tmp/inv_a.png", hash = "iw1", item_index = 1 } })
+    assert.equals(1, #recorded2)
+    assert.is_nil(recorded2[1].opts.window,
+      "SPEC I18: window must be nil so image.nvim's partial-scroll "
+        .. "branches don't fire")
+    require("mercury.notebook").detach(buf)
+  end)
+
+  it("I18: reposition_for_scroll updates y via image:move (cheap, no from_file)", function()
+    -- The scroll-driven update path: when the user scrolls, terminal
+    -- row of the anchor changes. Mercury's WinScrolled handler calls
+    -- reposition_for_scroll which iterates cached images and updates
+    -- each via image:move. NOT from_file (which would destroy +
+    -- recreate the image and flicker).
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util.write_file("/tmp/i18_move.png", fake_png_local(400, 200))
+
+    -- Track move calls separately from from_file calls.
+    local moves = {}
+    local from_files = {}
+    package.loaded["image"] = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        table.insert(from_files, { path = path, opts = opts })
+        local handle = {
+          id = path .. "#" .. #from_files,
+          global_state = { images = {} },
+          buffer = opts.buffer,
+          geometry = { x = opts.x, y = opts.y, width = opts.width },
+          render = function() end,
+          clear = function() end,
+          move = function(self, x, y)
+            self.geometry.x = x; self.geometry.y = y
+            table.insert(moves, { id = self.id, x = x, y = y })
+          end,
+        }
+        return handle
+      end,
+    }
+    package.loaded["mercury.image"] = nil
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=i18mov01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local renderer = require("mercury.image").new(nb)
+    local anchor = nb:cell_anchor_row(nb.cells[1])
+    local images = { { kind = "png", path = "/tmp/i18_move.png", hash = "i18mv" } }
+
+    renderer:render(nb.cells[1], anchor, images)
+    assert.equals(1, #from_files,
+      "initial render must create the image via from_file")
+    assert.equals(0, #moves,
+      "initial render must NOT call move (just from_file)")
+
+    -- Simulate scroll: reposition_for_scroll iterates cached images.
+    -- Because the buffer hasn't actually scrolled, the recomputed y
+    -- equals the cached y → no move call. Pin this so reposition
+    -- doesn't churn on no-op scroll events.
+    renderer:reposition_for_scroll()
+    assert.equals(0, #moves,
+      "reposition_for_scroll must NOT move when y is unchanged (cache hit)")
+    -- And it doesn't create a new image either.
+    assert.equals(1, #from_files,
+      "reposition_for_scroll must NEVER call from_file (move only)")
+
+    require("mercury.notebook").detach(buf)
+    os.remove("/tmp/i18_move.png")
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+  end)
+
   it("I17: clearing an image removes it from image.nvim's global_state.images", function()
     -- image.nvim's autocmds iterate state.images and call render() on
     -- each, recreating extmarks. Just calling Image:clear() leaves the
