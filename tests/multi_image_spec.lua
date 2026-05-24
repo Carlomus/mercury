@@ -99,9 +99,11 @@ describe("multi-image stacking", function()
     assert.is_true(recorded[2].opts.render_offset_top > 0)
     assert.is_true(recorded[3].opts.render_offset_top > recorded[2].opts.render_offset_top)
     -- Only the last reserves virtual padding.
+    -- SPEC I9/I16: every image has padding=false (Mercury's virt_lines
+    -- are the sole row reservation).
     assert.is_false(recorded[1].opts.with_virtual_padding)
     assert.is_false(recorded[2].opts.with_virtual_padding)
-    assert.is_true(recorded[3].opts.with_virtual_padding)
+    assert.is_false(recorded[3].opts.with_virtual_padding)
     -- All images share the same buffer-row anchor.
     assert.equals(recorded[1].opts.y, recorded[2].opts.y)
     assert.equals(recorded[2].opts.y, recorded[3].opts.y)

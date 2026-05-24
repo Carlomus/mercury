@@ -254,33 +254,37 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- to convert. Forgetting this +1 makes the image render at virt_line[K-1]
   -- — concretely, the first image ends up on the pill row (overlap).
   local offsets = layout.offsets
-  local trailing_index = layout.trailing_index   -- SPEC I15
   local text_offset = layout.text_offset or 0
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
     if not img.unavailable then
-      local is_last = (i == #images)
-      local is_trailing = (trailing_index ~= nil and i == trailing_index)
       -- SPEC I4: cumulative offsets stack images vertically with a +1
       -- visual gap row baked in.
       local virt_line_idx = offsets and offsets[i] or (text_offset + cumulative)
       local off = virt_line_idx + 1   -- SPEC I13: convert idx → screen offset
-      -- SPEC I15: when the image is the trailing item in the cell,
-      -- output.lua skipped its blank-row reservation. image.nvim takes
-      -- over by setting `with_virtual_padding = true` AND passing
-      -- `overlap = render_offset_top`, so its `get_reserved_lines`
-      -- formula collapses to `image_height + 1` — image.nvim adds the
-      -- minimum rows it actually needs (no offset_top duplication),
-      -- avoiding the double-reservation that bloated single-image cells.
-      -- Non-trailing images keep with_virtual_padding=false because our
-      -- virt_lines already reserved their rows (SPEC I9).
+      -- SPEC I16: `with_virtual_padding = false` for ALL images and
+      -- `overlap` is NEVER set. Mercury's own virt_lines (built in
+      -- output.lua) are the sole reservation source. Both image.nvim
+      -- alternatives produced visible bugs:
+      --   * with_virtual_padding=true (no overlap) duplicated the
+      --     `render_offset_top + image_height` reservation on top of
+      --     Mercury's blanks → bloated cells with "empty space till
+      --     end of screen".
+      --   * `overlap = render_offset_top` shrank that to image_height+1
+      --     but flipped image.nvim into its partial-scroll path
+      --     (`get_overlap_scroll_position`), which kept the image
+      --     locked to the screen top and blocked viewport scrolling
+      --     past the anchor row.
+      -- With I14 row math matching image.nvim's runtime cell sizes
+      -- and a 1-row gap below each image absorbing sub-cell drift,
+      -- our reservation alone is enough. Cell-spill safety relies on
+      -- matched math + the gap (no image.nvim backstop).
       local opts = {
         buffer = self.notebook.buf,
         window = win,
         inline = true,
-        with_virtual_padding = is_trailing or (trailing_index == nil and is_last),
-        overlap = is_trailing and off or nil,
+        with_virtual_padding = false,
         x = i - 1,
         y = anchor_row,
         width = widths[i],

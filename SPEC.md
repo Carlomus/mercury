@@ -937,11 +937,15 @@ updating this spec.
     vertically (cumulative `render_offset_top`), each fully visible,
     separated by a 1-row visual gap.
 
-    **I5 — No spill into the next cell.** The LAST image carries
-    `with_virtual_padding = true`. image.nvim's reservation
-    `= render_offset_top + rendered_height` then equals the full
-    stack height relative to the anchor, pushing the next cell clear
-    even when our row math underestimates.
+    **I5 — Best-effort cell-spill safety via matched row math.**
+    Mercury's reservation aims to match image.nvim's actual render
+    via I14 (runtime cell sizes) plus a 1-row gap below each image.
+    There is NO image.nvim backstop — `with_virtual_padding = true`
+    is no longer used (see I16). On terminals where the runtime
+    cell query is unreachable AND cell aspect deviates >1 row
+    from 8×16, the last image's bottom row may bleed into the next
+    cell. Users on such terminals override `output.cell_height_px`
+    via `setup()`.
 
     **I6 — Per-image height: NO safety margin.** Each image's reserved
     virt_lines = `image_row_height(...)`, clamped to
@@ -982,11 +986,11 @@ updating this spec.
     Single-extmark + cumulative offsets is the only configuration
     that satisfies I2–I5 simultaneously.
 
-    **I9 — `with_virtual_padding = false` on non-last images.**
-    Combined with I8: image.nvim's per-image virtual padding would
-    stack additively with our single-extmark virt_lines, double-
-    reserving rows below every intermediate image. Only the last
-    image needs the backstop (I5).
+    **I9 — `with_virtual_padding = false` on EVERY image.** image.nvim's
+    per-image virtual padding stacks additively with our virt_lines
+    and double-reserves rows below every image. Combined with I16
+    below: Mercury's virt_lines are the sole row reservation; image.nvim
+    only paints the pixels.
 
     **I10 — `same_placement` invalidation fields.** A cached
     image.nvim handle is reused only when ALL of these match: window
@@ -1077,38 +1081,37 @@ updating this spec.
     source of truth; it returns `nil, nil` on any failure path so
     the caller's config-default fallback runs.
 
-    **I15 — Trailing-image optimisation eliminates double-reservation.**
-    When the LAST item in `out.items` is an image-rendering item,
-    Mercury treats that image as "trailing" and delegates its row
-    reservation entirely to image.nvim:
+    **I16 — Mercury's virt_lines are the SOLE row reservation.**
+    No `with_virtual_padding`. No `overlap`. image.nvim only paints
+    pixels at `screenpos + render_offset_top`; the row count comes
+    from `build_virt_lines` pushing image-blank rows for every image,
+    period.
 
-      * `output.lua` SKIPS pushing the image's blank rows in our
-        extmark's virt_lines — `image_offsets[trailing_idx]` is
-        recorded but no blanks follow it.
+    Two image.nvim parameters were tried and discarded:
 
-      * `image.lua` passes `with_virtual_padding = true` AND
-        `overlap = render_offset_top` to image.nvim's `from_file`.
-        image.nvim's `get_reserved_lines` formula collapses to
-        `image_height + 1` (instead of `offset_top + image_height`),
-        adding only the minimum rows it actually needs.
+      * `with_virtual_padding = true` (no overlap) duplicates the
+        `render_offset_top + image_height` reservation on top of our
+        virt_lines, producing visible "empty space till end of
+        screen" below every image.
 
-    The result: a single-image cell reserves
-    `pill_rows + image_height + 1` virt_lines total — one row of
-    text + the image's actual height + 1 backstop row — rather than
-    `pill_rows + image_blanks + (offset_top + image_height)` which
-    visibly reserved "space for two images" for every single-image
-    cell. Sequential images shrink correspondingly.
+      * `overlap = render_offset_top` shrinks that to
+        `image_height + 1`, BUT it flips image.nvim's renderer into
+        the `get_overlap_scroll_position` partial-scroll path, which
+        locks the image to the screen top and blocks the viewport
+        from scrolling past the anchor row (top-of-buffer scroll
+        becomes stuck, and image-at-bottom scroll becomes stuck
+        scrolling down). The `overlap` option is documented for
+        images that visually cover REAL buffer lines, not virt_lines,
+        and image.nvim's scroll handling assumes that semantic.
 
-    The optimisation applies ONLY when the LAST item is an image:
-    if anything (text, error, etc.) follows the last image, Mercury
-    still pushes that image's blanks normally so the following text
-    renders below it. The check lives in `build_virt_lines` and only
-    fires when image.nvim is available AND the image's bytes are
-    loadable — otherwise the placeholder text needs our blanks.
-
-    Cache invalidation: `same_placement` in `image.lua` includes
-    `overlap` so a switch between trailing / non-trailing for the
-    same image hash invalidates the cached image.nvim handle.
+    Trade-off accepted by I16: cell-spill safety becomes
+    "best-effort matched math" (I14 + the 1-row gap in I6's
+    formula) rather than a hard image.nvim backstop. On terminals
+    where the runtime cell-size query fails AND the cell aspect
+    deviates from 8×16 by more than one row of drift, the last
+    image's bottom row may visually bleed into the next cell. The
+    1-row gap below every image absorbs typical drift; users on
+    unusual terminals override `output.cell_height_px` via setup().
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

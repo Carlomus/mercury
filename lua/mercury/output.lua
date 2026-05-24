@@ -245,54 +245,14 @@ function M.build_virt_lines(out, opts)
   -- crashes on the first real render).
   local body_blank = {}
 
-  -- Identify the "trailing image" — the image whose item is the LAST
-  -- item in `items`. For that image alone we skip our blank-row
-  -- reservation and let image.nvim's `with_virtual_padding=true`
-  -- (with `overlap = render_offset_top`) reserve the space instead.
-  -- Eliminates the double-reservation that bloated every cell that
-  -- ended in an image (the "single image takes 2 images' worth of
-  -- space" regression). If the last item is text (or any non-image),
-  -- there is no trailing image — every image gets normal blanks so
-  -- text below stays visible.
-  --
-  -- `trailing_img_idx` is the 1-based position in extract_images
-  -- order (= the count of image-rendering items seen up to and
-  -- including the last item). nil when the last item isn't an
-  -- image-rendering item.
-  local trailing_img_idx
-  do
-    local last_item = items[#items]
-    local last_is_image = false
-    if last_item and (last_item.type == "display_data"
-                       or last_item.type == "execute_result") then
-      local mime = pick_mime(last_item.data)
-      if mime == "image/png" or mime == "image/jpeg"
-          or mime == "image/svg+xml" then
-        -- Image.nvim must be available AND the bytes must be loadable
-        -- for the trailing optimization to apply — otherwise the
-        -- placeholder text takes our blanks' place and a special-case
-        -- skip would render a hole.
-        local image_ok, Image = pcall(require, "mercury.image")
-        if image_ok and Image.available()
-            and not last_item._mercury_image_unavailable then
-          last_is_image = true
-        end
-      end
-    end
-    if last_is_image then
-      local count = 0
-      for _, it in ipairs(items) do
-        if it.type == "display_data" or it.type == "execute_result" then
-          local m = pick_mime(it.data)
-          if m == "image/png" or m == "image/jpeg"
-              or m == "image/svg+xml" then
-            count = count + 1
-          end
-        end
-      end
-      trailing_img_idx = count
-    end
-  end
+  -- SPEC I16: All images reserve their blanks in our virt_lines. The
+  -- earlier "trailing image" optimisation skipped this reservation
+  -- for the last image and let image.nvim's `with_virtual_padding=true`
+  -- + `overlap=render_offset_top` reserve instead — but `overlap`
+  -- triggers image.nvim's partial-scroll path which locked the image
+  -- to the screen top and blocked viewport scrolling past the anchor.
+  -- Reserving in our virt_lines is the single source of truth; image.nvim
+  -- only paints the pixels.
   -- Bookkeeping for the interleave path. `_img_idx` tracks position in
   -- extract_images()'s ordering (= item order, since both walk
   -- `out.items` and only image-bearing items count). `_pill_rows` is
@@ -310,15 +270,12 @@ function M.build_virt_lines(out, opts)
     _img_idx = _img_idx + 1
     if opts.image_heights and opts.image_heights[_img_idx] then
       image_offsets[_img_idx] = _pill_rows + #body_lines
-      -- Trailing image: don't push blanks. image.nvim's
-      -- with_virtual_padding=true (with overlap=render_offset_top in
-      -- image.lua) will reserve just image_height+1 rows — far less
-      -- waste than our blanks + image.nvim's full reservation.
-      if _img_idx == trailing_img_idx then return end
       local h = opts.image_heights[_img_idx]
       for _ = 1, h do _push_blank() end
       -- Trailing visual gap so consecutive images (or text immediately
-      -- after) don't touch the image.
+      -- after) don't touch the image, AND a 1-row buffer for any
+      -- sub-cell drift between Mercury's row math and image.nvim's
+      -- actual render (SPEC I6).
       _push_blank()
       return
     end
@@ -453,7 +410,7 @@ function M.build_virt_lines(out, opts)
     lines[#lines + 1] =
       { { ("  … %d lines hidden"):format(text_hidden), "Comment" } }
   end
-  return lines, image_offsets, trailing_img_idx
+  return lines, image_offsets
 end
 
 -- Get just the plain text of an output (for copy / scratch view). The

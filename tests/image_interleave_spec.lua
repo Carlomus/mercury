@@ -186,13 +186,13 @@ describe("ui shifts images below text via layout.text_offset", function()
     package.loaded["mercury.image"] = nil
   end)
 
-  it("last image gets with_virtual_padding=true (SPEC I5, I9)", function()
-    -- Single-extmark layout (SPEC I8). Cumulative offsets stack images
-    -- vertically. Only the LAST image has with_virtual_padding=true so
-    -- image.nvim's own virt_lines reserve the rest of the stack height
-    -- as backstop (SPEC I5). Intermediate images carry false (SPEC I9)
-    -- to avoid double-reservation that would push later cells too far
-    -- down.
+  it("EVERY image has with_virtual_padding=false (SPEC I9, I16)", function()
+    -- Mercury's virt_lines are the sole row reservation (I16).
+    -- with_virtual_padding=true was tried and produced visible
+    -- "empty space till end of screen" via double-reservation; the
+    -- alternative `overlap=render_offset_top` broke viewport scroll
+    -- (image.nvim's partial-scroll path locked the image to the
+    -- screen top). Both discarded.
     local Util = require("mercury.util")
     local UI = require("mercury.ui")
     Util.write_file("/tmp/vpa.png", fake_png(400, 200))
@@ -223,9 +223,13 @@ describe("ui shifts images below text via layout.text_offset", function()
 
     assert.equals(2, #recorded)
     assert.is_false(recorded[1].opts.with_virtual_padding,
-      "intermediate image must have padding=false (SPEC I9)")
-    assert.is_true(recorded[2].opts.with_virtual_padding,
-      "last image must have padding=true as cell-spill backstop (SPEC I5)")
+      "every image must have padding=false (SPEC I16)")
+    assert.is_false(recorded[2].opts.with_virtual_padding,
+      "even the last image must have padding=false (SPEC I16)")
+    assert.is_nil(recorded[1].opts.overlap,
+      "overlap must NOT be set — it breaks viewport scroll (SPEC I16)")
+    assert.is_nil(recorded[2].opts.overlap,
+      "overlap must NOT be set — it breaks viewport scroll (SPEC I16)")
     -- Cumulative offsets: image 2's offset > image 1's so they stack.
     assert.is_true(recorded[2].opts.render_offset_top
                    > recorded[1].opts.render_offset_top,
@@ -449,7 +453,7 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
-  it("I5/I9: only the LAST image carries with_virtual_padding=true", function()
+  it("I9/I16: EVERY image has with_virtual_padding=false and NO overlap", function()
     local buf = _setup_cell({
       { type = "display_data", data = { ["image/png"] = "a" } },
       { type = "display_data", data = { ["image/png"] = "b" } },
@@ -458,10 +462,12 @@ describe("SPEC image invariants — direct pins", function()
       { kind = "png", path = "/tmp/inv_b.png", hash = "ic2", item_index = 2 },
     })
     assert.equals(2, #recorded2)
-    assert.is_false(recorded2[1].opts.with_virtual_padding,
-      "non-last image must have padding=false (SPEC I9)")
-    assert.is_true(recorded2[2].opts.with_virtual_padding,
-      "last image must have padding=true as spill backstop (SPEC I5)")
+    for i, rec in ipairs(recorded2) do
+      assert.is_false(rec.opts.with_virtual_padding,
+        ("SPEC I9/I16: image %d must have padding=false"):format(i))
+      assert.is_nil(rec.opts.overlap,
+        ("SPEC I16: image %d must have NO overlap — it breaks scroll"):format(i))
+    end
     require("mercury.notebook").detach(buf)
   end)
 
