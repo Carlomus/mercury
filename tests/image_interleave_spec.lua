@@ -688,6 +688,96 @@ describe("SPEC image invariants — direct pins", function()
     package.loaded["mercury.image"] = nil
   end)
 
+  it("I19: anchor past viewport top extrapolates to negative y (graceful scroll)", function()
+    -- When screenpos returns 0,0 (buffer row above viewport), Mercury
+    -- must NOT force y = -1000 (which would clear all images for the
+    -- cell simultaneously). Instead it extrapolates the would-be screen
+    -- row so each image lands at its true position; image.nvim's
+    -- partial-visibility clip handles the actual viewport-edge crossing.
+    -- The user's report: "the first output disappears partway through
+    -- scroll, whereas the second does not" — both should be staggered
+    -- by their render_offset_top values.
+    local Util = require("mercury.util")
+    local Image = require("mercury.image")
+    local function fake_png_local(w, h)
+      local function be32(n)
+        return string.char(
+          math.floor(n / 16777216) % 256,
+          math.floor(n / 65536) % 256,
+          math.floor(n / 256) % 256,
+          n % 256)
+      end
+      return "\137PNG\r\n\26\n"
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h)
+        .. string.char(8, 6, 0, 0, 0)
+        .. "\0\0\0\0IEND\174B`\130"
+    end
+    Util.write_file("/tmp/i19.png", fake_png_local(400, 200))
+
+    -- Spoof screenpos to simulate "anchor above viewport".
+    local orig_screenpos = vim.fn.screenpos
+    local orig_getwininfo = vim.fn.getwininfo
+    vim.fn.screenpos = function(...) return { row = 0, col = 0 } end
+    vim.fn.getwininfo = function(win)
+      return { { winrow = 1, topline = 50 } }   -- viewport starts at line 50
+    end
+
+    -- Track image positions
+    local moves = {}
+    local from_files = {}
+    package.loaded["image"] = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        table.insert(from_files, { path = path, opts = opts })
+        local handle = {
+          id = path .. "#" .. #from_files,
+          global_state = { images = {} },
+          buffer = opts.buffer,
+          geometry = { x = opts.x, y = opts.y, width = opts.width },
+          render = function() end,
+          clear = function() end,
+          move = function(self, x, y)
+            self.geometry.x = x; self.geometry.y = y
+            table.insert(moves, { id = self.id, x = x, y = y })
+          end,
+        }
+        return handle
+      end,
+    }
+    package.loaded["mercury.image"] = nil
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=i19sp01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local nb = require("mercury.notebook").attach(buf); nb:rescan()
+    local renderer = require("mercury.image").new(nb)
+    -- anchor_row = 1 (0-indexed). Extrapolated screen row =
+    --   winrow (1) + (anchor + 1 = 2) - topline (50) = -47.
+    renderer:render(nb.cells[1], 1,
+      { { kind = "png", path = "/tmp/i19.png", hash = "i19" } })
+
+    assert.equals(1, #from_files,
+      "image must be created via from_file")
+    local y = from_files[1].opts.y
+    -- The expected extrapolation is winrow (1) + (anchor+1=2) - topline (50) = -47.
+    assert.equals(-47, y,
+      ("SPEC I19: y must be extrapolated to anchor's would-be row "
+        .. "past the viewport top, NOT a -1000 sentinel; got %s")
+        :format(tostring(y)))
+    -- Must NOT be the far-negative sentinel.
+    assert.is_true(y > -1000,
+      "must NOT use -1000 sentinel when window exists (SPEC I19)")
+
+    vim.fn.screenpos = orig_screenpos
+    vim.fn.getwininfo = orig_getwininfo
+    require("mercury.notebook").detach(buf)
+    os.remove("/tmp/i19.png")
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+  end)
+
   it("I17: clearing an image removes it from image.nvim's global_state.images", function()
     -- image.nvim's autocmds iterate state.images and call render() on
     -- each, recreating extmarks. Just calling Image:clear() leaves the

@@ -1187,6 +1187,46 @@ updating this spec.
     same single-window restriction for its `window=winid` mode, so
     this matches its baseline.
 
+    **I19 — Anchor screen position extrapolates past the viewport
+    top so images scroll off gracefully.** `vim.fn.screenpos` returns
+    `0,0` for buffer rows that are above the viewport. If Mercury
+    forced those images to a far-negative sentinel `y` (e.g., -1000)
+    the moment the anchor went off-screen, image.nvim's `is_above`
+    bounds check would clear ALL images for the cell simultaneously
+    — even when images at higher `render_offset_top` from the same
+    anchor are still visually in the viewport. The user's report:
+    "the first output disappears partway through scroll, whereas
+    the second does not". Both should be in the same regime.
+
+    `_anchor_screen_pos` extrapolates a (possibly negative) screen
+    row when `screenpos` returns `0,0`, using the formula
+    `winrow + (anchor + 1) - topline` from `getwininfo`. image.nvim's
+    bounds logic then handles each image's position individually:
+
+      * Image fully in viewport → renders normally.
+      * Image partially above viewport top → image.nvim's
+        partial-visibility branch in `renderer.lua` clips the top
+        rows (backend permitting) or clamps `absolute_y` to
+        `bounds.top`.
+      * Image entirely above viewport (`absolute_y + height <= 0`)
+        → image.nvim's `is_above` clears it.
+
+    Each image in the cell crosses these thresholds at a different
+    scroll position (because their `render_offset_top` values
+    differ), so they disappear staggered — the natural notebook
+    scroll behavior the user expects.
+
+    The formula assumes no virt_lines from above-topline extmarks
+    are pushing the viewport down. For Mercury's per-cell virt_lines
+    arrangement this holds in the common case (each cell's
+    virt_lines live below its own body_end). A 1-2 row drift in the
+    partial-visibility threshold from this assumption isn't visible
+    to the user.
+
+    The far-negative `-1000` sentinel is now only used when
+    `_visible_window` returns nil (no window currently shows the
+    buffer — transient during `BufWinEnter`).
+
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
     Attaching `_image_blank = true` to a `{ text, hl }` chunk made

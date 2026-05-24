@@ -234,19 +234,40 @@ function Renderer:compute_dimensions(images)
   return widths, heights, available_cols
 end
 
--- Compute the screen position (1-indexed row + col) where buffer row
--- `anchor_row` displays in the focused window showing this notebook.
--- Returns `nil, nil` if no window shows the buffer OR the row is
--- off-screen. SPEC I18 — Mercury uses this to drive `window=nil`
--- manual-position image rendering.
+-- Compute the screen row where buffer row `anchor_row` displays — or
+-- WOULD display if it's currently scrolled past the viewport top.
+-- Returns `nil` only when no window shows this buffer at all.
+--
+-- screenpos returns 0,0 for buffer rows outside the viewport. For the
+-- "image gracefully scrolls off the top" requirement (SPEC I19), we
+-- need the IMAGES anchored to that row to still render at their real
+-- screen position (`anchor_screen + render_offset_top`) so image.nvim's
+-- partial-visibility clip can drop only the rows that actually crossed
+-- the viewport edge — not the whole image. The "would-be" formula
+-- `winrow + (anchor + 1) - topline` extrapolates the anchor's
+-- now-negative screen row past the top edge; image.nvim's `is_above`
+-- check (`absolute_y + height <= 0`) fires only when the entire image
+-- has truly left the viewport.
+--
+-- The formula assumes no virt_lines from extmarks above are pushing
+-- the topline display down. That's accurate for typical notebook
+-- scrolling (each cell's virt_lines live below its own body_end), and
+-- a 1-2 row drift in the partial-visibility threshold isn't visible to
+-- the user.
 function Renderer:_anchor_screen_pos(anchor_row)
   local win = self:_visible_window()
-  if not win then return nil, nil end
+  if not win then return nil end
   local ok, sp = pcall(vim.fn.screenpos, win, anchor_row + 1, 1)
-  if not ok or type(sp) ~= "table" then return nil, nil end
-  -- screenpos returns 0,0 when the buffer line is outside the viewport.
-  if sp.row == 0 and sp.col == 0 then return nil, nil end
-  return sp.row, sp.col
+  if ok and type(sp) == "table" and not (sp.row == 0 and sp.col == 0) then
+    return sp.row
+  end
+  -- Anchor is off-viewport. Extrapolate.
+  local ok2, info = pcall(vim.fn.getwininfo, win)
+  if not ok2 or type(info) ~= "table" or not info[1] then return nil end
+  local winrow = info[1].winrow      -- 1-indexed screen row of viewport top
+  local topline = info[1].topline    -- 1-indexed buffer line at viewport top
+  if type(winrow) ~= "number" or type(topline) ~= "number" then return nil end
+  return winrow + (anchor_row + 1) - topline
 end
 
 -- Render images for a cell using image.nvim's `window=nil` absolute-
@@ -292,12 +313,15 @@ function Renderer:render(cell, anchor_row, images, layout)
   entry.placements = entry.placements or {}
   local seen = {}
 
-  -- Get the screen row of the cell's anchor. nil → off-screen → we
-  -- still create the placement but at a sentinel y that triggers
-  -- image.nvim's `is_above` bounds-clear (so nothing's painted in the
-  -- viewport). When the cell scrolls back into view, our
-  -- `reposition_for_scroll` updates the geometry to the real row.
+  -- Get the screen row of the cell's anchor. Even when the buffer
+  -- row is past the viewport top, `_anchor_screen_pos` returns the
+  -- extrapolated (possibly negative) "would-be" row so images at
+  -- higher render_offset_top from this anchor can still render
+  -- partially-visible (SPEC I19). Only nil-out the placement when no
+  -- window shows the buffer at all.
   local screen_row = self:_anchor_screen_pos(anchor_row)
+  -- Big-negative sentinel used only when no window: image.nvim's
+  -- is_above clears the placement.
   local off_screen_sentinel = -1000
 
   -- Remember the buffer-relative anchor on the cache entry so the
@@ -407,8 +431,13 @@ end
 -- `y` and image.nvim re-renders at the proper position.
 function Renderer:reposition_for_scroll()
   if not api() then return end
-  for cell_id, entry in pairs(self.cache or {}) do
+  for _, entry in pairs(self.cache or {}) do
     if entry.anchor_row ~= nil and entry.handles then
+      -- SPEC I19: _anchor_screen_pos extrapolates a (possibly negative)
+      -- "would-be" row when the anchor is past the viewport top, so
+      -- partial-visibility clipping works as the cell scrolls off.
+      -- Falls back to a far-negative sentinel only when no window
+      -- shows the buffer at all (transient state during BufWinEnter).
       local sp_row = self:_anchor_screen_pos(entry.anchor_row)
       local image_y = sp_row or -1000
       for hash, handle in pairs(entry.handles) do
