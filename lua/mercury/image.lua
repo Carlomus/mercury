@@ -297,6 +297,43 @@ function Renderer:render(cell, anchor_row, images, layout)
         y = anchor_row,                 -- buffer row; image.nvim does screenpos
         width = widths[i],
         render_offset_top = off,
+        -- SPEC I18 (revised). image.nvim's renderer has TWO bad
+        -- branches when our anchor row goes off-screen above the
+        -- viewport (screenpos returns 0,0):
+        --   1. lock at winrow (rare for Mercury — needs anchor row
+        --      == topline AND screenpos=0,0, which doesn't normally
+        --      happen for a virt_lines-bearing extmark).
+        --   2. the `diff > 0` branch:
+        --        absolute_y = winrow - height + diff - 1
+        --      This is computed WITHOUT render_offset_top
+        --      (is_partial_scroll = true skips the +offset_top at
+        --      line 348). For a cell with multiple SAME-HEIGHT
+        --      images (e.g., two matplotlib plots), every image
+        --      gets the SAME absolute_y here and they all paint at
+        --      the same row — the later-rendered one wins and the
+        --      user sees image N "snap onto" image N+1's position.
+        --
+        -- The fix: a large `overlap` value steers image.nvim into
+        -- `get_overlap_scroll_position`, which returns
+        -- `winrow + render_offset_top - scrolled_lines` — a per-
+        -- image position because each image has a distinct
+        -- render_offset_top. The image then scrolls upward 1 row
+        -- per buffer scroll, exactly tracking its cell, and the
+        -- visible_height = height + offset_top check inside that
+        -- helper still hides the image when it's fully scrolled off
+        -- the top. We pick a constant well above any reasonable
+        -- offset_top + height (1000 cells is more than any user's
+        -- viewport would ever hold) so the overlap_lines cap inside
+        -- get_overlap_scroll_position never fires before the
+        -- visible_height check does — that ordering matters.
+        --
+        -- Previous attempt (formerly noted in SPEC I16) used
+        -- `overlap = render_offset_top`; that's typically 2-30,
+        -- which the overlap_lines cap fires on after just a few
+        -- scroll lines, falling back to the bad diff branch. Using
+        -- a value LARGER than visible_height is what makes this
+        -- robust.
+        overlap = 1000,
       }
       local handle = entry.handles[img.hash]
       local prev = entry.placements[img.hash]

@@ -228,47 +228,21 @@ local function attach_buffer(buf, opts)
     end,
   })
 
-  -- WinScrolled hook for keeping images glued to their cells.
+  -- WinScrolled hook: force image.nvim to re-render each cached
+  -- handle inline. image.nvim's own scroll handler defers its render
+  -- through vim.schedule (see render_scheduler.lua), so on every
+  -- scroll the image sits at the previous tick's pixel coords for
+  -- one event-loop tick while the buffer text has already moved
+  -- ("image lags the scroll"). Calling handle:render() inline gives
+  -- image.nvim a fresh screen_pos read on the same tick.
   --
-  -- Two distinct issues to address (SPEC I18 — the "images scroll with
-  -- the terminal" complaint):
+  -- The per-image-position correctness during scroll is handled in
+  -- image.lua by the `overlap = 1000` opt (SPEC I18) — this hook is
+  -- only about masking image.nvim's render-scheduler latency.
   --
-  -- (1) Partial-scroll lock. When the user scrolls so the viewport's
-  --     topline coincides with a cell's body_end AND body_end itself
-  --     is no longer visible (because Vim is showing the cell's
-  --     virt_lines area past winrow), image.nvim's renderer takes the
-  --     `if original_y + 1 == win_info.topline` branch and pins the
-  --     image at winrow regardless of further scrolling. From the
-  --     user's perspective, the image gets "stuck at the top of the
-  --     terminal" while the buffer text scrolls past it. Pre-clearing
-  --     the cell's handles (via image's `_clear_handles`, which fully
-  --     evicts from image.nvim's `state.images`) means the lock
-  --     branch finds nothing to lock — the image just vanishes for
-  --     the duration of the in-virt_lines scroll, which is the lesser
-  --     evil and matches user expectations of "image belongs to the
-  --     cell, scrolls with it, including off-screen". When the
-  --     viewport later moves past the lock zone, the immediate
-  --     renderer:render() call recreates the image from scratch via
-  --     image.nvim's from_file (the cache for that cell is empty so
-  --     we hit the cache-miss path).
-  --
-  -- (2) image.nvim's own WinScrolled handler is deferred via
-  --     vim.schedule (see render_scheduler.lua) — there is one
-  --     event-loop tick of latency between the scroll and the image
-  --     being moved to its new screen position. During that tick the
-  --     image is visually stale: the terminal text has scrolled but
-  --     the image sits at the previous tick's pixel coords. Calling
-  --     each cached handle's render() inline here gives image.nvim a
-  --     fresh screen_pos snapshot immediately on the same tick as
-  --     the scroll, eliminating the perceived lag.
-  --
-  -- We do NOT coalesce / debounce this — coalescing would
-  -- reintroduce the lag (1). The work per scroll is small: cheap
-  -- screenpos query per cell + at most an image:render() per handle
-  -- (no disk read, no decode — the image bytes are already in
-  -- image.nvim's transmitted_images cache and the placement is just
-  -- a kitty graphics command re-emit).
-  local lock_zone = {}
+  -- Not coalesced: coalescing would reintroduce the lag. Per-scroll
+  -- cost is small (image.nvim's transmitted_images cache holds the
+  -- bytes, render() just re-emits the kitty graphics placement).
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = buf_aug,
     callback = function()
@@ -276,49 +250,6 @@ local function attach_buffer(buf, opts)
       if not vim.api.nvim_buf_is_loaded(buf) then return end
       local wins = vim.fn.win_findbuf(buf) or {}
       if #wins == 0 then return end
-      local win = wins[1]
-      local topline = vim.fn.line("w0", win)
-
-      -- Compute the new lock-zone set: cells whose body_end is exactly
-      -- the topline AND whose body_end is no longer visible (screenpos
-      -- returns row 0). The screenpos check filters out the harmless
-      -- transitional state where body_end has *just* become the
-      -- topline and is still visible at winrow — clearing in that
-      -- state would cause flicker without preventing any lock.
-      local new_zone = {}
-      for _, cell in ipairs(nb.cells or {}) do
-        if cell.body_end + 1 == topline then
-          local sp = vim.fn.screenpos(win, cell.body_end + 1, 1)
-          if sp and sp.row == 0 then
-            new_zone[cell.id] = true
-          end
-        end
-      end
-
-      -- Entering lock zone: clear the cell's handles so image.nvim's
-      -- partial-scroll branch has nothing to lock.
-      for cid, _ in pairs(new_zone) do
-        if not lock_zone[cid] then
-          if renderer.image and renderer.image._clear_handles then
-            renderer.image:_clear_handles(cid)
-          end
-        end
-      end
-
-      -- Leaving lock zone: at least one cell came out of the lock
-      -- zone, so re-run the renderer to recreate its (now-evicted)
-      -- handles via from_file.
-      local leaving = false
-      for cid, _ in pairs(lock_zone) do
-        if not new_zone[cid] then leaving = true; break end
-      end
-
-      lock_zone = new_zone
-
-      if leaving then renderer:render() end
-
-      -- Compensate for image.nvim's vim.schedule'd scroll handler
-      -- (issue 2 above).
       if renderer.image and renderer.image.rerender_all_handles then
         renderer.image:rerender_all_handles()
       end

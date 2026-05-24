@@ -186,13 +186,24 @@ describe("ui shifts images below text via layout.text_offset", function()
     package.loaded["mercury.image"] = nil
   end)
 
-  it("EVERY image has with_virtual_padding=false (SPEC I9, I16)", function()
-    -- Mercury's virt_lines are the sole row reservation (I16).
-    -- with_virtual_padding=true was tried and produced visible
-    -- "empty space till end of screen" via double-reservation; the
-    -- alternative `overlap=render_offset_top` broke viewport scroll
-    -- (image.nvim's partial-scroll path locked the image to the
-    -- screen top). Both discarded.
+  it("EVERY image has with_virtual_padding=false and large overlap (SPEC I9, I16, I18)", function()
+    -- Mercury's virt_lines are the sole row reservation (I16) so
+    -- `with_virtual_padding = false` is the source of truth for
+    -- blanks beneath the image.
+    --
+    -- `overlap = 1000` is set on every image (SPEC I18) — this
+    -- steers image.nvim's renderer into get_overlap_scroll_position
+    -- for the scrolled-past-anchor case, giving each image a
+    -- per-render_offset_top position rather than the buggy diff
+    -- branch where same-height images collide at the same row.
+    -- An earlier attempt used `overlap = render_offset_top` (small
+    -- value): the overlap_lines cap in get_overlap_scroll_position
+    -- tripped after just a few scrolled lines and the bad diff
+    -- branch took over. Using a large constant (>> any reasonable
+    -- viewport height) keeps the overlap_lines cap inactive — the
+    -- visible_height = height + offset_top check inside the helper
+    -- is what naturally hides the image when it's fully scrolled
+    -- off, regardless of overlap's size.
     local Util = require("mercury.util")
     local UI = require("mercury.ui")
     Util.write_file("/tmp/vpa.png", fake_png(400, 200))
@@ -226,10 +237,12 @@ describe("ui shifts images below text via layout.text_offset", function()
       "every image must have padding=false (SPEC I16)")
     assert.is_false(recorded[2].opts.with_virtual_padding,
       "even the last image must have padding=false (SPEC I16)")
-    assert.is_nil(recorded[1].opts.overlap,
-      "overlap must NOT be set — it breaks viewport scroll (SPEC I16)")
-    assert.is_nil(recorded[2].opts.overlap,
-      "overlap must NOT be set — it breaks viewport scroll (SPEC I16)")
+    assert.equals(1000, recorded[1].opts.overlap,
+      "SPEC I18: overlap must be set to a large constant so "
+        .. "image.nvim picks get_overlap_scroll_position over the "
+        .. "buggy diff branch")
+    assert.equals(1000, recorded[2].opts.overlap,
+      "SPEC I18: overlap must be set on every image (incl. the last)")
     -- Cumulative offsets: image 2's offset > image 1's so they stack.
     assert.is_true(recorded[2].opts.render_offset_top
                    > recorded[1].opts.render_offset_top,
@@ -453,7 +466,7 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
-  it("I9/I16: EVERY image has with_virtual_padding=false and NO overlap", function()
+  it("I9/I16/I18: EVERY image has padding=false and large overlap", function()
     local buf = _setup_cell({
       { type = "display_data", data = { ["image/png"] = "a" } },
       { type = "display_data", data = { ["image/png"] = "b" } },
@@ -465,8 +478,12 @@ describe("SPEC image invariants — direct pins", function()
     for i, rec in ipairs(recorded2) do
       assert.is_false(rec.opts.with_virtual_padding,
         ("SPEC I9/I16: image %d must have padding=false"):format(i))
-      assert.is_nil(rec.opts.overlap,
-        ("SPEC I16: image %d must have NO overlap — it breaks scroll"):format(i))
+      assert.equals(1000, rec.opts.overlap,
+        ("SPEC I18: image %d needs overlap=1000 so image.nvim "
+          .. "routes the off-screen-anchor case through "
+          .. "get_overlap_scroll_position (per-image position) "
+          .. "rather than the diff branch (same absolute_y for "
+          .. "same-height images = overlap bug)"):format(i))
     end
     require("mercury.notebook").detach(buf)
   end)

@@ -1082,27 +1082,21 @@ updating this spec.
     the caller's config-default fallback runs.
 
     **I16 — Mercury's virt_lines are the SOLE row reservation.**
-    No `with_virtual_padding`. No `overlap`. image.nvim only paints
-    pixels at `screenpos + render_offset_top`; the row count comes
-    from `build_virt_lines` pushing image-blank rows for every image,
+    No `with_virtual_padding`. image.nvim only paints pixels at
+    `screenpos + render_offset_top`; the row count comes from
+    `build_virt_lines` pushing image-blank rows for every image,
     period.
 
-    Two image.nvim parameters were tried and discarded:
+    `with_virtual_padding = true` was tried and discarded: it
+    duplicates the `render_offset_top + image_height` reservation on
+    top of our virt_lines, producing visible "empty space till end of
+    screen" below every image.
 
-      * `with_virtual_padding = true` (no overlap) duplicates the
-        `render_offset_top + image_height` reservation on top of our
-        virt_lines, producing visible "empty space till end of
-        screen" below every image.
-
-      * `overlap = render_offset_top` shrinks that to
-        `image_height + 1`, BUT it flips image.nvim's renderer into
-        the `get_overlap_scroll_position` partial-scroll path, which
-        locks the image to the screen top and blocks the viewport
-        from scrolling past the anchor row (top-of-buffer scroll
-        becomes stuck, and image-at-bottom scroll becomes stuck
-        scrolling down). The `overlap` option is documented for
-        images that visually cover REAL buffer lines, not virt_lines,
-        and image.nvim's scroll handling assumes that semantic.
+    `overlap` IS now set (large constant — see SPEC I18) for a
+    different reason: steering image.nvim's scroll-past-anchor path.
+    Setting `overlap` does NOT reintroduce padding because we keep
+    `with_virtual_padding = false` — `get_reserved_lines` is only
+    consulted when padding is on.
 
     Trade-off accepted by I16: cell-spill safety becomes
     "best-effort matched math" (I14 + the 1-row gap in I6's
@@ -1138,64 +1132,78 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — Mercury detects image.nvim's partial-scroll lock and
-    pre-clears images so the lock branch has nothing to lock.**
-    image.nvim's renderer has a branch:
+    **I18 — Every image gets `overlap = 1000` to route image.nvim's
+    scroll-past-anchor path through `get_overlap_scroll_position`
+    (per-image position) instead of the diff branch (same row for
+    same-height images = visible overlap).**
+
+    The bug. image.nvim's renderer, when the anchor row goes off the
+    top of the viewport (`screenpos` returns 0,0), has three
+    branches:
 
     ```lua
     if original_y + 1 == win_info.topline then
-      absolute_y = win_info.winrow      -- lock at top of viewport
+      absolute_y = win_info.winrow                              -- lock
+    else
+      overlap_absolute_y = get_overlap_scroll_position(...)
+      if overlap_absolute_y then
+        absolute_y = overlap_absolute_y                         -- good
+      else
+        ...
+        absolute_y = win_info.winrow - height + diff - 1        -- diff
+      end
+    end
     ```
 
-    Fires when (a) the image's anchor row equals `topline` AND (b)
-    `screenpos(window, anchor_row+1, 1)` returns 0,0 (anchor itself
-    isn't visible — Vim is showing the cell's virt_lines area past
-    winrow). Without intervention the image pins to `winrow` and
-    stays put as buffer text scrolls past, violating "images stay
-    inside their cell outputs" (the user-visible "images scroll with
-    the terminal" complaint).
+    The `diff` branch computes `absolute_y` from `height` only —
+    `render_offset_top` is NOT added (line 348's `if not
+    is_partial_scroll` skips the addition). For a Mercury cell with
+    two same-height images (e.g., two matplotlib plots) and a shared
+    anchor row (single-extmark interleave, SPEC I8), BOTH images
+    compute the SAME `absolute_y` here. They paint on top of each
+    other; the later-rendered image wins. User report:
+    "image 1 snaps to image 2's position and displays on top."
 
-    Fix lives in `init.lua` (per-buffer WinScrolled autocmd):
-      * Compute the set of cells currently satisfying both (a) and
-        (b). Call this the **lock zone**.
-      * For each cell newly entering the lock zone, call
-        `Renderer.image:_clear_handles(cell_id)` — this fully evicts
-        the cell's image handles from image.nvim's `state.images`
-        (SPEC I17). The lock-fire branch then finds no image to
-        lock; the image vanishes for the duration of the in-virt_lines
-        scroll. Vanishing is the lesser evil: image scrolling with
-        its cell off-screen matches user expectations far better than
-        image staying glued to winrow.
-      * For each cell newly leaving the lock zone, call
-        `renderer:render()` so the (empty) cache hits the cache-miss
-        path and recreates the handle via `from_file`.
+    The fix. `get_overlap_scroll_position` returns
+    `winrow + render_offset_top - scrolled_lines` — a per-image
+    position because each image has its own `render_offset_top`.
+    Setting `overlap = LARGE` keeps the
+    `if scrolled_lines >= overlap_lines then return nil` cap
+    inside `get_overlap_scroll_position` from firing, so the
+    function reaches the `visible_height = height + offset_top`
+    check; that check naturally returns nil (→ hide) only when the
+    image is fully off the top.
 
-    Additionally the same WinScrolled callback invokes
-    `Renderer.image:rerender_all_handles()` (a new helper that calls
-    `handle:render()` on every cached handle). image.nvim's own
+    Value choice. Any constant larger than `max(height +
+    offset_top)` across all images would work. 1000 is well above
+    any reasonable viewport, costs nothing at runtime, and stays
+    cap-inactive even for very tall cells. Earlier failed attempt
+    used `overlap = render_offset_top` (typically 2-30) — the cap
+    tripped after a few scroll lines and the diff branch took over.
+
+    Why setting `overlap` doesn't reintroduce I16's old problem.
+    `overlap` affects two places in image.nvim:
+      * `get_reserved_lines` — only consulted when
+        `with_virtual_padding = true`. Mercury keeps it `false`
+        (SPEC I16), so no row duplication.
+      * `get_overlap_scroll_position` — the scroll path we WANT to
+        steer into.
+
+    Companion: `Renderer:rerender_all_handles()`. image.nvim's
     WinScrolled handler defers its render through `vim.schedule`
-    (see `render_scheduler.lua`), so there is one event-loop tick of
-    latency between the scroll and image.nvim moving the image to
-    its new screen position. During that tick the image is at the
-    previous tick's pixel coordinates while the text has already
-    moved — perceived as "image lags the scroll" / "image scrolls
-    with the terminal". Calling `handle:render()` inline gives
-    image.nvim a fresh screen_pos read on the same tick.
+    (`render_scheduler.lua`), so there's one event-loop tick of lag
+    between the scroll and the image moving. The per-buffer
+    WinScrolled autocmd in `init.lua` calls
+    `rerender_all_handles()` inline to re-emit each cached handle's
+    kitty placement on the same tick, eliminating the perceived
+    lag. No disk read (image.nvim's `transmitted_images` cache
+    holds the bytes), no coalescing (would reintroduce the lag).
 
-    Earlier failed attempt (formerly I18 / I19): `window = nil` +
-    manual `image:move` on WinScrolled. That broke layout entirely
-    (images all over the place, overlapping, floating). REVERTED.
-    The current detect-and-clear approach is cheaper (no
-    monkey-patching, no `image:move` math), targets only the
-    pathological frames, and degrades gracefully (worst case: image
-    briefly hidden during scroll-through-virt_lines).
-
-    Coalescing: the WinScrolled hook is NOT coalesced — coalescing
-    would reintroduce the lag. Work per scroll is small (cheap
-    screenpos query per cell + `handle:render()` per handle, no disk
-    read because image bytes are already in image.nvim's
-    `transmitted_images` cache and the placement is just a re-emit
-    of the kitty graphics command).
+    Earlier failed attempts (formerly I18 / I19): `window = nil` +
+    manual `image:move` on WinScrolled (broke layout entirely:
+    images overlapped, floated, persisted on screen). Lock-zone
+    pre-clear (vanished images during scroll instead of fixing
+    the diff-branch root cause). Both REVERTED.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.
