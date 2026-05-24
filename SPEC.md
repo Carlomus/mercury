@@ -944,15 +944,18 @@ updating this spec.
     even when our row math underestimates.
 
     **I6 — Per-image height safety margin.** Each image's reserved
-    virt_lines = `max(image_row_height + 3, ceil(image_row_height * 1.25))`
-    clamped to `image_max_height_rows`. This absorbs the divergence
-    between Mercury's static (8×16) cell-pixel assumption and
-    image.nvim's runtime terminal measurement, so even an
-    intermediate image (no `with_virtual_padding` backstop) can't
-    bleed into the row below it. Querying image.nvim's runtime cell
-    size to match exactly was tried and reverted — the API isn't
-    stable across versions and the width side-effect (I1) was worse
-    than the height precision gain.
+    virt_lines = `min(image_row_height + 1, image_max_height_rows)`.
+    The `+1` absorbs sub-cell rounding inside image.nvim's renderer.
+    This is intentionally TIGHT because I14 makes Mercury's row math
+    use image.nvim's runtime cell sizes — Mercury and image.nvim
+    agree on the row count, so no large margin is needed. The
+    previous `+25% +3` bump left a visible 4-7 wasted blank rows
+    below every image (the "too many lines between sequential
+    images" regression). For the runtime-query-fallback path (no
+    `image.utils.term` available), `+1` may be slightly tight for
+    cell-aspect drift, but the LAST image's
+    `with_virtual_padding=true` (I5) is the terminal-overflow
+    backstop there.
 
     **I7 — Image-blank rows bypass `max_preview_lines`.** Truncating a
     cell to N lines must apply only to TEXT rows. Image-blank rows

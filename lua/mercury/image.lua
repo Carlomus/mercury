@@ -121,29 +121,25 @@ end
 -- WIDTH (SPEC I1) — `natural_cols = ceil(w_px / 8)`. Static 8 px/cell on
 -- purpose: users have configured around the 8-px assumption and an
 -- earlier change that used image.nvim's runtime cell_width here shrank
--- every image visibly (because most terminals' actual cell_width > 8).
--- Keeping static 8 preserves the user's familiar image size, and
--- image.nvim is free to render the image at its own cell_width — the
--- image is "upscaled" pixel-wise when the runtime cell is wider, which
--- is the visual result the user wants.
+-- every image visibly. Keeping static 8 preserves the user's familiar
+-- image size.
 --
--- HEIGHT (SPEC I6, I14) — must match image.nvim's actual rendered row
--- count or our reservation underflows and the image paints over the
--- next row. image.nvim's height formula is:
+-- HEIGHT (SPEC I6, I14) — uses image.nvim's runtime cell_w / cell_h so
+-- our row reservation matches what image.nvim actually draws:
 --     target_w_px  = img_cols * runtime_cell_w
 --     scaled_h_px  = h_px * (target_w_px / w_px)
 --     rows         = ceil(scaled_h_px / runtime_cell_h)
--- so Mercury MUST use image.nvim's runtime cell_w / cell_h in the row
--- math (SPEC I14). With 8×16 static we'd only be correct when the
--- terminal's cell aspect happens to match — common but not universal,
--- and a single percentage-point divergence accumulates across multi-
--- image cells.
 --
--- Even with the runtime values we keep the +25% +3 safety bump (SPEC I6)
--- as a backstop for:
---   * the runtime query failing (image.nvim API drift / mock env);
---   * any future image.nvim scaling pass we haven't accounted for;
---   * sub-cell rounding inside image.nvim's renderer.
+-- Safety margin (SPEC I6) — TIGHT +1 row only. With I14 making the row
+-- math agree with image.nvim, the previous `max(bare+3, ceil(bare*1.25))`
+-- bump was overcounting and left a visible 4-7 blank rows below every
+-- image (the user's "too many lines between sequential images"
+-- complaint). +1 absorbs sub-cell rounding inside image.nvim's
+-- renderer without bloating the gap. The runtime-query fallback path
+-- (no `image.utils.term` available) reverts to the static 8×16
+-- baseline, where +1 may be slightly small for cell-aspect drift —
+-- the LAST image's `with_virtual_padding=true` (SPEC I5) is the
+-- terminal backstop there.
 function Renderer:compute_dimensions(images)
   local widths, heights = {}, {}
   if not images or #images == 0 then
@@ -182,9 +178,8 @@ function Renderer:compute_dimensions(images)
           -- Height: use image.nvim's runtime cell sizes (SPEC I14).
           local bare = Output.image_row_height(
             w, h, img_cols, cell_w_runtime, cell_h_runtime, max_rows)
-          -- SPEC Invariant I6 safety margin.
-          local safe = math.max(bare + 3, math.ceil(bare * 1.25))
-          rows = math.min(safe, max_rows)
+          -- SPEC Invariant I6 safety margin (tight +1, see header doc).
+          rows = math.min(bare + 1, max_rows)
         else
           -- Unknown dimensions (e.g. SVG without an intrinsic size): use the
           -- pessimistic max_rows so wide plots don't truncate. Invariant 15.
