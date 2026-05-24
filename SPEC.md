@@ -1132,10 +1132,15 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — Every image gets `overlap = 1000` to route image.nvim's
-    scroll-past-anchor path through `get_overlap_scroll_position`
-    (per-image position) instead of the diff branch (same row for
-    same-height images = visible overlap).**
+    **I18 — Three image.nvim-quirk mitigations on every image:
+    `overlap = 1000`, anchor at `body_end - 1` (not `body_end`), and
+    `right_gravity = false` pin via delete-and-recreate on the
+    image.nvim extmark.**
+
+    Overlap = 1000 routes image.nvim's scroll-past-anchor path
+    through `get_overlap_scroll_position` (per-image position) instead
+    of the diff branch (same row for same-height images = visible
+    overlap).
 
     The bug. image.nvim's renderer, when the anchor row goes off the
     top of the viewport (`screenpos` returns 0,0), has three
@@ -1189,20 +1194,59 @@ updating this spec.
       * `get_overlap_scroll_position` — the scroll path we WANT to
         steer into.
 
-    Companion: extmark pinning with `right_gravity = false`.
-    image.nvim creates a per-image extmark with the default
-    `right_gravity = true`. When the user types at column 0 of
-    `body_end` (the anchor), the extmark shifts right with text;
+    Anchor shift: `y = body_end - 1` (with offset_top bumped +1 to
+    compensate). image.nvim's renderer has a lock branch that pins
+    the image at `winrow + offset_top` when (a) `original_y + 1 ==
+    win_info.topline` AND (b) screenpos returns 0,0. For anchor =
+    body_end, condition (a) means `body_end_1idx == topline` — which
+    nvim sustains throughout the in-virt_lines scrolling of a cell
+    (the user observes "image stays in the same relative position on
+    the terminal" while the cell's virt_lines text scrolls past).
+    Shifting the anchor to `body_end - 1` breaks (a) — the anchor's
+    1-indexed row is now `body_end`, one less than topline during
+    in-virt_lines scrolling — and the renderer falls into
+    `get_overlap_scroll_position` instead, giving a per-image
+    position that tracks scroll. offset_top is bumped +1 to preserve
+    the static (anchor visible) display row.
+
+    Edge case: body_end == 0 (degenerate single-row cell at top of
+    buffer). We can't anchor at row -1, so anchor stays at 0 and the
+    bump is dropped. The lock case is theoretically possible but
+    requires topline == 1 with screenpos returning 0,0 for line 1,
+    which would mean line 1 isn't visible — impossible since line 1
+    *is* the topline. So the lock never fires there either.
+
+    Companion: extmark pinning with `right_gravity = false`,
+    delete-and-recreate. image.nvim creates a per-image extmark
+    with the default `right_gravity = true`. When the user types
+    at column 0 of the anchor, the extmark shifts right with text;
     image.nvim's `TextChanged` autocmd then detects the move via
     `has_extmark_moved()` and re-renders the image at the new
     column — visually the image jumps horizontally while typing.
-    Mercury re-sets the same extmark id with
-    `right_gravity = false` immediately after each `h:render()`
-    (see `_pin_extmark` in `image.lua`). With our
-    `with_virtual_padding = false`, image.nvim's reserved_lines
-    height is 0, so its `has_up_to_date_extmark` check never
-    triggers an extmark recreation that would clobber the pin.
-    The pin sticks for the handle's lifetime.
+    Mercury's `_pin_extmark` (in `image.lua`) **deletes** image.nvim's
+    extmark and recreates one with the same id and
+    `right_gravity = false`. (In-place update via
+    `nvim_buf_set_extmark` with the existing id doesn't always
+    change gravity on the existing extmark in older nvim builds —
+    delete-and-recreate is the safe path.)
+
+    With our `with_virtual_padding = false`, image.nvim's
+    reserved_lines height is 0, so its `has_up_to_date_extmark`
+    check never triggers an extmark recreation that would clobber
+    the pin. The pin sticks for the handle's lifetime.
+
+    The 3 ms render debounce (`init.lua`) is also part of the
+    user-visible-correctness story. The previous 30 ms was tuned for
+    rapid-typing performance, but produced visible flicker when the
+    user added a line to a cell that had image output: nvim
+    auto-scrolls the buffer, image.nvim's WinScrolled handler
+    re-renders each cached image at the OLD body_end (we pinned the
+    extmark with right_gravity=false so it doesn't track the line
+    insertion), and the Mercury re-render that moves the anchor to
+    the NEW body_end is held for 30 ms — visible as "img jumps up
+    then scrolls down to original position". 3 ms is sub-frame and
+    still gives coalescing across single keystrokes that emit
+    multiple TextChanged events.
 
     Earlier failed attempts (formerly I18 / I19): `window = nil` +
     manual `image:move` on WinScrolled (broke layout entirely:

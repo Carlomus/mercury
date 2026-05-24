@@ -152,7 +152,20 @@ local function attach_buffer(buf, opts)
     vim.schedule(function() pcall(function() kernel:_ensure_started() end) end)
   end
 
-  local debounced = Util.debounce(30, function()
+  -- Debounce is intentionally short. The previous 30 ms value was tuned
+  -- for performance during rapid typing, but it produced visible
+  -- flicker when adding lines to a cell that has image output: nvim
+  -- auto-scrolls the buffer to keep the cursor visible, image.nvim's
+  -- WinScrolled handler re-renders each cached image at the OLD
+  -- body_end anchor (which we pinned with right_gravity=false so it
+  -- doesn't track the line insertion), and Mercury's re-render that
+  -- moves the anchor to the NEW body_end is held for 30 ms — the
+  -- image is rendered at the wrong row for that window, visible as
+  -- "img jumps up then scrolls down to original position". 3 ms is
+  -- short enough to be sub-frame even at 200+ fps and still gives
+  -- coalescing across single keystrokes that emit multiple
+  -- TextChanged events.
+  local debounced = Util.debounce(3, function()
     if not vim.api.nvim_buf_is_loaded(buf) then return end
     if nb._suppress_rescan then return end
     nb:rescan()

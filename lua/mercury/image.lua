@@ -72,26 +72,34 @@ local function _fully_remove_image(img)
   end)
 end
 
--- Pin image.nvim's extmark to its current position with right_gravity=false
--- so text inserted at the anchor column doesn't shift it. image.nvim creates
--- its extmark with default right_gravity=true (image/image.lua, the
+-- Pin image.nvim's extmark with right_gravity=false so text inserted at
+-- the anchor column doesn't shift it. image.nvim creates its extmark
+-- with default right_gravity=true (image/image.lua, the
 -- vim.api.nvim_buf_set_extmark call); when the user types at body_end's
 -- col 0 the extmark shifts right, image.nvim's TextChanged handler then
--- spots the move via `has_extmark_moved()` and re-renders the image at the
--- new column — visually the image jumps horizontally. Re-setting the same
--- extmark id with right_gravity=false keeps it pinned at col 0 forever, so
--- the TextChanged path becomes a no-op for our images.
+-- spots the move via `has_extmark_moved()` and re-renders the image at
+-- the new column — visually the image jumps horizontally.
+--
+-- DELETE-AND-RECREATE, not in-place update. Empirically, calling
+-- nvim_buf_set_extmark with the existing id and an opts table that
+-- includes `right_gravity` does NOT always change the gravity on the
+-- existing extmark in older nvim builds. Delete + set with a fresh
+-- id guarantees the gravity sticks.
 local function _pin_extmark(img)
   if not img then return end
   if not img.buffer or not img.extmark then return end
   if not img.global_state or not img.global_state.extmarks_namespace then return end
   if not img.internal_id then return end
+  local ns = img.global_state.extmarks_namespace
+  local row = img.extmark.row or 0
+  local col = img.extmark.col or 0
+  pcall(vim.api.nvim_buf_del_extmark, img.buffer, ns, img.internal_id)
   pcall(
     vim.api.nvim_buf_set_extmark,
     img.buffer,
-    img.global_state.extmarks_namespace,
-    img.extmark.row or 0,
-    img.extmark.col or 0,
+    ns,
+    row,
+    col,
     { id = img.internal_id, right_gravity = false, strict = false }
   )
 end
@@ -298,6 +306,48 @@ function Renderer:render(cell, anchor_row, images, layout)
 
   local widths, heights = self:compute_dimensions(images)
 
+  -- SPEC I18 (anchor shift): anchor at body_end - 1, not body_end.
+  -- Rationale: image.nvim's renderer locks the image at `winrow` when
+  -- (a) `original_y + 1 == win_info.topline` AND (b) screenpos
+  -- returns 0,0. For an anchor at body_end, condition (a) means
+  -- `body_end_1idx == topline`. Nvim's topline stays at
+  -- `body_end_1idx` while the user scrolls through body_end's
+  -- virt_lines (the "scroll past the cell" case), AND body_end's
+  -- text goes above the window content area (screenpos returns
+  -- 0,0). Both fire → image pins at `winrow + offset_top` and the
+  -- user sees it "stay in the same relative position on the
+  -- terminal" while the cell's virt_lines content scrolls past.
+  --
+  -- Anchoring at body_end - 1 breaks condition (a): the anchor's
+  -- 1-indexed row is now `body_end`, which is one less than
+  -- topline during in-virt_lines scrolling. The lock branch
+  -- doesn't fire; image.nvim falls into `get_overlap_scroll_position`
+  -- (because overlap = 1000 is set) and the image gets a
+  -- per-render_offset_top position that tracks the scroll properly.
+  --
+  -- offset_top compensates +1 to keep the static (anchor visible)
+  -- display position unchanged. With anchor = body_end visible at
+  -- terminal row R, the OLD math was: image at R + offset_top + 1
+  -- (where offset_top = virt_line_idx + 1). With anchor =
+  -- body_end - 1 (one row higher in buffer, displaying one row
+  -- above body_end), screen_pos.row returns R-1, so we need
+  -- offset_top = virt_line_idx + 2 to land at the same display row.
+  --
+  -- Edge case: body_end == 0 (degenerate single-row cell at top of
+  -- buffer). We can't anchor at row -1, so anchor stays at 0 and
+  -- the offset bump is dropped. The lock case is theoretically
+  -- possible there but it requires topline == 1, which would mean
+  -- body_end IS visible at winrow (screenpos != 0,0), so the lock
+  -- never actually triggers either.
+  local anchor_y, anchor_bump
+  if anchor_row > 0 then
+    anchor_y = anchor_row - 1
+    anchor_bump = 1
+  else
+    anchor_y = 0
+    anchor_bump = 0
+  end
+
   local offsets = layout.offsets
   local text_offset = layout.text_offset or 0
   local cumulative = 0
@@ -310,15 +360,17 @@ function Renderer:render(cell, anchor_row, images, layout)
       -- because image.nvim's screenpos(window, y+1, x+1).row returns
       -- the screen row of the anchor BUFFER LINE, and the virt_line at
       -- index K below it sits at screen_pos.row + K + 1).
+      -- SPEC I18: +anchor_bump compensates for anchoring at
+      -- body_end - 1 instead of body_end (lock-avoidance).
       local virt_line_idx = offsets and offsets[i] or (text_offset + cumulative)
-      local off = virt_line_idx + 1
+      local off = virt_line_idx + 1 + anchor_bump
       local opts = {
         buffer = self.notebook.buf,
         window = win,
         inline = true,
         with_virtual_padding = false,   -- SPEC I16
         x = i - 1,                      -- distinct extmark cols per image
-        y = anchor_row,                 -- buffer row; image.nvim does screenpos
+        y = anchor_y,                   -- body_end - 1 (lock avoidance, SPEC I18)
         width = widths[i],
         render_offset_top = off,
         -- SPEC I18 (revised). image.nvim's renderer has TWO bad

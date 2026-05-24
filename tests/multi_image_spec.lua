@@ -93,9 +93,11 @@ describe("multi-image stacking", function()
     assert.equals(0, recorded[1].opts.x)
     assert.equals(1, recorded[2].opts.x)
     assert.equals(2, recorded[3].opts.x)
-    -- SPEC I13: first image's render_offset_top = virt_line_idx (0) + 1
-    -- so the image lands at virt_line[0], not on body_end's content row.
-    assert.equals(1, recorded[1].opts.render_offset_top)
+    -- SPEC I13/I18: first image's render_offset_top = virt_line_idx (0)
+    -- + 1 + anchor_bump (1 — cell at top with body_end > 0). The
+    -- anchor shift to body_end - 1 (lock avoidance) compensates with
+    -- a +1 to keep the on-screen position unchanged.
+    assert.equals(2, recorded[1].opts.render_offset_top)
     assert.is_true(recorded[2].opts.render_offset_top > 0)
     assert.is_true(recorded[3].opts.render_offset_top > recorded[2].opts.render_offset_top)
     -- Only the last reserves virtual padding.

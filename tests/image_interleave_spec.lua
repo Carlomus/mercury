@@ -512,13 +512,14 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
-  it("I13: render_offset_top = virt_line_idx + 1 (image lands BELOW body_end)", function()
+  it("I13: render_offset_top = virt_line_idx + 1 + anchor_bump", function()
     -- Build a cell with one stream item, then one image. The image's
     -- virt_line_idx (from build_virt_lines) is pill_rows (1) + 1 text
-    -- row = 2. SPEC I13 says render_offset_top = idx + 1 = 3, so the
-    -- image lands at the row corresponding to "first image blank" in
-    -- the cell's virt_lines stack — BELOW the pill AND below the text
-    -- row, not on top of them.
+    -- row = 2. render_offset_top = idx + 1 + anchor_bump (= idx + 2
+    -- when anchor_row > 0, which is the typical case — anchor sits
+    -- at body_end - 1 to avoid image.nvim's lock case, see SPEC I18,
+    -- and offset_top is bumped +1 to compensate so the on-screen
+    -- position stays the same as the old anchor=body_end math).
     local Output_mod = require("mercury.output")
     local buf = _setup_cell({
       { type = "stream", name = "stdout", text = "hi\n" },
@@ -527,9 +528,6 @@ describe("SPEC image invariants — direct pins", function()
       { kind = "png", path = "/tmp/inv_a.png", hash = "if1", item_index = 2 },
     })
     assert.equals(1, #recorded2)
-    -- Re-derive the expected virt_line_idx from build_virt_lines so the
-    -- test stays robust against future heading changes — but the +1 is
-    -- the contract we're pinning here.
     local nb = require("mercury.notebook").get(buf)
     local out = nb.outputs[nb.cells[1].id]
     local image_heights = ({ require("mercury.image").new(nb):compute_dimensions({
@@ -538,11 +536,21 @@ describe("SPEC image invariants — direct pins", function()
     local _, image_offsets = Output_mod.build_virt_lines(out, {
       show_status_pill = true, image_heights = image_heights,
     })
-    assert.equals(image_offsets[1] + 1, recorded2[1].opts.render_offset_top,
-      ("SPEC I13: render_offset_top must be virt_line_idx + 1. "
-        .. "idx=%d, expected=%d, got=%d"):format(
-        image_offsets[1], image_offsets[1] + 1,
+    -- Anchor was shifted from body_end to body_end - 1 (SPEC I18
+    -- lock-avoidance), so offset_top is virt_line_idx + 2 here.
+    -- Cell at top of buffer with body_end > 0 → anchor_bump = 1.
+    local anchor_row = nb:cell_anchor_row(nb.cells[1])
+    local expected_bump = anchor_row > 0 and 1 or 0
+    local expected = image_offsets[1] + 1 + expected_bump
+    assert.equals(expected, recorded2[1].opts.render_offset_top,
+      ("SPEC I13/I18: render_offset_top must be virt_line_idx + 1 + "
+        .. "anchor_bump. idx=%d, anchor_bump=%d, expected=%d, got=%d"):format(
+        image_offsets[1], expected_bump, expected,
         recorded2[1].opts.render_offset_top))
+    -- y must be body_end - 1 (or 0 for the degenerate top-of-buffer case).
+    local expected_y = (anchor_row > 0) and (anchor_row - 1) or 0
+    assert.equals(expected_y, recorded2[1].opts.y,
+      "SPEC I18: anchor y must be body_end - 1 to avoid lock case")
     require("mercury.notebook").detach(buf)
   end)
 
