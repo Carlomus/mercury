@@ -1138,94 +1138,31 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — Mercury uses image.nvim's `window=nil` absolute-position
-    mode and owns scroll updates itself.** image.nvim's
-    `window=current_win` mode triggers a "partial-scroll" branch in
-    `renderer.lua` when the user scrolls into a cell's virt_lines:
-    Vim pins `topline` to the row holding those virt_lines, and
-    image.nvim's `if original_y + 1 == topline` check fires, locking
-    the image at `winrow` while the buffer text scrolls past it.
-    That produced the "image stays fixed on terminal", "image
-    appears below text after scrolling", and "second image at fixed
-    position" reports.
+    **I18 — Known limitation: partial-scroll lock.** image.nvim's
+    renderer has a branch:
 
-    Under `window=nil`, image.nvim's renderer uses
-    `absolute_y = original_y + render_offset_top` — straight terminal
-    coordinates, no scroll branches. AND image.nvim's `WinScrolled`
-    autocmd path filters `api.get_images({window=winid, buffer=bufnr})`
-    by both window and buffer, with each image's `window` checked
-    against the filter's `window`. Our images carry `window=nil`,
-    fail the filter, and are NOT iterated by image.nvim's autocmd.
-    Mercury holds full control over scroll-driven re-rendering.
+    ```lua
+    if original_y + 1 == win_info.topline then
+      absolute_y = win_info.winrow      -- lock at top of viewport
+    ```
 
-    `Renderer:render` computes the screen row of the cell's
-    `body_end` via `vim.fn.screenpos(focused_win, body_end+1, 1)` at
-    render time and passes it as the image's `y`. The buffer-relative
-    `anchor_row` is stashed on the cache entry so the scroll handler
-    can recompute terminal coords later. `Renderer:reposition_for_scroll`
-    iterates every cached image, recomputes the screen row, and calls
-    `image:move(x, new_y)` to update the placement; image.nvim's
-    `move()` invokes its render() which paints at the new terminal
-    coordinates.
+    When the user scrolls into a cell's virt_lines, Vim keeps
+    `topline` pinned to the row holding the virt_lines (the cell's
+    `body_end`). image.nvim's check fires and locks the image at
+    `winrow` while buffer text scrolls past — visually the image
+    "stays fixed on the terminal" / "moves below the text".
 
-    Off-screen handling: when `screenpos` returns `0,0` (anchor not
-    in viewport), Mercury substitutes a sentinel `y = -1000`. image.nvim's
-    `is_above` bounds check (`absolute_y + height <= 0`) fires and the
-    backend clears the terminal pixels for that image until the
-    next scroll brings the anchor back into view.
+    Mercury attempted a fix using `window = nil` + manual
+    `image:move` on WinScrolled (formerly I18 / I19). That broke
+    layout entirely (images all over the place, overlapping,
+    floating). REVERTED. Current code keeps `window = current_win`;
+    image.nvim's scroll lock remains a known limitation pending
+    upstream support for disabling the partial-scroll path per
+    image. No public option for that exists today.
 
-    init.lua hooks `WinScrolled` on the per-buffer augroup; the
-    callback only runs when the notebook buffer is currently visible
-    in some window. `image:move` is cheap (no disk read, no decode)
-    so per-scroll repositioning is acceptable performance-wise.
-
-    Multi-window caveat: when the same notebook buffer is open in
-    multiple windows, `_visible_window()` returns the focused window
-    (or the first one). Images render at THAT window's screen
-    coordinates — they don't show correctly in other splits showing
-    the same buffer. Known limitation; image.nvim itself has the
-    same single-window restriction for its `window=winid` mode, so
-    this matches its baseline.
-
-    **I19 — Anchor screen position extrapolates past the viewport
-    top so images scroll off gracefully.** `vim.fn.screenpos` returns
-    `0,0` for buffer rows that are above the viewport. If Mercury
-    forced those images to a far-negative sentinel `y` (e.g., -1000)
-    the moment the anchor went off-screen, image.nvim's `is_above`
-    bounds check would clear ALL images for the cell simultaneously
-    — even when images at higher `render_offset_top` from the same
-    anchor are still visually in the viewport. The user's report:
-    "the first output disappears partway through scroll, whereas
-    the second does not". Both should be in the same regime.
-
-    `_anchor_screen_pos` extrapolates a (possibly negative) screen
-    row when `screenpos` returns `0,0`, using the formula
-    `winrow + (anchor + 1) - topline` from `getwininfo`. image.nvim's
-    bounds logic then handles each image's position individually:
-
-      * Image fully in viewport → renders normally.
-      * Image partially above viewport top → image.nvim's
-        partial-visibility branch in `renderer.lua` clips the top
-        rows (backend permitting) or clamps `absolute_y` to
-        `bounds.top`.
-      * Image entirely above viewport (`absolute_y + height <= 0`)
-        → image.nvim's `is_above` clears it.
-
-    Each image in the cell crosses these thresholds at a different
-    scroll position (because their `render_offset_top` values
-    differ), so they disappear staggered — the natural notebook
-    scroll behavior the user expects.
-
-    The formula assumes no virt_lines from above-topline extmarks
-    are pushing the viewport down. For Mercury's per-cell virt_lines
-    arrangement this holds in the common case (each cell's
-    virt_lines live below its own body_end). A 1-2 row drift in the
-    partial-visibility threshold from this assumption isn't visible
-    to the user.
-
-    The far-negative `-1000` sentinel is now only used when
-    `_visible_window` returns nil (no window currently shows the
-    buffer — transient during `BufWinEnter`).
+    Workaround for users: avoid scrolling INTO a cell's image area;
+    scroll past the whole cell instead. The lock only fires when
+    `topline` is exactly on the cell's `body_end`.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

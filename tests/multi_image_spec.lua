@@ -139,15 +139,12 @@ describe("multi-image stacking", function()
     assert.equals(1, #recorded,
       "image cache should skip re-creation when hash+placement unchanged")
 
-    -- Different anchor row updates `y` via image:move (cheap) — does
-    -- NOT trigger a fresh from_file. SPEC I18: y is the terminal
-    -- screen row of the anchor; it changes on every scroll, and
-    -- recreating on every y change would cause flicker. Identity
-    -- fields (width, x, render_offset_top etc.) are what trigger
-    -- cache invalidation.
+    -- Different anchor row → different y in opts → same_placement
+    -- returns false → cache invalidates and a fresh from_file is
+    -- called.
     renderer:render(nb.cells[1], anchor + 5, images)
-    assert.equals(1, #recorded,
-      "anchor-row change must not call from_file (use image:move under SPEC I18)")
+    assert.equals(2, #recorded,
+      "anchor-row change must invalidate cache (y is part of same_placement)")
 
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/a.png")
@@ -178,11 +175,9 @@ describe("multi-image stacking", function()
     -- Second render with same images at same anchor: should NOT call from_file.
     renderer:render(nb.cells[1], anchor, images)
     assert.equals(1, #recorded)
-    -- Moving the anchor row triggers an image:move (cheap, no new
-    -- from_file). SPEC I18: scroll y updates are not cache invalidations.
+    -- Moving the anchor row invalidates placement -> must re-create.
     renderer:render(nb.cells[1], anchor + 5, images)
-    assert.equals(1, #recorded,
-      "anchor-row change must use image:move, not from_file (SPEC I18)")
+    assert.equals(2, #recorded)
 
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/reuse.png")

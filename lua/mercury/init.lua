@@ -228,32 +228,11 @@ local function attach_buffer(buf, opts)
     end,
   })
 
-  -- SPEC I18: Mercury owns image positioning under `window=nil` mode.
-  -- image.nvim's WinScrolled autocmd filters by `(window, buffer)` —
-  -- our `window=nil` images don't match, so image.nvim never repaints
-  -- them on scroll. We hook WinScrolled ourselves and update each
-  -- cached image's terminal `y` via `image:move(x, y)`. Bypasses the
-  -- partial-scroll lock that previously made images stay fixed on
-  -- the screen while text scrolled past them.
-  --
-  -- Coalesced (Util.coalesce) so fast scrolls — which fire multiple
-  -- WinScrolled events in a single tick — collapse into one
-  -- reposition pass. Without this, every j keypress would trigger an
-  -- image:move call per image; image.nvim's transform_cache could
-  -- briefly show a stale crop on each step, looking like flicker.
-  local coalesced_reposition = Util.coalesce(function()
-    if not vim.api.nvim_buf_is_valid(buf) then return end
-    if not vim.api.nvim_buf_is_loaded(buf) then return end
-    local wins = vim.fn.win_findbuf(buf) or {}
-    if #wins == 0 then return end
-    if renderer.image and renderer.image.reposition_for_scroll then
-      renderer.image:reposition_for_scroll()
-    end
-  end)
-  vim.api.nvim_create_autocmd("WinScrolled", {
-    group = buf_aug,
-    callback = function() coalesced_reposition() end,
-  })
+  -- Mercury no longer hooks WinScrolled for image repositioning —
+  -- image.nvim handles scroll re-rendering itself via its own
+  -- WinScrolled autocmd. (Earlier I18/I19 design used window=nil
+  -- + manual repositioning to bypass image.nvim's partial-scroll
+  -- lock; that broke layout entirely and was reverted.)
 
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)
