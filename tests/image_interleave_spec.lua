@@ -273,13 +273,12 @@ describe("ui shifts images below text via layout.text_offset", function()
 end)
 
 describe("compute_dimensions row math (SPEC I6)", function()
-  it("applies the I6 tight safety margin: bare + 1", function()
-    -- SPEC Invariant I6: per-image height = min(bare + 1,
-    -- image_max_height_rows). With I14 making Mercury's row math use
-    -- image.nvim's runtime cell sizes, our row count matches what
-    -- image.nvim renders — only a +1 sub-cell-rounding buffer is
-    -- needed. The previous +25%/+3 bump produced "too many lines
-    -- between sequential images" visually.
+  it("returns bare image_row_height (NO safety margin)", function()
+    -- SPEC Invariant I6: per-image height is exactly image_row_height
+    -- (clamped to max_rows). No safety bump — the gap row in
+    -- build_virt_lines is the buffer for sub-cell drift. Previous
+    -- formulas (+25%/+3 then +1) added a visible blank row below
+    -- every image.
     local Util = require("mercury.util")
     local Image = require("mercury.image")
     local function fake_png_local(w, h)
@@ -311,15 +310,11 @@ describe("compute_dimensions row math (SPEC I6)", function()
     local natural_cols = math.ceil(400 / 8)
     local bare = Output.image_row_height(400, 600,
       math.min(available, natural_cols), 8, 16, 40)
-    local expected = math.min(40, bare + 1)
+    -- I6 (current): zero safety bump.
+    local expected = math.min(40, bare)
     assert.equals(expected, heights[1],
-      ("expected I6 tight height = bare(%d) + 1 = %d; got %d")
-        :format(bare, expected, heights[1]))
-    -- Only +1 above bare (not the old +25% inflation) — pin the trim.
-    if bare + 1 < 40 then
-      assert.equals(bare + 1, heights[1],
-        "I6 safety bump must be exactly +1 row, not the old +25% bump")
-    end
+      ("expected I6 bare height = %d; got %d (any margin bloats spacing)")
+        :format(expected, heights[1]))
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/safetym.png")
   end)

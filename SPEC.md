@@ -943,19 +943,24 @@ updating this spec.
     stack height relative to the anchor, pushing the next cell clear
     even when our row math underestimates.
 
-    **I6 — Per-image height safety margin.** Each image's reserved
-    virt_lines = `min(image_row_height + 1, image_max_height_rows)`.
-    The `+1` absorbs sub-cell rounding inside image.nvim's renderer.
-    This is intentionally TIGHT because I14 makes Mercury's row math
-    use image.nvim's runtime cell sizes — Mercury and image.nvim
-    agree on the row count, so no large margin is needed. The
-    previous `+25% +3` bump left a visible 4-7 wasted blank rows
-    below every image (the "too many lines between sequential
-    images" regression). For the runtime-query-fallback path (no
-    `image.utils.term` available), `+1` may be slightly tight for
-    cell-aspect drift, but the LAST image's
-    `with_virtual_padding=true` (I5) is the terminal-overflow
-    backstop there.
+    **I6 — Per-image height: NO safety margin.** Each image's reserved
+    virt_lines = `image_row_height(...)`, clamped to
+    `image_max_height_rows`. The +1 gap row that
+    `Output.build_virt_lines` adds AFTER every non-trailing image
+    absorbs any 1-row sub-cell drift between Mercury's math and
+    image.nvim's actual render. Adding a separate per-image safety
+    bump on top double-counted that buffer and produced the visible
+    blank row below every image (the "too many lines between
+    sequential images" regression).
+
+    Runtime-query-fallback path (`image.utils.term` not available
+    → static 8×16): drift can exceed 1 row for terminals whose cell
+    aspect isn't 1:2. The trailing image's
+    `with_virtual_padding=true` + `overlap=render_offset_top`
+    (SPEC I15) provides the cell-spill backstop in all cases. For
+    non-trailing images on a divergent terminal, drift may bleed
+    into the next item — users on such terminals should override
+    `output.cell_height_px` via `setup()`.
 
     **I7 — Image-blank rows bypass `max_preview_lines`.** Truncating a
     cell to N lines must apply only to TEXT rows. Image-blank rows
@@ -1071,6 +1076,39 @@ updating this spec.
     `_runtime_cell_size()` helper in `image.lua` is the single
     source of truth; it returns `nil, nil` on any failure path so
     the caller's config-default fallback runs.
+
+    **I15 — Trailing-image optimisation eliminates double-reservation.**
+    When the LAST item in `out.items` is an image-rendering item,
+    Mercury treats that image as "trailing" and delegates its row
+    reservation entirely to image.nvim:
+
+      * `output.lua` SKIPS pushing the image's blank rows in our
+        extmark's virt_lines — `image_offsets[trailing_idx]` is
+        recorded but no blanks follow it.
+
+      * `image.lua` passes `with_virtual_padding = true` AND
+        `overlap = render_offset_top` to image.nvim's `from_file`.
+        image.nvim's `get_reserved_lines` formula collapses to
+        `image_height + 1` (instead of `offset_top + image_height`),
+        adding only the minimum rows it actually needs.
+
+    The result: a single-image cell reserves
+    `pill_rows + image_height + 1` virt_lines total — one row of
+    text + the image's actual height + 1 backstop row — rather than
+    `pill_rows + image_blanks + (offset_top + image_height)` which
+    visibly reserved "space for two images" for every single-image
+    cell. Sequential images shrink correspondingly.
+
+    The optimisation applies ONLY when the LAST item is an image:
+    if anything (text, error, etc.) follows the last image, Mercury
+    still pushes that image's blanks normally so the following text
+    renders below it. The check lives in `build_virt_lines` and only
+    fires when image.nvim is available AND the image's bytes are
+    loadable — otherwise the placeholder text needs our blanks.
+
+    Cache invalidation: `same_placement` in `image.lua` includes
+    `overlap` so a switch between trailing / non-trailing for the
+    same image hash invalidates the cached image.nvim handle.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

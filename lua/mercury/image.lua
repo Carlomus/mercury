@@ -41,6 +41,7 @@ local function same_placement(a, b)
     and a.width == b.width
     and a.render_offset_top == b.render_offset_top
     and a.with_virtual_padding == b.with_virtual_padding
+    and a.overlap == b.overlap
     and a.window == b.window
 end
 
@@ -130,16 +131,19 @@ end
 --     scaled_h_px  = h_px * (target_w_px / w_px)
 --     rows         = ceil(scaled_h_px / runtime_cell_h)
 --
--- Safety margin (SPEC I6) — TIGHT +1 row only. With I14 making the row
--- math agree with image.nvim, the previous `max(bare+3, ceil(bare*1.25))`
--- bump was overcounting and left a visible 4-7 blank rows below every
--- image (the user's "too many lines between sequential images"
--- complaint). +1 absorbs sub-cell rounding inside image.nvim's
--- renderer without bloating the gap. The runtime-query fallback path
--- (no `image.utils.term` available) reverts to the static 8×16
--- baseline, where +1 may be slightly small for cell-aspect drift —
--- the LAST image's `with_virtual_padding=true` (SPEC I5) is the
--- terminal backstop there.
+-- Safety margin (SPEC I6) — ZERO. With I14 the row math matches
+-- image.nvim within sub-cell rounding (0–1 row drift). The gap row
+-- that build_virt_lines adds AFTER every non-trailing image absorbs
+-- the worst-case +1 drift, so the bare reservation suffices.
+-- Previous values (+25%/+3, then +1) left a visible blank row below
+-- every image — the "too many lines between sequential images"
+-- regression. Now bare is exactly the number we reserve; the gap
+-- row is the only visible separator between consecutive content.
+-- Runtime-query-fallback path: in that case our static 8×16 may
+-- drift more than 1 row from image.nvim's actual, but the LAST
+-- image's `with_virtual_padding=true` (SPEC I5/I15) is the
+-- terminal backstop there. For intermediate images, the gap row
+-- provides 1 row of buffer.
 function Renderer:compute_dimensions(images)
   local widths, heights = {}, {}
   if not images or #images == 0 then
@@ -176,10 +180,10 @@ function Renderer:compute_dimensions(images)
           local natural_cols = math.ceil(w / cell_w_static)
           img_cols = math.min(available_cols, natural_cols)
           -- Height: use image.nvim's runtime cell sizes (SPEC I14).
-          local bare = Output.image_row_height(
+          -- No safety bump (SPEC I6) — the gap row in
+          -- build_virt_lines is the buffer for any sub-cell drift.
+          rows = Output.image_row_height(
             w, h, img_cols, cell_w_runtime, cell_h_runtime, max_rows)
-          -- SPEC Invariant I6 safety margin (tight +1, see header doc).
-          rows = math.min(bare + 1, max_rows)
         else
           -- Unknown dimensions (e.g. SVG without an intrinsic size): use the
           -- pessimistic max_rows so wide plots don't truncate. Invariant 15.
@@ -250,26 +254,33 @@ function Renderer:render(cell, anchor_row, images, layout)
   -- to convert. Forgetting this +1 makes the image render at virt_line[K-1]
   -- — concretely, the first image ends up on the pill row (overlap).
   local offsets = layout.offsets
+  local trailing_index = layout.trailing_index   -- SPEC I15
   local text_offset = layout.text_offset or 0
   local cumulative = 0
   for i, img in ipairs(images) do
     seen[img.hash] = true
     if not img.unavailable then
       local is_last = (i == #images)
+      local is_trailing = (trailing_index ~= nil and i == trailing_index)
       -- SPEC I4: cumulative offsets stack images vertically with a +1
-      -- visual gap row baked in. SPEC I9: only the last image carries
-      -- with_virtual_padding=true (SPEC I5 is the cell-spill backstop).
+      -- visual gap row baked in.
       local virt_line_idx = offsets and offsets[i] or (text_offset + cumulative)
       local off = virt_line_idx + 1   -- SPEC I13: convert idx → screen offset
+      -- SPEC I15: when the image is the trailing item in the cell,
+      -- output.lua skipped its blank-row reservation. image.nvim takes
+      -- over by setting `with_virtual_padding = true` AND passing
+      -- `overlap = render_offset_top`, so its `get_reserved_lines`
+      -- formula collapses to `image_height + 1` — image.nvim adds the
+      -- minimum rows it actually needs (no offset_top duplication),
+      -- avoiding the double-reservation that bloated single-image cells.
+      -- Non-trailing images keep with_virtual_padding=false because our
+      -- virt_lines already reserved their rows (SPEC I9).
       local opts = {
         buffer = self.notebook.buf,
         window = win,
         inline = true,
-        -- Last image: image.nvim reserves the rest of the rows it
-        -- actually needs (catches under-reserving from our height
-        -- math). Others: no padding from image.nvim — our virt_lines
-        -- already reserved the rows.
-        with_virtual_padding = is_last,
+        with_virtual_padding = is_trailing or (trailing_index == nil and is_last),
+        overlap = is_trailing and off or nil,
         x = i - 1,
         y = anchor_row,
         width = widths[i],

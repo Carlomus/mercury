@@ -229,7 +229,7 @@ function Renderer:render_cell_output(cell)
     end
   end
 
-  local virt, image_offsets = Output.build_virt_lines(out, {
+  local virt, image_offsets, trailing_img_idx = Output.build_virt_lines(out, {
     show_status_pill = cfg.show_status_pill,
     max_preview_lines = collapsed and 0 or (cfg.max_preview_lines or 9999),
     collapsed = collapsed,
@@ -259,6 +259,7 @@ function Renderer:render_cell_output(cell)
       -- Mercury's row math and image.nvim's actual rendering (SPEC I5).
       self.image:render(cell, anchor, images, {
         offsets = image_offsets,
+        trailing_index = trailing_img_idx,
       })
     else
       self.image:clear_cell(cell)
