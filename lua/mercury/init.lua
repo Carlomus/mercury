@@ -228,33 +228,13 @@ local function attach_buffer(buf, opts)
     end,
   })
 
-  -- WinScrolled hook: force image.nvim to re-render each cached
-  -- handle inline. image.nvim's own scroll handler defers its render
-  -- through vim.schedule (see render_scheduler.lua), so on every
-  -- scroll the image sits at the previous tick's pixel coords for
-  -- one event-loop tick while the buffer text has already moved
-  -- ("image lags the scroll"). Calling handle:render() inline gives
-  -- image.nvim a fresh screen_pos read on the same tick.
-  --
-  -- The per-image-position correctness during scroll is handled in
-  -- image.lua by the `overlap = 1000` opt (SPEC I18) — this hook is
-  -- only about masking image.nvim's render-scheduler latency.
-  --
-  -- Not coalesced: coalescing would reintroduce the lag. Per-scroll
-  -- cost is small (image.nvim's transmitted_images cache holds the
-  -- bytes, render() just re-emits the kitty graphics placement).
-  vim.api.nvim_create_autocmd("WinScrolled", {
-    group = buf_aug,
-    callback = function()
-      if not vim.api.nvim_buf_is_valid(buf) then return end
-      if not vim.api.nvim_buf_is_loaded(buf) then return end
-      local wins = vim.fn.win_findbuf(buf) or {}
-      if #wins == 0 then return end
-      if renderer.image and renderer.image.rerender_all_handles then
-        renderer.image:rerender_all_handles()
-      end
-    end,
-  })
+  -- No Mercury-side WinScrolled hook. The earlier attempt to force
+  -- a re-render on every scroll (via Renderer:rerender_all_handles)
+  -- was a workaround for image.nvim's vim.schedule-deferred scroll
+  -- handler, but it produced visible artifacts in multi-image
+  -- cells: image 1 appearing to disappear/lag relative to image 2.
+  -- image.nvim's own deferred render handles scroll re-positioning
+  -- correctly; the one-tick latency is acceptable.
 
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)

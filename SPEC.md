@@ -1189,21 +1189,30 @@ updating this spec.
       * `get_overlap_scroll_position` — the scroll path we WANT to
         steer into.
 
-    Companion: `Renderer:rerender_all_handles()`. image.nvim's
-    WinScrolled handler defers its render through `vim.schedule`
-    (`render_scheduler.lua`), so there's one event-loop tick of lag
-    between the scroll and the image moving. The per-buffer
-    WinScrolled autocmd in `init.lua` calls
-    `rerender_all_handles()` inline to re-emit each cached handle's
-    kitty placement on the same tick, eliminating the perceived
-    lag. No disk read (image.nvim's `transmitted_images` cache
-    holds the bytes), no coalescing (would reintroduce the lag).
+    Companion: extmark pinning with `right_gravity = false`.
+    image.nvim creates a per-image extmark with the default
+    `right_gravity = true`. When the user types at column 0 of
+    `body_end` (the anchor), the extmark shifts right with text;
+    image.nvim's `TextChanged` autocmd then detects the move via
+    `has_extmark_moved()` and re-renders the image at the new
+    column — visually the image jumps horizontally while typing.
+    Mercury re-sets the same extmark id with
+    `right_gravity = false` immediately after each `h:render()`
+    (see `_pin_extmark` in `image.lua`). With our
+    `with_virtual_padding = false`, image.nvim's reserved_lines
+    height is 0, so its `has_up_to_date_extmark` check never
+    triggers an extmark recreation that would clobber the pin.
+    The pin sticks for the handle's lifetime.
 
     Earlier failed attempts (formerly I18 / I19): `window = nil` +
     manual `image:move` on WinScrolled (broke layout entirely:
     images overlapped, floated, persisted on screen). Lock-zone
     pre-clear (vanished images during scroll instead of fixing
-    the diff-branch root cause). Both REVERTED.
+    the diff-branch root cause). Inline `rerender_all_handles()`
+    on WinScrolled (force-rendered each handle to compensate for
+    image.nvim's `vim.schedule`-deferred scroll handler, but
+    produced visible artifacts in multi-image cells where image 1
+    appeared to disappear/lag relative to image 2). All REVERTED.
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

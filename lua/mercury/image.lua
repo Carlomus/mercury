@@ -72,6 +72,30 @@ local function _fully_remove_image(img)
   end)
 end
 
+-- Pin image.nvim's extmark to its current position with right_gravity=false
+-- so text inserted at the anchor column doesn't shift it. image.nvim creates
+-- its extmark with default right_gravity=true (image/image.lua, the
+-- vim.api.nvim_buf_set_extmark call); when the user types at body_end's
+-- col 0 the extmark shifts right, image.nvim's TextChanged handler then
+-- spots the move via `has_extmark_moved()` and re-renders the image at the
+-- new column — visually the image jumps horizontally. Re-setting the same
+-- extmark id with right_gravity=false keeps it pinned at col 0 forever, so
+-- the TextChanged path becomes a no-op for our images.
+local function _pin_extmark(img)
+  if not img then return end
+  if not img.buffer or not img.extmark then return end
+  if not img.global_state or not img.global_state.extmarks_namespace then return end
+  if not img.internal_id then return end
+  pcall(
+    vim.api.nvim_buf_set_extmark,
+    img.buffer,
+    img.global_state.extmarks_namespace,
+    img.extmark.row or 0,
+    img.extmark.col or 0,
+    { id = img.internal_id, right_gravity = false, strict = false }
+  )
+end
+
 function Renderer:_clear_handles(cell_id)
   local entry = self.cache[cell_id]
   if not entry then return end
@@ -344,6 +368,7 @@ function Renderer:render(cell, anchor_row, images, layout)
         local ok, h = pcall(mod.from_file, img.path, opts)
         if ok and h then
           pcall(function() h:render() end)
+          _pin_extmark(h)
           entry.handles[img.hash] = h
           entry.placements[img.hash] = opts
         else
@@ -380,22 +405,6 @@ end
 -- produced the "two slots per image" bug (SPEC I11).
 function Renderer:force_invalidate_all()
   for id, _ in pairs(self.cache) do self:_clear_handles(id) end
-end
-
--- Force image.nvim to re-render every cached handle. Used by the
--- WinScrolled autocmd in init.lua to compensate for image.nvim's own
--- scroll handler lagging — without this prompt re-render, the image
--- can stay anchored to its previous terminal-cell position while the
--- buffer text scrolls past it (the "images scroll with the terminal,
--- not with the cell" complaint). image:render() is cheap on a
--- previously-loaded handle (no disk read, no decode); it just
--- re-computes screen_pos and re-emits the kitty graphics placement.
-function Renderer:rerender_all_handles()
-  for _, entry in pairs(self.cache or {}) do
-    for _, handle in pairs(entry.handles or {}) do
-      pcall(function() if handle.render then handle:render() end end)
-    end
-  end
 end
 
 return M

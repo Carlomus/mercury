@@ -677,67 +677,76 @@ describe("SPEC image invariants — direct pins", function()
     os.remove("/tmp/inv_clear.png")
   end)
 
-  it("I18: rerender_all_handles calls render() on every cached handle", function()
-    -- SPEC I18 (issue 2): image.nvim's WinScrolled handler defers its
-    -- render via vim.schedule, so the image lags one event-loop tick
-    -- behind the buffer text on every scroll. Mercury's WinScrolled
-    -- hook calls Renderer:rerender_all_handles() inline to emit a
-    -- fresh placement on the same tick.
-    --
-    -- Pin the behavior: after a render, calling rerender_all_handles
-    -- must invoke handle:render() once per cached handle (without
-    -- creating new handles or going through from_file again).
+  it("I18: extmark is pinned with right_gravity=false (no horizontal drift on type)", function()
+    -- SPEC I18 (right-gravity pin). image.nvim creates its per-image
+    -- extmark with default right_gravity=true, so text inserted at
+    -- col 0 of the anchor row shifts the extmark right. image.nvim's
+    -- TextChanged handler then re-positions the image at the new
+    -- column — visually the image jumps horizontally while typing.
+    -- Mercury re-sets the extmark with right_gravity=false right
+    -- after each h:render() to pin it. Verify by inspecting the
+    -- extmark's options after the render completes.
     local Util = require("mercury.util")
-    local Image = require("mercury.image")
-    Util.write_file("/tmp/inv_rer_a.png", fake_png(400, 200))
-    Util.write_file("/tmp/inv_rer_b.png", fake_png(400, 200))
+    Util.write_file("/tmp/inv_pin.png", fake_png(400, 200))
 
-    local from_file_calls = 0
-    local render_calls = 0
+    -- Spy backend that exposes the buf_set_extmark calls made by
+    -- Mercury's _pin_extmark helper.
+    local pin_calls = {}
     package.loaded["image"] = {
       is_enabled = function() return true end,
       from_file = function(path, opts)
-        from_file_calls = from_file_calls + 1
         return {
           id = path,
-          render = function() render_calls = render_calls + 1 end,
+          internal_id = 9001,
+          buffer = opts.buffer,
+          extmark = { row = opts.y, col = (opts.x or 0) },
+          global_state = { extmarks_namespace = 42 },
+          render = function() end,
           clear = function() end,
         }
       end,
     }
     package.loaded["mercury.image"] = nil
 
+    -- Wrap nvim_buf_set_extmark to capture calls so we can assert
+    -- right_gravity = false was passed.
+    local orig_set = vim.api.nvim_buf_set_extmark
+    vim.api.nvim_buf_set_extmark = function(buf, ns, row, col, opts)
+      if ns == 42 then  -- only image.nvim's namespace
+        table.insert(pin_calls, { row = row, col = col, opts = opts })
+        return 1
+      end
+      return orig_set(buf, ns, row, col, opts)
+    end
+
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-      "# %% id=invrer01", "x = 1",
+      "# %% id=invpin01", "x = 1",
     })
     vim.api.nvim_set_current_buf(buf)
     local nb = require("mercury.notebook").attach(buf); nb:rescan()
     local renderer = require("mercury.image").new(nb)
     renderer:render(nb.cells[1], nb:cell_anchor_row(nb.cells[1]),
-      {
-        { kind = "png", path = "/tmp/inv_rer_a.png", hash = "rer_a" },
-        { kind = "png", path = "/tmp/inv_rer_b.png", hash = "rer_b" },
-      })
-    -- Two from_file calls and two render() calls from the initial
-    -- render path.
-    assert.equals(2, from_file_calls)
-    assert.equals(2, render_calls)
+      { { kind = "png", path = "/tmp/inv_pin.png", hash = "pin" } })
 
-    -- Now invoke rerender_all_handles. from_file MUST NOT be called
-    -- again (no disk read / decode), but render() MUST fire once per
-    -- cached handle.
-    renderer:rerender_all_handles()
-    assert.equals(2, from_file_calls,
-      "rerender_all_handles must NOT re-decode images (no from_file)")
-    assert.equals(4, render_calls,
-      ("SPEC I18: rerender_all_handles must call render() once per "
-        .. "cached handle (expected 4 total, got %d)"):format(render_calls))
+    vim.api.nvim_buf_set_extmark = orig_set
+
+    -- At least one pin call with right_gravity = false.
+    local pinned = false
+    for _, c in ipairs(pin_calls) do
+      if c.opts and c.opts.right_gravity == false then
+        pinned = true; break
+      end
+    end
+    assert.is_true(pinned,
+      "SPEC I18: Mercury must re-set image.nvim's extmark with "
+        .. "right_gravity = false so typing at col 0 doesn't shift "
+        .. "the image horizontally")
 
     require("mercury.notebook").detach(buf)
     package.loaded["image"] = nil
     package.loaded["mercury.image"] = nil
-    os.remove("/tmp/inv_rer_a.png"); os.remove("/tmp/inv_rer_b.png")
+    os.remove("/tmp/inv_pin.png")
   end)
 
   it("I13: image with no preceding text still lands BELOW the pill (offset >= 2)", function()
