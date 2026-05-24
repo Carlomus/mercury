@@ -329,6 +329,53 @@ describe(":Notebook* user commands", function()
   -- Buffer-only behavior — commands must be no-ops on a non-mercury buffer
   ---------------------------------------------------------------------------
 
+  ---------------------------------------------------------------------------
+  -- Shift-Enter on a non-code cell must not error — should advance like
+  -- JupyterLab does on markdown cells.
+  ---------------------------------------------------------------------------
+
+  it(":NotebookExec on a markdown cell advances without error", function()
+    local buf, nb, tmp = fresh_buffer()
+    -- simple.ipynb: cell 1 = code, cell 2 = markdown.
+    local md_cell = nb.cells[2]
+    assert.equals("markdown", md_cell.kind)
+    -- Position cursor inside the markdown cell's body.
+    vim.api.nvim_win_set_cursor(0, { md_cell.body_start + 1, 0 })
+    -- Shift-Enter on markdown must not throw. Cursor should advance to
+    -- the next cell.
+    assert.has_no.errors(function() vim.cmd("NotebookExec") end)
+    local cur = vim.api.nvim_win_get_cursor(0)[1] - 1   -- 0-indexed row
+    local idx = nb:cell_index(md_cell.id)
+    local nxt = nb.cells[idx + 1]
+    if nxt then
+      assert.equals(nxt.body_start, cur,
+        "cursor must advance to the next cell's body_start")
+    end
+    teardown(tmp)
+  end)
+
+  it(":NotebookExec on the LAST markdown cell creates a new markdown cell",
+  function()
+    local buf, nb, tmp = fresh_buffer()
+    -- Convert the last cell to markdown to test the "create new" branch.
+    local last_idx = #nb.cells
+    vim.api.nvim_win_set_cursor(0, { nb.cells[last_idx].body_start + 1, 0 })
+    vim.cmd("NotebookCellToMarkdown")
+    nb:rescan()
+    assert.equals("markdown", nb.cells[#nb.cells].kind)
+    -- Now Shift-Enter on the last cell should create a NEW markdown
+    -- cell below it (matching JupyterLab's behavior).
+    local before = #nb.cells
+    vim.api.nvim_win_set_cursor(0, { nb.cells[#nb.cells].body_start + 1, 0 })
+    assert.has_no.errors(function() vim.cmd("NotebookExec") end)
+    nb:rescan()
+    assert.equals(before + 1, #nb.cells,
+      "a new cell should have been created below the last markdown cell")
+    assert.equals("markdown", nb.cells[#nb.cells].kind,
+      "the new cell must be markdown (same kind as the previous one)")
+    teardown(tmp)
+  end)
+
   it("commands on a non-mercury buffer notify and don't crash", function()
     -- Create a plain scratch buffer.
     local b = vim.api.nvim_create_buf(false, true)

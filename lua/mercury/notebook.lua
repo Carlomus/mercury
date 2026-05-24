@@ -389,14 +389,20 @@ function Notebook:_with_mutation(fn)
   self:rescan()
 end
 
-function Notebook:new_cell_below(cell)
+-- Insert a new cell below `cell`. `kind` is optional and defaults to
+-- "code"; pass "markdown" / "raw" to create a non-code cell. Used by
+-- `:NotebookExec` on markdown cells to follow Jupyter Lab's
+-- convention of creating a new cell of the SAME kind on Shift-Enter
+-- at the last cell.
+function Notebook:new_cell_below(cell, kind)
   cell = cell or self:cell_at_row()
   if not cell then return end
+  kind = kind or "code"
   local idx = self:cell_index(cell.id)
   local insert_at = (self.cells[idx + 1] and self.cells[idx + 1].header_row) or
     vim.api.nvim_buf_line_count(self.buf)
   local id = Util.short_id()
-  local sep = Ipynb.format_separator({ id = id, kind = "code" })
+  local sep = Ipynb.format_separator({ id = id, kind = kind })
   self:_with_mutation(function()
     vim.api.nvim_buf_set_lines(self.buf, insert_at, insert_at, false, { "", sep, "" })
   end)

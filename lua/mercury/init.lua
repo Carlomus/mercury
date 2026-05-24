@@ -235,17 +235,24 @@ local function attach_buffer(buf, opts)
   -- cached image's terminal `y` via `image:move(x, y)`. Bypasses the
   -- partial-scroll lock that previously made images stay fixed on
   -- the screen while text scrolled past them.
+  --
+  -- Coalesced (Util.coalesce) so fast scrolls — which fire multiple
+  -- WinScrolled events in a single tick — collapse into one
+  -- reposition pass. Without this, every j keypress would trigger an
+  -- image:move call per image; image.nvim's transform_cache could
+  -- briefly show a stale crop on each step, looking like flicker.
+  local coalesced_reposition = Util.coalesce(function()
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    if not vim.api.nvim_buf_is_loaded(buf) then return end
+    local wins = vim.fn.win_findbuf(buf) or {}
+    if #wins == 0 then return end
+    if renderer.image and renderer.image.reposition_for_scroll then
+      renderer.image:reposition_for_scroll()
+    end
+  end)
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = buf_aug,
-    callback = function()
-      if not vim.api.nvim_buf_is_valid(buf) then return end
-      if not vim.api.nvim_buf_is_loaded(buf) then return end
-      local wins = vim.fn.win_findbuf(buf) or {}
-      if #wins == 0 then return end
-      if renderer.image and renderer.image.reposition_for_scroll then
-        renderer.image:reposition_for_scroll()
-      end
-    end,
+    callback = function() coalesced_reposition() end,
   })
 
   M._setup_buffer_keymaps(buf)
@@ -690,12 +697,28 @@ function M._register_commands()
   cmd("NotebookExec", with_nb(function(nb)
     local cell = nb:cell_at_row()
     if not cell then return end
-    nb.kernel:execute(cell)
-    -- advance to next cell, or create one
+    -- Kernel execution only applies to code cells. Markdown / raw cells
+    -- treat Shift-Enter as "advance to next cell (or create one of the
+    -- same kind below)" — matching JupyterLab's behavior on markdown
+    -- cells (render-and-move). Wrap the kernel call so any internal
+    -- error path can't block the advance; the user expects the cursor
+    -- to move regardless.
+    if cell.kind == "code" then
+      pcall(function() nb.kernel:execute(cell) end)
+    end
     local idx = nb:cell_index(cell.id)
     local nxt = nb.cells[idx + 1]
-    if not nxt then nxt = nb:new_cell_below(cell) end
-    if nxt then vim.api.nvim_win_set_cursor(0, { nxt.body_start + 1, 0 }) end
+    if not nxt then
+      -- At the last cell. Create a new cell of the SAME kind as the
+      -- one we're advancing from. JupyterLab does this for markdown
+      -- (Shift-Enter on the last markdown cell adds a markdown cell);
+      -- for code cells the default is also code which is the existing
+      -- behavior.
+      nxt = nb:new_cell_below(cell, cell.kind)
+    end
+    if nxt then
+      pcall(vim.api.nvim_win_set_cursor, 0, { nxt.body_start + 1, 0 })
+    end
   end), {})
 
   cmd("NotebookExecAlone", with_nb(function(nb)
