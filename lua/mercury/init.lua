@@ -205,12 +205,21 @@ local function attach_buffer(buf, opts)
     group = buf_aug,
     buffer = buf,
     callback = function()
-      if vim.api.nvim_buf_is_loaded(buf) then renderer:render() end
+      if not vim.api.nvim_buf_is_loaded(buf) then return end
+      renderer:render()
+      -- With window=nil mode (SPEC I18), image.nvim doesn't redraw
+      -- our images on its own when the buffer becomes visible again.
+      -- redraw_all re-emits each handle's kitty placement using the
+      -- in-memory transmitted bytes (no disk read).
+      if renderer.image and renderer.image.redraw_all then
+        renderer.image:redraw_all()
+      end
     end,
   })
 
-  -- Tab / window switches: just re-run the renderer. Same rationale as
-  -- BufWinEnter — no force-invalidate, no duplicates.
+  -- Tab / window switches: re-run the renderer AND redraw images.
+  -- Same rationale as BufWinEnter — no force-invalidate, no
+  -- duplicates; the cached handles still have valid geometry.
   vim.api.nvim_create_autocmd({ "TabEnter", "WinEnter" }, {
     group = buf_aug,
     callback = function()
@@ -219,6 +228,9 @@ local function attach_buffer(buf, opts)
       local wins = vim.fn.win_findbuf(buf) or {}
       if #wins == 0 then return end
       renderer:render()
+      if renderer.image and renderer.image.redraw_all then
+        renderer.image:redraw_all()
+      end
     end,
   })
 
@@ -241,13 +253,45 @@ local function attach_buffer(buf, opts)
     end,
   })
 
-  -- No Mercury-side WinScrolled hook. The earlier attempt to force
-  -- a re-render on every scroll (via Renderer:rerender_all_handles)
-  -- was a workaround for image.nvim's vim.schedule-deferred scroll
-  -- handler, but it produced visible artifacts in multi-image
-  -- cells: image 1 appearing to disappear/lag relative to image 2.
-  -- image.nvim's own deferred render handles scroll re-positioning
-  -- correctly; the one-tick latency is acceptable.
+  -- WinScrolled hook: reposition every cached image to body_end's
+  -- current screen row. Mercury sets `window = nil` on every image
+  -- (SPEC I18), so image.nvim's own WinScrolled handler skips our
+  -- images via its window-filter; we MUST do this here ourselves or
+  -- images stay at their previous geometry across scrolls.
+  --
+  -- Synchronous, not coalesced — coalescing would reintroduce the
+  -- "image lags the scroll" perception. Per-scroll cost is small:
+  -- linear iteration of cached cells, a screenpos query per cell, at
+  -- most one image:move() per handle. No disk read.
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = buf_aug,
+    callback = function()
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      if not vim.api.nvim_buf_is_loaded(buf) then return end
+      local wins = vim.fn.win_findbuf(buf) or {}
+      if #wins == 0 then return end
+      if renderer.image and renderer.image.reposition_for_scroll then
+        renderer.image:reposition_for_scroll()
+      end
+    end,
+  })
+
+  -- BufLeave / WinLeave / BufHidden: clear kitty graphics pixels for
+  -- our images. With window = nil, image.nvim's own BufLeave/WinClosed/
+  -- TabEnter cleanup (init.lua:296-339) skips our images via the
+  -- `if current_image.window then` guard at line 312, so without this
+  -- hook the pixels stay on the terminal after the user switches
+  -- buffer/tab/window. clear_pixels_only does a shallow clear that
+  -- keeps the handle object alive so we can redraw cheaply on return.
+  vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
+    group = buf_aug,
+    buffer = buf,
+    callback = function()
+      if renderer.image and renderer.image.clear_pixels_only then
+        renderer.image:clear_pixels_only()
+      end
+    end,
+  })
 
   M._setup_buffer_keymaps(buf)
   setup_folding(buf)

@@ -93,11 +93,9 @@ describe("multi-image stacking", function()
     assert.equals(0, recorded[1].opts.x)
     assert.equals(1, recorded[2].opts.x)
     assert.equals(2, recorded[3].opts.x)
-    -- SPEC I13/I18: first image's render_offset_top = virt_line_idx (0)
-    -- + 1 + anchor_bump (1 — cell at top with body_end > 0). The
-    -- anchor shift to body_end - 1 (lock avoidance) compensates with
-    -- a +1 to keep the on-screen position unchanged.
-    assert.equals(2, recorded[1].opts.render_offset_top)
+    -- SPEC I13 (window=nil mode): first image's render_offset_top =
+    -- virt_line_idx (0) + 1 = 1.
+    assert.equals(1, recorded[1].opts.render_offset_top)
     assert.is_true(recorded[2].opts.render_offset_top > 0)
     assert.is_true(recorded[3].opts.render_offset_top > recorded[2].opts.render_offset_top)
     -- Only the last reserves virtual padding.
@@ -141,12 +139,15 @@ describe("multi-image stacking", function()
     assert.equals(1, #recorded,
       "image cache should skip re-creation when hash+placement unchanged")
 
-    -- Different anchor row → different y in opts → same_placement
-    -- returns false → cache invalidates and a fresh from_file is
-    -- called.
+    -- Different anchor row → DIFFERENT screen y in opts. With
+    -- window=nil mode (SPEC I18), y is excluded from same_placement
+    -- so the handle is reused and updated via image:move() instead
+    -- of recreated via from_file. Verify from_file is NOT called
+    -- again.
     renderer:render(nb.cells[1], anchor + 5, images)
-    assert.equals(2, #recorded,
-      "anchor-row change must invalidate cache (y is part of same_placement)")
+    assert.equals(1, #recorded,
+      "anchor-row change must NOT call from_file — handle is reused "
+        .. "and y is updated via image:move (SPEC I18 window=nil mode)")
 
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/a.png")
@@ -177,9 +178,10 @@ describe("multi-image stacking", function()
     -- Second render with same images at same anchor: should NOT call from_file.
     renderer:render(nb.cells[1], anchor, images)
     assert.equals(1, #recorded)
-    -- Moving the anchor row invalidates placement -> must re-create.
+    -- Moving the anchor row keeps the handle (only y changes) — no
+    -- from_file. (SPEC I18 window=nil mode.)
     renderer:render(nb.cells[1], anchor + 5, images)
-    assert.equals(2, #recorded)
+    assert.equals(1, #recorded)
 
     require("mercury.notebook").detach(buf)
     os.remove("/tmp/reuse.png")

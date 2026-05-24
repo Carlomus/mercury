@@ -231,12 +231,13 @@ describe("image rendering — explicit height + tab re-render", function()
       { kind = "png", path = "/tmp/ov_c.png", hash = "ovc" },
     })
     assert.equals(3, #recorded)
-    -- SPEC I13/I18: first image's render_offset_top = virt_line_idx (0)
-    -- + 1 + anchor_bump (1 in this case — cell at top of buffer with
-    -- body_end > 0). The lock-avoidance anchor shift (SPEC I18) moves
-    -- the anchor from body_end to body_end - 1 and bumps offset_top
-    -- by 1 to keep the on-screen position unchanged.
-    assert.equals(2, recorded[1].opts.render_offset_top)
+    -- SPEC I13 (window=nil mode): first image's render_offset_top =
+    -- virt_line_idx (0) + 1 = 1. With window=nil, y is set to
+    -- body_end's screen row 0-indexed; image.nvim's renderer takes
+    -- absolute_y = y + offset_top and writes at terminal row
+    -- absolute_y + 1 — placing the image at
+    -- body_end_screen_1idx + offset_top = body_end + 1 for image 1.
+    assert.equals(1, recorded[1].opts.render_offset_top)
     for i = 2, 3 do
       assert.is_true(
         recorded[i].opts.render_offset_top > recorded[i - 1].opts.render_offset_top,

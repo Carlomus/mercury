@@ -34,18 +34,48 @@ function M.new(notebook)
   }, Renderer)
 end
 
--- Cache key for image.nvim placements. y is the buffer row (anchor);
--- image.nvim handles scroll positioning itself via screenpos. A change
--- in any of these requires destroying the cached image and re-creating
--- it via from_file.
+-- Cache key for image.nvim placements. y is EXCLUDED from the comparison
+-- because we now set y dynamically to body_end's current screen row
+-- (SPEC I18, window=nil mode) — y changes on every scroll. The cache
+-- still hits on unchanged content/x/width/offset; y differences are
+-- propagated to the cached handle via image:move() rather than tearing
+-- down and recreating.
 local function same_placement(a, b)
   if not a or not b then return false end
-  return a.y == b.y
-    and a.x == b.x
+  return a.x == b.x
     and a.width == b.width
     and a.render_offset_top == b.render_offset_top
     and a.with_virtual_padding == b.with_virtual_padding
-    and a.window == b.window
+end
+
+-- Compute body_end's terminal screen row (0-indexed). Returns nil if no
+-- valid window is found.
+--
+-- For body_end visible in the viewport: vim.fn.screenpos returns the
+-- 1-indexed terminal row directly; subtract 1.
+--
+-- For body_end above the viewport (cell scrolled past): screenpos
+-- returns 0,0. Extrapolate using `winrow + (body_end_1idx - topline)`
+-- — assumes a linear buffer (no folds, no virt_lines_above on
+-- intervening lines). For Mercury cells with only virt_lines_below,
+-- this is accurate enough; even when it's slightly off, image.nvim's
+-- bounds check (is_above) will clip or hide the image correctly.
+local function _body_end_screen_y_0idx(win, body_end)
+  if not win or not vim.api.nvim_win_is_valid(win) then return nil end
+  -- screenpos errors with E966 if the line number is past the buffer's
+  -- last line — happens in test setups and during transient states
+  -- where the cell scan hasn't caught up with the buffer. pcall it
+  -- and treat any failure as "off-screen, extrapolate".
+  local ok, sp = pcall(vim.fn.screenpos, win, body_end + 1, 1)
+  if ok and sp and type(sp.row) == "number" and sp.row > 0 then
+    return sp.row - 1
+  end
+  local wi_list = vim.fn.getwininfo(win)
+  local wi = wi_list and wi_list[1]
+  if not wi then return nil end
+  local topline = wi.topline or 1
+  local winrow = wi.winrow or 1
+  return winrow + body_end - topline
 end
 
 -- Fully remove an image.nvim image from its global registry.
@@ -256,38 +286,33 @@ function Renderer:compute_dimensions(images)
   return widths, heights, available_cols
 end
 
--- Compute the screen row where buffer row `anchor_row` displays — or
--- WOULD display if it's currently scrolled past the viewport top.
--- Returns `nil` only when no window shows this buffer at all.
+-- Render images for a cell using image.nvim's `inline=true` mode with
+-- `window = nil` (SPEC I18). With window=nil, image.nvim's renderer
+-- takes a single simple branch (renderer.lua:214):
 --
--- screenpos returns 0,0 for buffer rows outside the viewport. For the
--- "image gracefully scrolls off the top" requirement (SPEC I19), we
--- need the IMAGES anchored to that row to still render at their real
--- screen position (`anchor_screen + render_offset_top`) so image.nvim's
--- partial-visibility clip can drop only the rows that actually crossed
--- the viewport edge — not the whole image. The "would-be" formula
--- `winrow + (anchor + 1) - topline` extrapolates the anchor's
--- now-negative screen row past the top edge; image.nvim's `is_above`
--- check (`absolute_y + height <= 0`) fires only when the entire image
--- has truly left the viewport.
+--     absolute_x = original_x
+--     absolute_y = original_y + render_offset_top
 --
--- The formula assumes no virt_lines from extmarks above are pushing
--- the topline display down. That's accurate for typical notebook
--- scrolling (each cell's virt_lines live below its own body_end), and
--- Render images for a cell using image.nvim's `inline=true` mode
--- with the visible window. image.nvim handles screen positioning via
--- `vim.fn.screenpos(window, y+1, x+1)` internally and tracks scroll
--- via its own WinScrolled autocmd.
+-- — no `screenpos`, no lock branch, no diff branch, no `get_overlap`
+-- helper. Just direct screen coordinates. Mercury controls them.
 --
--- Known limitation: image.nvim's partial-scroll path
--- (renderer.lua's `if original_y + 1 == topline` branch) locks an
--- image at `winrow` when the user scrolls into the cell's virt_lines.
--- This produces image "stays fixed on terminal" / "image appears below
--- text" behavior during scroll. Attempts to bypass via `window=nil`
--- + manual reposition broke layout entirely (SPEC I18 reverted), so
--- the current trade-off is: correct layout, imperfect scroll. A
--- proper fix needs image.nvim upstream support for disabling the
--- partial-scroll path per-image (no such option today).
+-- This bypasses all the image.nvim renderer quirks that gave us the
+-- previous bug grab-bag (image-snaps-to-image-2, image-stays-on-scroll,
+-- image-overlaps-text-on-scroll, image-disappears-in-multi-cell). The
+-- trade-offs:
+--
+--   * `y` is now a SCREEN row, computed dynamically per render and
+--     per WinScrolled event (Renderer:reposition_for_scroll below).
+--     Same_placement excludes y from the cache key — we update y via
+--     image:move() on cache hits instead of tearing down and recreating.
+--   * image.nvim's own auto-cleanup on BufLeave/WinClosed/TabEnter
+--     (init.lua:296) skips images with window=nil. Mercury hooks
+--     BufLeave/WinLeave/BufWipeout and calls Renderer:clear_pixels_only
+--     to manually clear the kitty graphics when the buffer/window goes
+--     out of view, and Renderer:redraw_all on BufWinEnter/WinEnter/
+--     TabEnter to re-emit them when it comes back.
+--   * Cell-spill safety still relies on our virt_lines reservation
+--     (SPEC I16) since image.nvim's virtual-padding path isn't active.
 function Renderer:render(cell, anchor_row, images, layout)
   layout = layout or {}
   local mod = api()
@@ -306,47 +331,12 @@ function Renderer:render(cell, anchor_row, images, layout)
 
   local widths, heights = self:compute_dimensions(images)
 
-  -- SPEC I18 (anchor shift): anchor at body_end - 1, not body_end.
-  -- Rationale: image.nvim's renderer locks the image at `winrow` when
-  -- (a) `original_y + 1 == win_info.topline` AND (b) screenpos
-  -- returns 0,0. For an anchor at body_end, condition (a) means
-  -- `body_end_1idx == topline`. Nvim's topline stays at
-  -- `body_end_1idx` while the user scrolls through body_end's
-  -- virt_lines (the "scroll past the cell" case), AND body_end's
-  -- text goes above the window content area (screenpos returns
-  -- 0,0). Both fire → image pins at `winrow + offset_top` and the
-  -- user sees it "stay in the same relative position on the
-  -- terminal" while the cell's virt_lines content scrolls past.
-  --
-  -- Anchoring at body_end - 1 breaks condition (a): the anchor's
-  -- 1-indexed row is now `body_end`, which is one less than
-  -- topline during in-virt_lines scrolling. The lock branch
-  -- doesn't fire; image.nvim falls into `get_overlap_scroll_position`
-  -- (because overlap = 1000 is set) and the image gets a
-  -- per-render_offset_top position that tracks the scroll properly.
-  --
-  -- offset_top compensates +1 to keep the static (anchor visible)
-  -- display position unchanged. With anchor = body_end visible at
-  -- terminal row R, the OLD math was: image at R + offset_top + 1
-  -- (where offset_top = virt_line_idx + 1). With anchor =
-  -- body_end - 1 (one row higher in buffer, displaying one row
-  -- above body_end), screen_pos.row returns R-1, so we need
-  -- offset_top = virt_line_idx + 2 to land at the same display row.
-  --
-  -- Edge case: body_end == 0 (degenerate single-row cell at top of
-  -- buffer). We can't anchor at row -1, so anchor stays at 0 and
-  -- the offset bump is dropped. The lock case is theoretically
-  -- possible there but it requires topline == 1, which would mean
-  -- body_end IS visible at winrow (screenpos != 0,0), so the lock
-  -- never actually triggers either.
-  local anchor_y, anchor_bump
-  if anchor_row > 0 then
-    anchor_y = anchor_row - 1
-    anchor_bump = 1
-  else
-    anchor_y = 0
-    anchor_bump = 0
-  end
+  -- y is the SCREEN row (0-indexed) where body_end currently displays.
+  -- absolute_y = y + offset_top with window=nil, so we want
+  -- y + offset_top + 1 (the kitty cursor +1) to land at body_end's
+  -- terminal row + virt_line_offset.
+  local screen_y = _body_end_screen_y_0idx(win, anchor_row)
+  if not screen_y then return 0 end
 
   local offsets = layout.offsets
   local text_offset = layout.text_offset or 0
@@ -356,60 +346,27 @@ function Renderer:render(cell, anchor_row, images, layout)
     if not img.unavailable then
       -- SPEC I4: cumulative offsets stack images vertically with a +1
       -- visual gap row baked in.
-      -- SPEC I13: convert virt_line index → render_offset_top (+1
-      -- because image.nvim's screenpos(window, y+1, x+1).row returns
-      -- the screen row of the anchor BUFFER LINE, and the virt_line at
-      -- index K below it sits at screen_pos.row + K + 1).
-      -- SPEC I18: +anchor_bump compensates for anchoring at
-      -- body_end - 1 instead of body_end (lock-avoidance).
+      -- SPEC I13 (window=nil mode): with y = body_end_screen_row_0idx,
+      -- absolute_y = y + offset_top + 1 = (body_end's 1-indexed
+      -- terminal row) + offset_top. For the image to land at
+      -- body_end_screen + virt_line_idx + 1 (= virt_line[K]'s terminal
+      -- row), set offset_top = virt_line_idx + 1.
       local virt_line_idx = offsets and offsets[i] or (text_offset + cumulative)
-      local off = virt_line_idx + 1 + anchor_bump
+      local off = virt_line_idx + 1
       local opts = {
         buffer = self.notebook.buf,
-        window = win,
+        window = nil,                   -- SPEC I18: bypass image.nvim's renderer branches
         inline = true,
         with_virtual_padding = false,   -- SPEC I16
         x = i - 1,                      -- distinct extmark cols per image
-        y = anchor_y,                   -- body_end - 1 (lock avoidance, SPEC I18)
+        y = screen_y,                   -- body_end's CURRENT screen row (0-indexed)
         width = widths[i],
         render_offset_top = off,
-        -- SPEC I18 (revised). image.nvim's renderer has TWO bad
-        -- branches when our anchor row goes off-screen above the
-        -- viewport (screenpos returns 0,0):
-        --   1. lock at winrow (rare for Mercury — needs anchor row
-        --      == topline AND screenpos=0,0, which doesn't normally
-        --      happen for a virt_lines-bearing extmark).
-        --   2. the `diff > 0` branch:
-        --        absolute_y = winrow - height + diff - 1
-        --      This is computed WITHOUT render_offset_top
-        --      (is_partial_scroll = true skips the +offset_top at
-        --      line 348). For a cell with multiple SAME-HEIGHT
-        --      images (e.g., two matplotlib plots), every image
-        --      gets the SAME absolute_y here and they all paint at
-        --      the same row — the later-rendered one wins and the
-        --      user sees image N "snap onto" image N+1's position.
-        --
-        -- The fix: a large `overlap` value steers image.nvim into
-        -- `get_overlap_scroll_position`, which returns
-        -- `winrow + render_offset_top - scrolled_lines` — a per-
-        -- image position because each image has a distinct
-        -- render_offset_top. The image then scrolls upward 1 row
-        -- per buffer scroll, exactly tracking its cell, and the
-        -- visible_height = height + offset_top check inside that
-        -- helper still hides the image when it's fully scrolled off
-        -- the top. We pick a constant well above any reasonable
-        -- offset_top + height (1000 cells is more than any user's
-        -- viewport would ever hold) so the overlap_lines cap inside
-        -- get_overlap_scroll_position never fires before the
-        -- visible_height check does — that ordering matters.
-        --
-        -- Previous attempt (formerly noted in SPEC I16) used
-        -- `overlap = render_offset_top`; that's typically 2-30,
-        -- which the overlap_lines cap fires on after just a few
-        -- scroll lines, falling back to the bad diff branch. Using
-        -- a value LARGER than visible_height is what makes this
-        -- robust.
-        overlap = 1000,
+        -- No `overlap` opt. With window=nil, image.nvim's renderer
+        -- skips the entire `get_overlap_scroll_position` /
+        -- diff-branch / lock-branch block. overlap is meaningless
+        -- here and only mattered when image.nvim was doing screen
+        -- positioning for us.
       }
       local handle = entry.handles[img.hash]
       local prev = entry.placements[img.hash]
@@ -427,6 +384,13 @@ function Renderer:render(cell, anchor_row, images, layout)
           entry.handles[img.hash] = nil
           entry.placements[img.hash] = nil
         end
+      elseif handle.geometry and handle.geometry.y ~= screen_y then
+        -- Cache hit but body_end's screen row changed (typing added a
+        -- line earlier in the buffer, scroll, etc.). Update y via
+        -- image:move() — cheap, no disk read.
+        pcall(function() handle:move(handle.geometry.x or (i - 1), screen_y) end)
+        _pin_extmark(handle)
+        entry.placements[img.hash] = opts
       end
     end
     -- 1-row visual gap row between consecutive RENDERED images. Skip the
@@ -457,6 +421,67 @@ end
 -- produced the "two slots per image" bug (SPEC I11).
 function Renderer:force_invalidate_all()
   for id, _ in pairs(self.cache) do self:_clear_handles(id) end
+end
+
+-- Reposition every cached image to its cell's current body_end screen
+-- row (SPEC I18, window=nil mode). Called from init.lua's WinScrolled
+-- autocmd. Cheap: at most one image:move() per handle, no disk read,
+-- and only when the row actually changed.
+function Renderer:reposition_for_scroll()
+  local win = self:_visible_window()
+  if not win then return end
+  for cell_id, entry in pairs(self.cache or {}) do
+    -- Find the cell by id. notebook.cells is small, linear scan is fine.
+    local cell = nil
+    for _, c in ipairs(self.notebook.cells or {}) do
+      if c.id == cell_id then cell = c; break end
+    end
+    if cell then
+      local new_y = _body_end_screen_y_0idx(win, cell.body_end)
+      if new_y then
+        for _, handle in pairs(entry.handles or {}) do
+          if handle.geometry and handle.geometry.y ~= new_y then
+            pcall(function()
+              handle:move(handle.geometry.x or 0, new_y)
+            end)
+            _pin_extmark(handle)
+          end
+        end
+      end
+    end
+  end
+end
+
+-- Clear all kitty graphics pixels for our cached images, but PRESERVE
+-- the handle objects so we can redraw cheaply later. Used on
+-- BufLeave/WinLeave — image.nvim's own BufLeave cleanup skips images
+-- with window=nil (init.lua:312 in image.nvim), so we must do this
+-- ourselves or the pixels stay on the terminal even after the buffer
+-- is no longer visible.
+--
+-- Shallow=true tells image.nvim's backend.clear to keep the
+-- state.images entry; we still own the handle and can re-render it.
+function Renderer:clear_pixels_only()
+  for _, entry in pairs(self.cache or {}) do
+    for _, handle in pairs(entry.handles or {}) do
+      pcall(function()
+        if handle.clear then handle:clear(true) end
+      end)
+    end
+  end
+end
+
+-- Re-emit kitty graphics for every cached image. Used on
+-- BufWinEnter/WinEnter/TabEnter after a clear_pixels_only — the
+-- handles still exist with their last geometry, so render() reuses
+-- the in-memory transmitted image bytes and just re-emits the
+-- placement command. No disk read, no decode.
+function Renderer:redraw_all()
+  for _, entry in pairs(self.cache or {}) do
+    for _, handle in pairs(entry.handles or {}) do
+      pcall(function() if handle.render then handle:render() end end)
+    end
+  end
 end
 
 return M

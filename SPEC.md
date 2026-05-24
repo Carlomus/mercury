@@ -1132,131 +1132,129 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — Three image.nvim-quirk mitigations on every image:
-    `overlap = 1000`, anchor at `body_end - 1` (not `body_end`), and
-    `right_gravity = false` pin via delete-and-recreate on the
-    image.nvim extmark.**
+    **I18 — `window = nil` mode: Mercury bypasses image.nvim's
+    renderer branches entirely and manages screen positioning itself.**
 
-    Overlap = 1000 routes image.nvim's scroll-past-anchor path
-    through `get_overlap_scroll_position` (per-image position) instead
-    of the diff branch (same row for same-height images = visible
-    overlap).
-
-    The bug. image.nvim's renderer, when the anchor row goes off the
-    top of the viewport (`screenpos` returns 0,0), has three
-    branches:
+    Every image is created with `window = nil`. image.nvim's
+    renderer.lua then takes a single simple branch (line 214):
 
     ```lua
-    if original_y + 1 == win_info.topline then
-      absolute_y = win_info.winrow                              -- lock
-    else
-      overlap_absolute_y = get_overlap_scroll_position(...)
-      if overlap_absolute_y then
-        absolute_y = overlap_absolute_y                         -- good
-      else
-        ...
-        absolute_y = win_info.winrow - height + diff - 1        -- diff
-      end
-    end
+    if image.window == nil then
+      absolute_x = original_x
+      absolute_y = original_y + (image.render_offset_top or 0)
     ```
 
-    The `diff` branch computes `absolute_y` from `height` only —
-    `render_offset_top` is NOT added (line 348's `if not
-    is_partial_scroll` skips the addition). For a Mercury cell with
-    two same-height images (e.g., two matplotlib plots) and a shared
-    anchor row (single-extmark interleave, SPEC I8), BOTH images
-    compute the SAME `absolute_y` here. They paint on top of each
-    other; the later-rendered image wins. User report:
-    "image 1 snaps to image 2's position and displays on top."
+    No `screenpos`, no lock branch, no diff branch, no
+    `get_overlap_scroll_position`. The kitty backend writes pixels at
+    `(x + 1, absolute_y + 1)` directly. Mercury controls `original_y`
+    so it controls where the image lands on the terminal.
 
-    The fix. `get_overlap_scroll_position` returns
-    `winrow + render_offset_top - scrolled_lines` — a per-image
-    position because each image has its own `render_offset_top`.
-    Setting `overlap = LARGE` keeps the
-    `if scrolled_lines >= overlap_lines then return nil` cap
-    inside `get_overlap_scroll_position` from firing, so the
-    function reaches the `visible_height = height + offset_top`
-    check; that check naturally returns nil (→ hide) only when the
-    image is fully off the top.
+    Why bypass image.nvim's renderer entirely. Every previous
+    attempt to keep image.nvim's `window = current_win` path and
+    work around its quirks failed on at least one of these:
 
-    Value choice. Any constant larger than `max(height +
-    offset_top)` across all images would work. 1000 is well above
-    any reasonable viewport, costs nothing at runtime, and stays
-    cap-inactive even for very tall cells. Earlier failed attempt
-    used `overlap = render_offset_top` (typically 2-30) — the cap
-    tripped after a few scroll lines and the diff branch took over.
+      * **Lock branch** (`if original_y + 1 == win_info.topline`):
+        pins the image at `winrow + offset_top` when the anchor's
+        1-indexed row equals topline AND screenpos returns 0,0.
+        Nvim sustains `topline == body_end_1idx` while the user
+        scrolls through virt_lines below body_end → image stays
+        glued to the top of the viewport while text scrolls past.
+      * **Diff branch** (`absolute_y = winrow - height + diff - 1`):
+        same `absolute_y` for same-height images sharing an
+        anchor → multi-matplotlib cells render images on top of
+        each other.
+      * **`get_overlap_scroll_position` with overlap=LARGE**: fixes
+        the diff branch but renders the image at `winrow +
+        offset_top - scrolled` even when the cell has fully
+        scrolled past, so the image hangs in the viewport
+        artifactually after the cell is gone.
+      * **TextChanged + has_extmark_moved**: image.nvim's
+        TextChanged handler reads the per-image extmark's current
+        position and re-renders the image at the new col / row.
+        Typing at col 0 with default `right_gravity = true` shifts
+        the extmark → image moves horizontally.
 
-    Why setting `overlap` doesn't reintroduce I16's old problem.
-    `overlap` affects two places in image.nvim:
-      * `get_reserved_lines` — only consulted when
-        `with_virtual_padding = true`. Mercury keeps it `false`
-        (SPEC I16), so no row duplication.
-      * `get_overlap_scroll_position` — the scroll path we WANT to
-        steer into.
+    Each of these had a bespoke workaround (`overlap`, anchor
+    shift, `right_gravity` pin, etc.), and each workaround opened
+    a different regression elsewhere. The window=nil branch has
+    NONE of these failure modes — the renderer doesn't read
+    screenpos, doesn't run the lock/diff/overlap branches, and
+    image:render() doesn't recompute position on TextChanged
+    (has_extmark_moved still runs, but with no movement to react
+    to, it's a no-op).
 
-    Anchor shift: `y = body_end - 1` (with offset_top bumped +1 to
-    compensate). image.nvim's renderer has a lock branch that pins
-    the image at `winrow + offset_top` when (a) `original_y + 1 ==
-    win_info.topline` AND (b) screenpos returns 0,0. For anchor =
-    body_end, condition (a) means `body_end_1idx == topline` — which
-    nvim sustains throughout the in-virt_lines scrolling of a cell
-    (the user observes "image stays in the same relative position on
-    the terminal" while the cell's virt_lines text scrolls past).
-    Shifting the anchor to `body_end - 1` breaks (a) — the anchor's
-    1-indexed row is now `body_end`, one less than topline during
-    in-virt_lines scrolling — and the renderer falls into
-    `get_overlap_scroll_position` instead, giving a per-image
-    position that tracks scroll. offset_top is bumped +1 to preserve
-    the static (anchor visible) display row.
+    Mercury's responsibilities under window=nil. With image.nvim
+    no longer doing screen positioning, Mercury must:
 
-    Edge case: body_end == 0 (degenerate single-row cell at top of
-    buffer). We can't anchor at row -1, so anchor stays at 0 and the
-    bump is dropped. The lock case is theoretically possible but
-    requires topline == 1 with screenpos returning 0,0 for line 1,
-    which would mean line 1 isn't visible — impossible since line 1
-    *is* the topline. So the lock never fires there either.
+      1. **Compute screen y.** `_body_end_screen_y_0idx` calls
+         `vim.fn.screenpos(win, body_end + 1, 1)` when body_end
+         is visible; falls back to `winrow + body_end - topline`
+         extrapolation when it's above the viewport.
+      2. **Pass screen y as the `y` opt.** image.nvim plugs this
+         directly into `absolute_y = y + offset_top`, so the kitty
+         backend writes pixels at terminal row `screen_y +
+         offset_top + 1` — matching `body_end_screen_1idx +
+         virt_line_idx + 1` for image at virt_line[K].
+      3. **Reposition on WinScrolled.** Synchronously update each
+         cached handle's geometry.y via `image:move` from the
+         per-buffer WinScrolled autocmd. image.nvim's own
+         WinScrolled handler filters by (window, buffer) — with
+         our window=nil, it doesn't pick our images up, so this
+         hook is the only thing moving them on scroll.
+      4. **Clear pixels on BufLeave / WinLeave.** image.nvim's
+         BufLeave/WinClosed/TabEnter cleanup (init.lua:296-339)
+         guards on `if current_image.window then` (line 312) and
+         skips our images. Mercury's per-buffer BufLeave / WinLeave
+         autocmds call `Renderer:clear_pixels_only` to manually
+         clear the kitty graphics when the buffer/window goes out
+         of view. Shallow clear preserves the handle so we can
+         redraw cheaply on return.
+      5. **Redraw on BufWinEnter / WinEnter / TabEnter.**
+         `Renderer:redraw_all` calls `handle:render()` on every
+         cached handle to re-emit the kitty placement using the
+         in-memory transmitted image bytes (no disk read, no
+         decode).
+      6. **Pin the per-image extmark with `right_gravity = false`.**
+         image.nvim creates an extmark per image even in window=nil
+         mode (used by has_extmark_moved). Without the pin, typing
+         at col 0 shifts the extmark, has_extmark_moved fires, and
+         image.nvim's TextChanged handler updates geometry.x →
+         image moves horizontally. `_pin_extmark` deletes and
+         recreates the extmark with `right_gravity = false` so it
+         stays at col 0 across text edits.
 
-    Companion: extmark pinning with `right_gravity = false`,
-    delete-and-recreate. image.nvim creates a per-image extmark
-    with the default `right_gravity = true`. When the user types
-    at column 0 of the anchor, the extmark shifts right with text;
-    image.nvim's `TextChanged` autocmd then detects the move via
-    `has_extmark_moved()` and re-renders the image at the new
-    column — visually the image jumps horizontally while typing.
-    Mercury's `_pin_extmark` (in `image.lua`) **deletes** image.nvim's
-    extmark and recreates one with the same id and
-    `right_gravity = false`. (In-place update via
-    `nvim_buf_set_extmark` with the existing id doesn't always
-    change gravity on the existing extmark in older nvim builds —
-    delete-and-recreate is the safe path.)
+    Cache semantics. `same_placement` excludes `y` from the
+    comparison because y changes on every scroll. On cache hit
+    with a changed y, Mercury calls `image:move(x, new_y)` instead
+    of tearing down the handle and recreating via `from_file`
+    (which would be a needless disk read on every scroll).
 
-    With our `with_virtual_padding = false`, image.nvim's
-    reserved_lines height is 0, so its `has_up_to_date_extmark`
-    check never triggers an extmark recreation that would clobber
-    the pin. The pin sticks for the handle's lifetime.
+    Render-offset_top math. With y = `body_end_screen_y_0idx`,
+    `absolute_y = y + offset_top` and the kitty backend writes at
+    `absolute_y + 1`, so the image lands at terminal row
+    `body_end_screen_1idx + offset_top`. For the image at
+    virt_line[K] (which displays at body_end_screen_1idx + K + 1),
+    we need `offset_top = K + 1` — the same `virt_line_idx + 1`
+    formula Mercury used before the brief
+    `body_end - 1`/anchor_bump excursion. No bump needed in
+    window=nil mode.
 
     The 3 ms render debounce (`init.lua`) is also part of the
-    user-visible-correctness story. The previous 30 ms was tuned for
-    rapid-typing performance, but produced visible flicker when the
-    user added a line to a cell that had image output: nvim
-    auto-scrolls the buffer, image.nvim's WinScrolled handler
-    re-renders each cached image at the OLD body_end (we pinned the
-    extmark with right_gravity=false so it doesn't track the line
-    insertion), and the Mercury re-render that moves the anchor to
-    the NEW body_end is held for 30 ms — visible as "img jumps up
-    then scrolls down to original position". 3 ms is sub-frame and
-    still gives coalescing across single keystrokes that emit
-    multiple TextChanged events.
+    user-visible-correctness story. The previous 30 ms was tuned
+    for rapid-typing performance, but produced visible flicker when
+    the user added a line to a cell that had image output. 3 ms is
+    sub-frame and still coalesces multiple TextChanged events from
+    a single keystroke.
 
-    Earlier failed attempts (formerly I18 / I19): `window = nil` +
-    manual `image:move` on WinScrolled (broke layout entirely:
-    images overlapped, floated, persisted on screen). Lock-zone
-    pre-clear (vanished images during scroll instead of fixing
-    the diff-branch root cause). Inline `rerender_all_handles()`
-    on WinScrolled (force-rendered each handle to compensate for
-    image.nvim's `vim.schedule`-deferred scroll handler, but
-    produced visible artifacts in multi-image cells where image 1
-    appeared to disappear/lag relative to image 2). All REVERTED.
+    Earlier failed attempts (all REVERTED): `window = current_win`
+    + `overlap = 1000` (image hung in viewport after cell scrolled
+    past); `body_end - 1` anchor + offset_top bump (lock case
+    survived in some configurations); inline
+    `rerender_all_handles()` on WinScrolled (visible artifacts in
+    multi-image cells); lock-zone pre-clear (images vanished
+    instead of moving); `nvim_buf_set_extmark` in-place gravity
+    update (didn't actually change gravity on older nvim builds —
+    fixed by switching to delete-and-recreate).
 
     Marker storage detail: the blank-row marker lives in a parallel
     `body_blank[i]` array, NOT as a field on the chunk table.

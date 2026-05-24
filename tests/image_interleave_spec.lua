@@ -186,24 +186,16 @@ describe("ui shifts images below text via layout.text_offset", function()
     package.loaded["mercury.image"] = nil
   end)
 
-  it("EVERY image has with_virtual_padding=false and large overlap (SPEC I9, I16, I18)", function()
+  it("EVERY image has with_virtual_padding=false and window=nil (SPEC I9, I16, I18)", function()
     -- Mercury's virt_lines are the sole row reservation (I16) so
     -- `with_virtual_padding = false` is the source of truth for
     -- blanks beneath the image.
     --
-    -- `overlap = 1000` is set on every image (SPEC I18) — this
-    -- steers image.nvim's renderer into get_overlap_scroll_position
-    -- for the scrolled-past-anchor case, giving each image a
-    -- per-render_offset_top position rather than the buggy diff
-    -- branch where same-height images collide at the same row.
-    -- An earlier attempt used `overlap = render_offset_top` (small
-    -- value): the overlap_lines cap in get_overlap_scroll_position
-    -- tripped after just a few scrolled lines and the bad diff
-    -- branch took over. Using a large constant (>> any reasonable
-    -- viewport height) keeps the overlap_lines cap inactive — the
-    -- visible_height = height + offset_top check inside the helper
-    -- is what naturally hides the image when it's fully scrolled
-    -- off, regardless of overlap's size.
+    -- `window = nil` (SPEC I18, current mode): Mercury bypasses
+    -- image.nvim's renderer branches entirely by setting window=nil.
+    -- With window=nil image.nvim takes a single simple code path
+    -- (absolute_y = y + render_offset_top) and Mercury controls the
+    -- screen position via dynamic y. No `overlap` opt is needed.
     local Util = require("mercury.util")
     local UI = require("mercury.ui")
     Util.write_file("/tmp/vpa.png", fake_png(400, 200))
@@ -237,12 +229,11 @@ describe("ui shifts images below text via layout.text_offset", function()
       "every image must have padding=false (SPEC I16)")
     assert.is_false(recorded[2].opts.with_virtual_padding,
       "even the last image must have padding=false (SPEC I16)")
-    assert.equals(1000, recorded[1].opts.overlap,
-      "SPEC I18: overlap must be set to a large constant so "
-        .. "image.nvim picks get_overlap_scroll_position over the "
-        .. "buggy diff branch")
-    assert.equals(1000, recorded[2].opts.overlap,
-      "SPEC I18: overlap must be set on every image (incl. the last)")
+    assert.is_nil(recorded[1].opts.window,
+      "SPEC I18: window must be nil to bypass image.nvim's "
+        .. "renderer branches (we manage screen y ourselves)")
+    assert.is_nil(recorded[2].opts.window,
+      "SPEC I18: window must be nil on every image")
     -- Cumulative offsets: image 2's offset > image 1's so they stack.
     assert.is_true(recorded[2].opts.render_offset_top
                    > recorded[1].opts.render_offset_top,
@@ -466,7 +457,7 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
-  it("I9/I16/I18: EVERY image has padding=false and large overlap", function()
+  it("I9/I16/I18: EVERY image has padding=false and window=nil", function()
     local buf = _setup_cell({
       { type = "display_data", data = { ["image/png"] = "a" } },
       { type = "display_data", data = { ["image/png"] = "b" } },
@@ -478,12 +469,10 @@ describe("SPEC image invariants — direct pins", function()
     for i, rec in ipairs(recorded2) do
       assert.is_false(rec.opts.with_virtual_padding,
         ("SPEC I9/I16: image %d must have padding=false"):format(i))
-      assert.equals(1000, rec.opts.overlap,
-        ("SPEC I18: image %d needs overlap=1000 so image.nvim "
-          .. "routes the off-screen-anchor case through "
-          .. "get_overlap_scroll_position (per-image position) "
-          .. "rather than the diff branch (same absolute_y for "
-          .. "same-height images = overlap bug)"):format(i))
+      assert.is_nil(rec.opts.window,
+        ("SPEC I18: image %d needs window=nil so image.nvim's "
+          .. "renderer takes the simple `absolute_y = y + offset_top` "
+          .. "path that Mercury controls directly"):format(i))
     end
     require("mercury.notebook").detach(buf)
   end)
@@ -512,14 +501,15 @@ describe("SPEC image invariants — direct pins", function()
     require("mercury.notebook").detach(buf)
   end)
 
-  it("I13: render_offset_top = virt_line_idx + 1 + anchor_bump", function()
+  it("I13: render_offset_top = virt_line_idx + 1 (window=nil mode)", function()
     -- Build a cell with one stream item, then one image. The image's
     -- virt_line_idx (from build_virt_lines) is pill_rows (1) + 1 text
-    -- row = 2. render_offset_top = idx + 1 + anchor_bump (= idx + 2
-    -- when anchor_row > 0, which is the typical case — anchor sits
-    -- at body_end - 1 to avoid image.nvim's lock case, see SPEC I18,
-    -- and offset_top is bumped +1 to compensate so the on-screen
-    -- position stays the same as the old anchor=body_end math).
+    -- row = 2. With window=nil, offset_top = virt_line_idx + 1.
+    -- image.nvim's window=nil branch computes
+    -- absolute_y = y + offset_top, written at terminal row
+    -- absolute_y + 1 (kitty's 1-indexed cursor). For the image to
+    -- land at body_end_screen_1idx + virt_line_idx + 1, we set
+    -- y = body_end_screen_0idx and offset_top = virt_line_idx + 1.
     local Output_mod = require("mercury.output")
     local buf = _setup_cell({
       { type = "stream", name = "stdout", text = "hi\n" },
@@ -536,21 +526,16 @@ describe("SPEC image invariants — direct pins", function()
     local _, image_offsets = Output_mod.build_virt_lines(out, {
       show_status_pill = true, image_heights = image_heights,
     })
-    -- Anchor was shifted from body_end to body_end - 1 (SPEC I18
-    -- lock-avoidance), so offset_top is virt_line_idx + 2 here.
-    -- Cell at top of buffer with body_end > 0 → anchor_bump = 1.
-    local anchor_row = nb:cell_anchor_row(nb.cells[1])
-    local expected_bump = anchor_row > 0 and 1 or 0
-    local expected = image_offsets[1] + 1 + expected_bump
+    local expected = image_offsets[1] + 1
     assert.equals(expected, recorded2[1].opts.render_offset_top,
-      ("SPEC I13/I18: render_offset_top must be virt_line_idx + 1 + "
-        .. "anchor_bump. idx=%d, anchor_bump=%d, expected=%d, got=%d"):format(
-        image_offsets[1], expected_bump, expected,
-        recorded2[1].opts.render_offset_top))
-    -- y must be body_end - 1 (or 0 for the degenerate top-of-buffer case).
-    local expected_y = (anchor_row > 0) and (anchor_row - 1) or 0
-    assert.equals(expected_y, recorded2[1].opts.y,
-      "SPEC I18: anchor y must be body_end - 1 to avoid lock case")
+      ("SPEC I13: render_offset_top must be virt_line_idx + 1. "
+        .. "idx=%d, expected=%d, got=%d"):format(
+        image_offsets[1], expected, recorded2[1].opts.render_offset_top))
+    -- window must be nil so image.nvim doesn't go through screenpos /
+    -- lock / diff / overlap branches.
+    assert.is_nil(recorded2[1].opts.window,
+      "SPEC I18: window must be nil so image.nvim's renderer takes "
+        .. "the simple `absolute_y = y + offset_top` branch")
     require("mercury.notebook").detach(buf)
   end)
 
