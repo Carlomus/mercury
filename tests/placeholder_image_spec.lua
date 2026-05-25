@@ -33,7 +33,14 @@ end
 -- Mount a fake snacks module in package.loaded so require("snacks")
 -- and _G.Snacks.image.* resolve to our test doubles. Returns the
 -- fake's transmit log so tests can introspect.
+--
+-- Side effect: enables termguicolors. Placeholder mode requires it
+-- (without termguicolors, the per-image fg color collapses to
+-- 256-color and kitty can't decode the image_id from the cell).
+-- Most users have it on via their colorscheme; tests need to
+-- opt in explicitly.
 local function _install_fake_snacks(supports_placeholders)
+  vim.o.termguicolors = true
   local transmitted = {}
   local next_id = 1000
 
@@ -99,6 +106,14 @@ describe("placeholder_image.available()", function()
     _install_fake_snacks(true)
     local P = require("mercury.placeholder_image")
     assert.is_true(P.available())
+  end)
+
+  it("returns false when termguicolors is off (fg-color encoding broken)", function()
+    _install_fake_snacks(true)
+    vim.o.termguicolors = false
+    local P = require("mercury.placeholder_image")
+    assert.is_false(P.available())
+    vim.o.termguicolors = true   -- restore for other tests
   end)
 end)
 

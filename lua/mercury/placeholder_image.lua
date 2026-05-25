@@ -78,17 +78,44 @@ end
 -- Returns true iff (a) snacks is loaded AND (b) the current terminal
 -- supports the kitty unicode-placeholder protocol. Currently kitty and
 -- ghostty support it; wezterm/foot/zellij don't (snacks's env table).
+--
+-- Side effect: ensures snacks.image.setup() has been called and that
+-- vim.o.termguicolors is true. Both are prerequisites for the
+-- placeholder protocol — snacks's setup wires up the cleanup autocmds
+-- (without which transmitted images leak), and termguicolors makes
+-- nvim emit the per-image fg color as a 24-bit RGB sequence (without
+-- which kitty can't recover the image_id from the placeholder cell's
+-- color). If termguicolors is off, available() returns false; user
+-- must opt in by setting `vim.o.termguicolors = true`.
+local _setup_done = false
+local _tgc_warned = false
 function M.available()
   if Cfg.get and Cfg.get().output and Cfg.get().output.disable_placeholders then
     return false
   end
   local img_mod = _snacks_image()
   if not img_mod then return false end
+  if _G.Snacks and _G.Snacks.image and not _setup_done then
+    _setup_done = true
+    pcall(function() _G.Snacks.image.setup() end)
+  end
   local term = _snacks_terminal()
   if not term or type(term.env) ~= "function" then return false end
   local ok, env = pcall(term.env)
   if not ok or type(env) ~= "table" then return false end
-  return env.placeholders == true
+  if env.placeholders ~= true then return false end
+  if not vim.o.termguicolors then
+    if not _tgc_warned then
+      _tgc_warned = true
+      vim.notify(
+        "[mercury] kitty unicode placeholders require `:set termguicolors`. "
+          .. "Add `vim.o.termguicolors = true` to your config. "
+          .. "Falling back to legacy image.nvim path.",
+        vim.log.levels.WARN)
+    end
+    return false
+  end
+  return true
 end
 
 -- ---------- terminal cell size ----------
@@ -269,6 +296,45 @@ end
 -- Drop everything. Used on full Mercury teardown.
 function M.cleanup_all()
   for path, _ in pairs(_cache) do M.cleanup(path) end
+end
+
+-- Diagnostic snapshot for :NotebookDebugImages. Returns a table with
+-- everything we can probe about the placeholder rendering path. Read
+-- by init.lua's command to print a user-facing report.
+function M.diagnose()
+  local report = {}
+  local snacks_ok = pcall(require, "snacks")
+  report.snacks_loaded = snacks_ok and _G.Snacks ~= nil
+  report.snacks_image_module = _snacks_image() ~= nil
+  report.termguicolors = vim.o.termguicolors
+  report.setup_called = _setup_done
+
+  local term = _snacks_terminal()
+  if term and type(term.env) == "function" then
+    local ok, env = pcall(term.env)
+    if ok and type(env) == "table" then
+      report.env_name = env.name
+      report.env_supported = env.supported
+      report.env_placeholders = env.placeholders
+      report.env_remote = env.remote
+    end
+  end
+
+  report.available = M.available()
+
+  local cache_entries = {}
+  for path, entry in pairs(_cache) do
+    cache_entries[#cache_entries + 1] = {
+      path = path,
+      id = entry.id,
+      width_cells = entry.width_cells,
+      height_cells = entry.height_cells,
+      hl = entry.hl,
+    }
+  end
+  report.cache = cache_entries
+
+  return report
 end
 
 -- Test/debug helpers — not part of the public API but exposed so tests

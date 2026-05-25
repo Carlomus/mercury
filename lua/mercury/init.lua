@@ -919,6 +919,45 @@ function M._register_commands()
   cmd("NotebookKernelRestartClear", with_nb(function(nb) nb.kernel:restart({ clear = true }) end), {})
   cmd("NotebookKernelInterrupt",    with_nb(function(nb) nb.kernel:interrupt() end), {})
   cmd("NotebookKernelStop",         with_nb(function(nb) nb.kernel:stop() end), {})
+
+  -- Diagnose the kitty unicode-placeholder image rendering path
+  -- (SPEC I18 primary). Prints a human-readable report of:
+  --   - whether snacks is loaded.
+  --   - whether snacks.image is detected and set up.
+  --   - termguicolors state (required for placeholder mode).
+  --   - what terminal snacks's env detection reports.
+  --   - whether placeholders are available.
+  --   - per-image cache contents (how many transmitted, which paths).
+  -- Useful when "images don't appear" — tells you exactly which
+  -- precondition is failing.
+  cmd("NotebookDebugImages", function()
+    local ok, P = pcall(require, "mercury.placeholder_image")
+    if not ok then
+      vim.notify("[mercury] placeholder_image module failed to load: "
+        .. tostring(P), vim.log.levels.ERROR)
+      return
+    end
+    local report = P.diagnose()
+    local lines = {
+      "[mercury] image rendering diagnostics",
+      ("  snacks_loaded        : %s"):format(tostring(report.snacks_loaded)),
+      ("  snacks_image_module  : %s"):format(tostring(report.snacks_image_module)),
+      ("  snacks_setup_called  : %s"):format(tostring(report.setup_called)),
+      ("  termguicolors        : %s"):format(tostring(report.termguicolors)),
+      ("  env_name             : %s"):format(tostring(report.env_name)),
+      ("  env_supported        : %s"):format(tostring(report.env_supported)),
+      ("  env_placeholders     : %s"):format(tostring(report.env_placeholders)),
+      ("  env_remote           : %s"):format(tostring(report.env_remote)),
+      ("  available()          : %s"):format(tostring(report.available)),
+      ("  cached_images        : %d"):format(#report.cache),
+    }
+    for _, entry in ipairs(report.cache) do
+      lines[#lines + 1] = ("    id=%s  %dx%d  %s"):format(
+        tostring(entry.id), entry.width_cells, entry.height_cells,
+        entry.path)
+    end
+    vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+  end, {})
 end
 
 function M._setup_buffer_keymaps(buf)
