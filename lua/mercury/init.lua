@@ -179,34 +179,48 @@ local function attach_buffer(buf, opts)
   local buf_aug = vim.api.nvim_create_augroup("MercuryBuf_" .. buf,
     { clear = true })
 
-  -- Track buffer line count so we can distinguish:
-  --   * in-line typing (line count unchanged) — debounce normally,
-  --     character-rate render would be wasteful.
-  --   * line additions/removals (Enter, dd, paste-with-newline) —
-  --     these shift body_end and require the output extmark to move
-  --     IMMEDIATELY, in the same redraw cycle as the text change.
-  --     Otherwise nvim lays out the screen with the stale extmark
-  --     position, scrolloff kicks in based on the wrong cursor
-  --     screen row, then Mercury's debounced render moves the
-  --     extmark and nvim re-lays-out — visible as the cell
-  --     "jumping" briefly when adding a line near image output.
-  local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = buf_aug,
     buffer = buf,
     callback = function()
       if nb._suppress_rescan then return end
-      local new_count = vim.api.nvim_buf_line_count(buf)
-      if new_count ~= line_count then
-        line_count = new_count
-        -- Sync: scan cells, recompute extmark positions, repaint.
-        -- Fires inside the autocmd, before nvim's next redraw.
+      debounced()
+    end,
+  })
+
+  -- Line-count changes (Enter, o, O, dd, paste-with-newline) shift
+  -- body_end and require the output extmark to MOVE in the same
+  -- redraw cycle as the text change. Otherwise nvim lays out the
+  -- screen with the stale extmark position, scrolloff kicks in based
+  -- on the wrong cursor row, then Mercury's debounced render moves
+  -- the extmark — visible as the cell jumping briefly when adding a
+  -- line near image output.
+  --
+  -- nvim_buf_attach's on_lines fires SYNCHRONOUSLY during the
+  -- buffer change, before nvim's next redraw and before any
+  -- TextChanged/TextChangedI autocmd (some commands like `o` don't
+  -- fire TextChanged at all until the user exits insert). We do the
+  -- minimum work: rescan + move each cell's output extmark to its
+  -- new anchor row, preserving the existing virt_lines content so
+  -- kitty doesn't get a clear+repaint cycle (which would briefly
+  -- show the U+10EEEE placeholder chars as their font fallback
+  -- glyphs — the user-reported "______ flash" on Enter).
+  --
+  -- Full render (rebuilds virt_lines, re-transmits images, etc.)
+  -- stays on the 3 ms debounce.
+  vim.api.nvim_buf_attach(buf, false, {
+    on_lines = function(_, _, _, first, last_old, last_new)
+      if nb._suppress_rescan then return end
+      if last_old == last_new then return end   -- no line count change
+      vim.schedule(function()
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        if not vim.api.nvim_buf_is_loaded(buf) then return end
+        if nb._suppress_rescan then return end
         nb:rescan()
-        renderer:render()
-      else
-        -- In-line text edit only — debounce.
-        debounced()
-      end
+        if renderer.move_output_extmarks then
+          renderer:move_output_extmarks()
+        end
+      end)
     end,
   })
 

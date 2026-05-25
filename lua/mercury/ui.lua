@@ -176,6 +176,48 @@ function Renderer:render()
   if self.image and self.image.gc then self.image:gc(present) end
 end
 
+-- Fast-path: move each cell's output extmark to its CURRENT
+-- body_end (post-rescan) WITHOUT rebuilding virt_lines or
+-- re-transmitting images. Used by init.lua's on_lines hook so
+-- line-count-changing edits (Enter, o, dd, paste, undo) end up
+-- with extmarks at the right row in the SAME redraw cycle as the
+-- edit — without that, nvim lays out the screen with stale extmark
+-- positions and scrolloff scrolls based on the wrong cursor row.
+--
+-- Preserving virt_lines verbatim (we read them off the existing
+-- extmark and pass them back through) avoids kitty's
+-- clear-then-repaint cycle for our placeholder images, which would
+-- otherwise flash the U+10EEEE chars as their font's fallback
+-- glyphs (typically `_____`).
+function Renderer:move_output_extmarks()
+  local nb = self.nb
+  if not vim.api.nvim_buf_is_valid(nb.buf) then return end
+  local ns_out = Notebook.ns(NS_OUTPUT)
+  for _, cell in ipairs(nb.cells or {}) do
+    local mark_id = self._marks and self._marks[cell.id]
+    if mark_id then
+      local marks = vim.api.nvim_buf_get_extmarks(
+        nb.buf, ns_out, mark_id, mark_id, { details = true })
+      local m = marks and marks[1]
+      if m then
+        local current_row = m[2]
+        local new_anchor = nb:cell_anchor_row(cell)
+        if current_row ~= new_anchor then
+          local d = m[4] or {}
+          pcall(vim.api.nvim_buf_set_extmark,
+            nb.buf, ns_out, new_anchor, 0, {
+              id = mark_id,
+              virt_lines = d.virt_lines,
+              virt_lines_above = d.virt_lines_above,
+              hl_mode = d.hl_mode,
+              right_gravity = d.right_gravity,
+            })
+        end
+      end
+    end
+  end
+end
+
 function Renderer:render_cell_output(cell)
   local nb = self.nb
   local out = nb.outputs[cell.id]
