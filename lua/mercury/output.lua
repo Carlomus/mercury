@@ -280,7 +280,15 @@ function M.build_virt_lines(out, opts)
     if ph then
       image_offsets[_img_idx] = _pill_rows + #body_lines
       for _, row_str in ipairs(ph.rows) do
-        body_lines[#body_lines + 1] = { row_str, ph.hl }
+        -- Two-chunk virt_lines row matching snacks's working
+        -- placement format: a leading empty/Normal chunk before
+        -- the placeholder text. snacks ships this shape and it's
+        -- known to render correctly in kitty; the single-chunk
+        -- shape we used initially might confuse nvim's SGR
+        -- emission (a stale fg from prior content leaking into
+        -- the placeholder cells means kitty decodes a wrong
+        -- image_id and renders nothing).
+        body_lines[#body_lines + 1] = { { "", "Normal" }, { row_str, ph.hl } }
         -- Each placeholder row counts as an image-blank for the
         -- preview cap (SPEC I7): never elided regardless of
         -- max_preview_lines.
@@ -419,7 +427,15 @@ function M.build_virt_lines(out, opts)
   for i = 1, #body_lines do
     local entry = body_lines[i]
     if body_blank[i] then
-      lines[#lines + 1] = { entry }
+      -- Same shape detection as the text branch: entry is either a
+      -- single chunk { text, hl } or already a list of chunks
+      -- { {text1, hl1}, {text2, hl2}, ... } (placeholder rows in
+      -- snacks-style two-chunk form).
+      if type(entry[1]) == "table" then
+        lines[#lines + 1] = entry
+      else
+        lines[#lines + 1] = { entry }
+      end
     elseif text_seen < cap then
       text_seen = text_seen + 1
       if type(entry[1]) == "table" then

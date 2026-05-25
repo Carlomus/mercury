@@ -273,6 +273,23 @@ local function _kitty_transmit(id, path)
   if not term or not util then return false end
   local ok = pcall(function()
     term.request({
+      -- a=T: transmit AND display in placeholder mode (combined
+      -- with U=1). Plain `a=t` transmits the bytes but doesn't
+      -- mark the image for placeholder lookup, so subsequent
+      -- placeholder cells in the terminal output get ignored by
+      -- kitty's renderer.
+      a = "T",
+      -- U=1: tell kitty this image will be referenced via unicode
+      -- placeholders (U+10EEEE + diacritics in the terminal
+      -- output). REQUIRED per
+      -- https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+      -- — without it kitty stores the image but won't decode the
+      -- placeholder cells.
+      U = 1,
+      -- q=2: silence kitty's success/error responses. Without
+      -- this kitty writes `\x1b_G...\x1b\\` acks into the terminal
+      -- which nvim then renders as garbage in the status line.
+      q = 2,
       t = "f",            -- transmit by file path
       i = id,             -- our generated image_id
       f = 100,            -- format: 100 = PNG (kitty graphics spec)

@@ -1036,6 +1036,100 @@ function M._register_commands()
 
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
   end, {})
+
+  -- One-button visual test for the kitty unicode-placeholder
+  -- protocol, completely independent of Mercury's notebook
+  -- rendering. Transmits the FIRST PNG in the mercury cache (any
+  -- previously-rendered notebook output works), then writes a small
+  -- 8x4 grid of placeholder cells DIRECTLY to the terminal at the
+  -- cursor — bypassing nvim's virt_text emission entirely.
+  --
+  -- If the user sees a tiny image rendered after running this:
+  --   → kitty's placeholder protocol is working in their environment.
+  --   → any bug is in Mercury's virt_text emission path (not the
+  --     protocol or transmission).
+  -- If they DON'T see an image:
+  --   → kitty isn't decoding placeholders at all. Check:
+  --       - kitty version (need 0.30+ for unicode placeholders).
+  --       - terminal multiplexer (tmux/screen passthrough).
+  --       - font (some terminal fonts strip private-use characters).
+  cmd("NotebookTestKittyPlaceholder", function()
+    local cache_dir = vim.fn.stdpath("cache") .. "/mercury_images"
+    local pngs = vim.fn.glob(cache_dir .. "/*.png", true, true)
+    if #pngs == 0 then
+      vim.notify("[mercury] no cached PNG found in " .. cache_dir
+        .. " — run a notebook cell with image output first.",
+        vim.log.levels.WARN)
+      return
+    end
+    local png = pngs[1]
+    local ok, P = pcall(require, "mercury.placeholder_image")
+    if not ok then
+      vim.notify("placeholder_image module failed: " .. tostring(P),
+        vim.log.levels.ERROR)
+      return
+    end
+    if not P.available() then
+      vim.notify("[mercury] placeholders unavailable. Run :NotebookDebugImages.",
+        vim.log.levels.WARN)
+      return
+    end
+    -- Transmit via Mercury's normal path so we use the same U=1
+    -- transmit semantics. Pin to a known test id (above the normal
+    -- range) so we don't collide with cached entries.
+    local term = require("snacks.image.terminal")
+    local util = _G.Snacks.util
+    local test_id = 99999
+    pcall(function()
+      term.request({
+        a = "T", U = 1, q = 2, t = "f", i = test_id, f = 100,
+        data = util.base64(png),
+      })
+    end)
+    -- Build 8x4 placeholder grid with the test id's RGB encoded as
+    -- fg. Diacritics: first 4 codepoints from the kitty table.
+    local PLACEHOLDER = vim.fn.nr2char(0x10EEEE)
+    local diac = {
+      vim.fn.nr2char(0x0305),
+      vim.fn.nr2char(0x030D),
+      vim.fn.nr2char(0x030E),
+      vim.fn.nr2char(0x0310),
+      vim.fn.nr2char(0x0312),
+      vim.fn.nr2char(0x033D),
+      vim.fn.nr2char(0x033E),
+      vim.fn.nr2char(0x033F),
+    }
+    local R = math.floor(test_id / 65536) % 256
+    local G = math.floor(test_id / 256) % 256
+    local B = test_id % 256
+    local fg = ("\27[38;2;%d;%d;%dm"):format(R, G, B)
+    local reset = "\27[39m"
+    -- Emit a marker line, then the grid, then a trailing marker —
+    -- so the user can locate where the image SHOULD render.
+    local lines = { "[kitty placeholder test, id=" .. test_id .. "]" }
+    for r = 1, 4 do
+      local row = fg
+      for c = 1, 8 do
+        row = row .. PLACEHOLDER .. diac[r] .. diac[c]
+      end
+      row = row .. reset
+      lines[#lines + 1] = row
+    end
+    lines[#lines + 1] = "[end of test]"
+    -- Use nvim_ui_send (snacks's path) so the output reaches the
+    -- terminal directly, bypassing nvim's text rendering.
+    local payload = table.concat(lines, "\r\n") .. "\r\n"
+    if vim.api.nvim_ui_send then
+      pcall(vim.api.nvim_ui_send, payload)
+    else
+      io.stdout:write(payload)
+    end
+    vim.notify(
+      "[mercury] emitted kitty placeholder test (image source: "
+        .. png .. "). Check your terminal output above the messages "
+        .. "window — you should see a small image between the markers.",
+      vim.log.levels.INFO)
+  end, {})
 end
 
 function M._setup_buffer_keymaps(buf)

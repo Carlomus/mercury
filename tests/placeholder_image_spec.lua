@@ -256,12 +256,18 @@ describe("output.build_virt_lines image_placeholders branch", function()
     -- Expect: 0 pill rows, then 2 placeholder rows, then 1 trailing
     -- gap blank = 3 virt_lines total.
     assert.equals(3, #virt)
-    -- The placeholder rows must carry the per-image highlight.
-    assert.equals("row1text", virt[1][1][1])
-    assert.equals("MercuryImg_12345", virt[1][1][2])
-    assert.equals("row2text", virt[2][1][1])
-    assert.equals("MercuryImg_12345", virt[2][1][2])
-    -- The trailing gap is a blank row with "Normal" hl.
+    -- Each placeholder row is a TWO-CHUNK virt_line (matching
+    -- snacks's working layout): an empty leading chunk to flush
+    -- any prior SGR state, then the placeholder text with the
+    -- per-image highlight.
+    assert.equals(2, #virt[1])
+    assert.equals("", virt[1][1][1])
+    assert.equals("Normal", virt[1][1][2])
+    assert.equals("row1text", virt[1][2][1])
+    assert.equals("MercuryImg_12345", virt[1][2][2])
+    assert.equals("row2text", virt[2][2][1])
+    assert.equals("MercuryImg_12345", virt[2][2][2])
+    -- The trailing gap is a blank row with "Normal" hl (single chunk).
     assert.equals("", virt[3][1][1])
     assert.equals("Normal", virt[3][1][2])
   end)
@@ -283,9 +289,11 @@ describe("output.build_virt_lines image_placeholders branch", function()
     })
     -- Placeholder path = 1 placeholder row + 1 trailing gap = 2 virt_lines.
     -- Legacy path would have produced 21 rows. Verify we took the
-    -- placeholder path.
+    -- placeholder path. Placeholder row is two-chunk (empty Normal +
+    -- placeholder with hl).
     assert.equals(2, #virt)
-    assert.equals("PHROW", virt[1][1][1])
+    assert.equals("PHROW", virt[1][2][1])
+    assert.equals("MercuryImg_7", virt[1][2][2])
   end)
 
   it("falls back to blank rows when image_placeholders is nil", function()
