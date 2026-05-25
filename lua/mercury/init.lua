@@ -179,12 +179,34 @@ local function attach_buffer(buf, opts)
   local buf_aug = vim.api.nvim_create_augroup("MercuryBuf_" .. buf,
     { clear = true })
 
+  -- Track buffer line count so we can distinguish:
+  --   * in-line typing (line count unchanged) — debounce normally,
+  --     character-rate render would be wasteful.
+  --   * line additions/removals (Enter, dd, paste-with-newline) —
+  --     these shift body_end and require the output extmark to move
+  --     IMMEDIATELY, in the same redraw cycle as the text change.
+  --     Otherwise nvim lays out the screen with the stale extmark
+  --     position, scrolloff kicks in based on the wrong cursor
+  --     screen row, then Mercury's debounced render moves the
+  --     extmark and nvim re-lays-out — visible as the cell
+  --     "jumping" briefly when adding a line near image output.
+  local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = buf_aug,
     buffer = buf,
     callback = function()
       if nb._suppress_rescan then return end
-      debounced()
+      local new_count = vim.api.nvim_buf_line_count(buf)
+      if new_count ~= line_count then
+        line_count = new_count
+        -- Sync: scan cells, recompute extmark positions, repaint.
+        -- Fires inside the autocmd, before nvim's next redraw.
+        nb:rescan()
+        renderer:render()
+      else
+        -- In-line text edit only — debounce.
+        debounced()
+      end
     end,
   })
 
@@ -744,6 +766,7 @@ function M._register_commands()
     if cell.kind == "code" then
       pcall(function() nb.kernel:execute(cell) end)
     end
+    local was_markdown = cell.kind == "markdown"
     local idx = nb:cell_index(cell.id)
     local nxt = nb.cells[idx + 1]
     if not nxt then
@@ -755,7 +778,28 @@ function M._register_commands()
       nxt = nb:new_cell_below(cell, cell.kind)
     end
     if nxt then
-      pcall(vim.api.nvim_win_set_cursor, 0, { nxt.body_start + 1, 0 })
+      -- Land on the first BODY line of the next cell. For markdown
+      -- cells with no body (e.g., empty markdown), body_start can
+      -- equal body_end + 1 or the header row itself; clamp to a
+      -- valid buffer line so set_cursor doesn't error.
+      local target_row = math.max(0, nxt.body_start) + 1
+      local line_count = vim.api.nvim_buf_line_count(0)
+      target_row = math.min(target_row, line_count)
+      pcall(vim.api.nvim_win_set_cursor, 0, { target_row, 0 })
+      -- If we just left a markdown cell and we're in insert mode,
+      -- exit to normal — Jupyter renders the cell on Shift-Enter
+      -- and selects (= command mode on) the next cell, NOT edit
+      -- mode. Code-cell Shift-Enter stays in whatever mode it was
+      -- (user typically wants to keep typing on the next code line).
+      if was_markdown then
+        local mode = vim.api.nvim_get_mode().mode
+        if mode == "i" or mode == "ic" or mode == "ix" then
+          -- Use vim.cmd("stopinsert") so the mode change happens
+          -- AFTER the <cmd>-mapping's command finishes. The schedule
+          -- defers until the next event-loop tick.
+          vim.schedule(function() pcall(vim.cmd, "stopinsert") end)
+        end
+      end
     end
   end), {})
 
