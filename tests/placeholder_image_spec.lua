@@ -205,6 +205,87 @@ describe("placeholder_image.transmit", function()
   end)
 end)
 
+describe("output.build_virt_lines image_placeholders branch", function()
+  -- Verifies the wiring in output.lua: when an image_placeholders[i]
+  -- entry is present, build_virt_lines pushes the placeholder rows
+  -- (with the per-image highlight) instead of blank rows.
+  it("uses placeholder rows + per-image hl in place of blank rows", function()
+    local Output = require("mercury.output")
+    -- Build a fake placeholder descriptor with two rows of three cells.
+    local placeholder = {
+      id = 12345,
+      width_cells = 3,
+      height_cells = 2,
+      rows = { "row1text", "row2text" },
+      hl = "MercuryImg_12345",
+    }
+    local virt, image_offsets = Output.build_virt_lines({
+      status = "ok", items = {
+        { type = "display_data", data = { ["image/png"] = "fakepng" } },
+      },
+    }, {
+      show_status_pill = false,   -- skip pill to make assertions simpler
+      image_placeholders = { [1] = placeholder },
+    })
+    -- image_offsets is the virt_line index where the image starts.
+    -- With show_status_pill=false there are no rows above the image,
+    -- so it lands at index 0.
+    assert.equals(0, image_offsets[1])
+    -- Expect: 0 pill rows, then 2 placeholder rows, then 1 trailing
+    -- gap blank = 3 virt_lines total.
+    assert.equals(3, #virt)
+    -- The placeholder rows must carry the per-image highlight.
+    assert.equals("row1text", virt[1][1][1])
+    assert.equals("MercuryImg_12345", virt[1][1][2])
+    assert.equals("row2text", virt[2][1][1])
+    assert.equals("MercuryImg_12345", virt[2][1][2])
+    -- The trailing gap is a blank row with "Normal" hl.
+    assert.equals("", virt[3][1][1])
+    assert.equals("Normal", virt[3][1][2])
+  end)
+
+  it("placeholder branch takes priority over image_heights when both passed", function()
+    local Output = require("mercury.output")
+    local placeholder = {
+      id = 7, width_cells = 1, height_cells = 1,
+      rows = { "PHROW" }, hl = "MercuryImg_7",
+    }
+    local virt, _ = Output.build_virt_lines({
+      status = "ok", items = {
+        { type = "display_data", data = { ["image/png"] = "fakepng" } },
+      },
+    }, {
+      show_status_pill = false,
+      image_placeholders = { [1] = placeholder },
+      image_heights = { [1] = 20 },    -- would reserve 21 blank rows on the legacy path
+    })
+    -- Placeholder path = 1 placeholder row + 1 trailing gap = 2 virt_lines.
+    -- Legacy path would have produced 21 rows. Verify we took the
+    -- placeholder path.
+    assert.equals(2, #virt)
+    assert.equals("PHROW", virt[1][1][1])
+  end)
+
+  it("falls back to blank rows when image_placeholders is nil", function()
+    -- Legacy parity check: existing image.nvim flow (no placeholders
+    -- passed, only image_heights) still produces the same output.
+    local Output = require("mercury.output")
+    local virt, _ = Output.build_virt_lines({
+      status = "ok", items = {
+        { type = "display_data", data = { ["image/png"] = "fakepng" } },
+      },
+    }, {
+      show_status_pill = false,
+      image_heights = { [1] = 3 },
+    })
+    -- 3 blank rows for the image + 1 trailing gap = 4 virt_lines.
+    assert.equals(4, #virt)
+    for i = 1, 4 do
+      assert.equals("", virt[i][1][1])
+    end
+  end)
+end)
+
 describe("placeholder_image.cleanup", function()
   before_each(function()
     _install_fake_snacks(true)

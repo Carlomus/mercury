@@ -268,6 +268,31 @@ function M.build_virt_lines(out, opts)
   end
   local function _next_image_emit(item, mime)
     _img_idx = _img_idx + 1
+    -- Placeholder mode (SPEC I18, kitty unicode-placeholder protocol
+    -- via snacks): each image is rendered as a grid of placeholder
+    -- characters embedded directly in our virt_lines. Because the
+    -- placeholders ARE buffer-rendered text, the image scrolls and
+    -- redraws with the buffer — no Mercury or image.nvim code runs
+    -- on scroll. The placeholder descriptor comes from
+    -- mercury.placeholder_image.transmit; ui.lua passes it through
+    -- as image_placeholders[i].
+    local ph = opts.image_placeholders and opts.image_placeholders[_img_idx]
+    if ph then
+      image_offsets[_img_idx] = _pill_rows + #body_lines
+      for _, row_str in ipairs(ph.rows) do
+        body_lines[#body_lines + 1] = { row_str, ph.hl }
+        -- Each placeholder row counts as an image-blank for the
+        -- preview cap (SPEC I7): never elided regardless of
+        -- max_preview_lines.
+        body_blank[#body_lines] = true
+      end
+      -- 1-row trailing gap so consecutive images don't visually
+      -- touch and text after the image is offset by one (SPEC I6).
+      _push_blank()
+      return
+    end
+    -- image.nvim cursor-positioned path (legacy, kept for terminals
+    -- that don't support kitty unicode placeholders).
     if opts.image_heights and opts.image_heights[_img_idx] then
       image_offsets[_img_idx] = _pill_rows + #body_lines
       local h = opts.image_heights[_img_idx]
@@ -279,10 +304,10 @@ function M.build_virt_lines(out, opts)
       _push_blank()
       return
     end
-    -- No image_heights provided. Caller is either rendering without
-    -- image.nvim, or rendering via the renderer's fallback path
-    -- (text_offset shift, no interleave). Emit a diagnostic only when
-    -- the image WON'T appear inline.
+    -- No image_heights and no image_placeholders provided. Caller is
+    -- either rendering without an image backend, or rendering via the
+    -- renderer's fallback path (text_offset shift, no interleave).
+    -- Emit a diagnostic only when the image WON'T appear inline.
     local image_ok, Image = pcall(require, "mercury.image")
     if not image_ok or not Image.available() then
       body_lines[#body_lines + 1] = { ("[%s]"):format(mime), "Comment" }
