@@ -972,19 +972,51 @@ function M._register_commands()
     local Notebook = require("mercury.notebook")
     local nb = Notebook.get(vim.api.nvim_get_current_buf())
     if nb then
+      -- Dump cell info first so we can correlate extmark virt_lines
+      -- with what each cell actually contains. For each cell with an
+      -- output, list: cell id (suffix), header→body range, output
+      -- status, item types in order.
+      lines[#lines + 1] = ("  cells with output : %d"):format(
+        vim.tbl_count(nb.outputs or {}))
+      for _, cell in ipairs(nb.cells or {}) do
+        local out = nb.outputs and nb.outputs[cell.id]
+        if out then
+          local item_types = {}
+          for _, item in ipairs(out.items or {}) do
+            local t = item.type or "?"
+            if t == "display_data" or t == "execute_result" then
+              local data = item.data or {}
+              local mime
+              for _, m in ipairs({ "image/png", "image/jpeg", "image/svg+xml",
+                                   "text/html", "text/plain" }) do
+                if data[m] then mime = m; break end
+              end
+              t = t .. "(" .. (mime or "no-mime") .. ")"
+            end
+            item_types[#item_types + 1] = t
+          end
+          lines[#lines + 1] = ("    cell %s  body=%d-%d  status=%s  items=[%s]"):format(
+            cell.id:sub(1, 8), cell.body_start, cell.body_end,
+            tostring(out.status), table.concat(item_types, ", "))
+        end
+      end
+
       local ns_out = Notebook.ns("output")
       local marks = vim.api.nvim_buf_get_extmarks(nb.buf, ns_out, 0, -1,
         { details = true })
       lines[#lines + 1] = ("  buffer extmarks (output ns) : %d"):format(#marks)
       for i, m in ipairs(marks) do
-        if i > 2 then break end  -- limit dump
+        if i > 10 then  -- raise limit so we see all cells
+          lines[#lines + 1] = ("    ... (%d more extmarks)"):format(#marks - 10)
+          break
+        end
         local d = m[4] or {}
         local vl = d.virt_lines or {}
         lines[#lines + 1] = ("    extmark #%d row=%d cols=%d virt_lines=%d"):format(
           i, m[2], m[3], #vl)
         for j, vline in ipairs(vl) do
-          if j > 8 then
-            lines[#lines + 1] = ("      ... (%d more)"):format(#vl - 8)
+          if j > 6 then
+            lines[#lines + 1] = ("      ... (%d more vlines)"):format(#vl - 6)
             break
           end
           -- Render each chunk as: <hl_group>:<utf8-len> :: <visible-prefix>
