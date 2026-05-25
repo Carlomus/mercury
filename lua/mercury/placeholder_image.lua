@@ -199,10 +199,24 @@ local function _build_rows(width_cells, height_cells)
 end
 
 -- Compute the target placeholder grid size (width_cells, height_cells)
--- for an image with pixel dimensions (w_px, h_px). Mirrors image.lua's
--- compute_dimensions math so the rendered grid lands at exactly the
--- same number of cell rows the old path was reserving — preserving
--- the layout users are accustomed to.
+-- for an image with pixel dimensions (w_px, h_px).
+--
+-- WIDTH: keep the SPEC-I1 static-8 px/cell assumption. Users have
+-- tuned around it for the legacy image.nvim path, and an earlier
+-- iteration that derived width from runtime cell sizes made every
+-- image visibly smaller. We preserve the on-screen size users
+-- expect.
+--
+-- HEIGHT: use runtime cell-pixel math so reserved rows match the
+-- image's aspect ratio at the chosen width.
+--
+-- The image gets scaled to FILL these cells (no padding) because
+-- the kitty transmit also sets `c = width_cells, r = height_cells`
+-- — see _kitty_transmit. Without c/r, kitty paints the image at
+-- its NATIVE pixel size inside our grid, which (with our static-8
+-- assumption + a typical terminal cell width of ~11 px) leaves
+-- visible padding around the image (the "smaller than before +
+-- lots of empty space" report).
 local function _compute_grid_size(w_px, h_px, available_cols)
   local cfg_out = (Cfg.get() and Cfg.get().output) or {}
   local cell_w_static = cfg_out.cell_width_px or 8
@@ -212,7 +226,8 @@ local function _compute_grid_size(w_px, h_px, available_cols)
   -- SPEC I1: width derived from static 8 px/cell.
   local natural_cols = math.max(1, math.ceil(w_px / cell_w_static))
   local width_cells = math.max(1, math.min(available_cols, natural_cols))
-  -- SPEC I14: height derived from runtime cell sizes.
+  -- SPEC I14: height derived from runtime cell sizes so the
+  -- on-terminal image preserves aspect ratio at the chosen width.
   local target_w_px = width_cells * cell_w_runtime
   local scaled_h_px = h_px * (target_w_px / w_px)
   local height_cells = math.max(1, math.ceil(scaled_h_px / cell_h_runtime))
@@ -267,7 +282,14 @@ end
 -- and on systems where magick is missing the convert never completes
 -- and snacks never calls send(). For Mercury's use case (always PNG
 -- from matplotlib / IPython rich display), no conversion is needed.
-local function _kitty_transmit(id, path)
+--
+-- c, r: desired display size in cells. With these set, kitty scales
+-- the image to fill the `c × r` rectangle of placeholder cells (no
+-- padding). Without them kitty paints the image at its native pixel
+-- dimensions inside the placeholder grid — for users whose terminal
+-- cell width differs from our SPEC-I1 static 8 px/cell assumption,
+-- the image ends up small with empty space around it.
+local function _kitty_transmit(id, path, width_cells, height_cells)
   local term = _snacks_terminal()
   local util = _snacks_util()
   if not term or not util then return false end
@@ -290,10 +312,12 @@ local function _kitty_transmit(id, path)
       -- this kitty writes `\x1b_G...\x1b\\` acks into the terminal
       -- which nvim then renders as garbage in the status line.
       q = 2,
-      t = "f",            -- transmit by file path
-      i = id,             -- our generated image_id
-      f = 100,            -- format: 100 = PNG (kitty graphics spec)
-      data = util.base64(path),   -- base64-encoded file path
+      t = "f",                  -- transmit by file path
+      i = id,                   -- our generated image_id
+      f = 100,                  -- format: 100 = PNG (kitty graphics spec)
+      c = width_cells,          -- scale image to this many cells wide
+      r = height_cells,         -- scale image to this many cells tall
+      data = util.base64(path), -- base64-encoded file path
     })
   end)
   return ok
@@ -346,11 +370,16 @@ function M.transmit(path, opts)
   end
 
   local id = _next_id()
-  local ok = _kitty_transmit(id, path)
-  if not ok then return nil end
-
   local available_cols = opts.available_cols or 80
   local width_cells, height_cells = _compute_grid_size(w_px, h_px, available_cols)
+
+  -- Transmit AFTER computing dimensions so kitty gets the c/r
+  -- scaling hints that match the placeholder grid we're about to
+  -- emit. Without c/r, kitty paints native pixels and leaves
+  -- visible padding inside our grid.
+  local ok = _kitty_transmit(id, path, width_cells, height_cells)
+  if not ok then return nil end
+
   local rows = _build_rows(width_cells, height_cells)
   local hl = _ensure_hl(id)
 

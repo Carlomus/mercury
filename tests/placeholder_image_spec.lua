@@ -478,14 +478,19 @@ describe("end-to-end: nvim emits placeholder cells with correct hl", function()
       "first two cells of row 1 must be PLACEHOLDER + row[1]_diacritic + col[N]_diacritic")
   end)
 
-  it("snacks transmit call has a=T, U=1, q=2 (kitty placeholder mode)", function()
+  it("snacks transmit call has a=T, U=1, q=2, c, r (kitty placeholder mode)", function()
     -- The U=1 transmit flag is REQUIRED to register the image for
     -- kitty's unicode-placeholder rendering. Without it kitty
     -- stores the bytes but ignores any cells that reference them.
+    -- c and r tell kitty to SCALE the image to fit our placeholder
+    -- grid exactly — without them kitty paints at native pixels
+    -- which leaves visible padding when our grid is larger than
+    -- the image's natural cell footprint.
     Util.write_file("/tmp/mph_xmit.png", fake_png(80, 80))
     local P = require("mercury.placeholder_image")
-    P.transmit("/tmp/mph_xmit.png",
+    local entry = P.transmit("/tmp/mph_xmit.png",
       { available_cols = 80, width_px = 80, height_px = 80 })
+    assert.is_table(entry)
     assert.equals(1, #fake.transmitted)
     local req = fake.transmitted[1]
     assert.equals("T", req.a,
@@ -498,6 +503,10 @@ describe("end-to-end: nvim emits placeholder cells with correct hl", function()
       .. "leaks into the terminal output)")
     assert.equals("f", req.t)
     assert.equals(100, req.f, "kitty format 100 = PNG")
+    assert.equals(entry.width_cells, req.c,
+      "c must equal grid width so kitty scales image to fill cells")
+    assert.equals(entry.height_cells, req.r,
+      "r must equal grid height so kitty scales image to fill cells")
     os.remove("/tmp/mph_xmit.png")
   end)
 end)
