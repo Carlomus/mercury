@@ -952,10 +952,58 @@ function M._register_commands()
       ("  cached_images        : %d"):format(#report.cache),
     }
     for _, entry in ipairs(report.cache) do
-      lines[#lines + 1] = ("    id=%s  %dx%d  %s"):format(
+      local img = entry.snacks_img
+      local sent = (img and img.sent == true) and "sent=true"
+        or "sent=" .. tostring(img and img.sent)
+      lines[#lines + 1] = ("    id=%s  %dx%d  hl=%s  %s  %s"):format(
         tostring(entry.id), entry.width_cells, entry.height_cells,
-        entry.path)
+        entry.hl or "?", sent, entry.path)
+      if entry.hl then
+        local h = vim.api.nvim_get_hl(0, { name = entry.hl })
+        lines[#lines + 1] = ("      hl_fg=%s  hl_bg=%s"):format(
+          tostring(h.fg), tostring(h.bg))
+      end
     end
+
+    -- Dump the placeholder content actually present in the current
+    -- buffer's output extmark virt_lines. This is the ground-truth
+    -- check: if the placeholder character + hl don't appear here, the
+    -- problem is in build_virt_lines / ui.lua. If they DO appear here
+    -- but kitty isn't rendering, the problem is downstream
+    -- (terminal protocol, multiplexer, font, etc.).
+    local Notebook = require("mercury.notebook")
+    local nb = Notebook.get(vim.api.nvim_get_current_buf())
+    if nb then
+      local ns_out = Notebook.ns("output")
+      local marks = vim.api.nvim_buf_get_extmarks(nb.buf, ns_out, 0, -1,
+        { details = true })
+      lines[#lines + 1] = ("  buffer extmarks (output ns) : %d"):format(#marks)
+      for i, m in ipairs(marks) do
+        if i > 2 then break end  -- limit dump
+        local d = m[4] or {}
+        local vl = d.virt_lines or {}
+        lines[#lines + 1] = ("    extmark #%d row=%d cols=%d virt_lines=%d"):format(
+          i, m[2], m[3], #vl)
+        for j, vline in ipairs(vl) do
+          if j > 8 then
+            lines[#lines + 1] = ("      ... (%d more)"):format(#vl - 8)
+            break
+          end
+          -- Render each chunk as: <hl_group>:<utf8-len> :: <visible-prefix>
+          local pieces = {}
+          for _, chunk in ipairs(vline) do
+            local text = chunk[1] or ""
+            local hl = chunk[2] or "-"
+            -- Show first 24 chars + length, since the actual content
+            -- is non-printable placeholder + diacritics.
+            local prefix = text:sub(1, 32):gsub("[^\x20-\x7e]", "?")
+            pieces[#pieces + 1] = ("[%s]<%d>%s"):format(hl, #text, prefix)
+          end
+          lines[#lines + 1] = "      vline " .. j .. ": " .. table.concat(pieces, " | ")
+        end
+      end
+    end
+
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
   end, {})
 end

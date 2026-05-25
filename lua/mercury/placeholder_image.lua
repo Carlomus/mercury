@@ -142,8 +142,16 @@ end
 
 -- Per-image highlight registry. The fg of each highlight is the image_id
 -- (as a 24-bit RGB integer); kitty parses the cell's fg color to recover
--- the id when rendering. nocombine=true so other syntax highlights on
--- the same row don't override the fg encoding.
+-- the id when rendering.
+--
+-- bg = "NONE" matches snacks's own placement highlight ("bg = 'none'") —
+-- without it the placeholder cells inherit Normal's background, which
+-- doesn't break kitty's pixel painting per se but DOES emit extra
+-- background-color escape sequences that have been observed to confuse
+-- the placeholder decoder in some kitty / multiplexer combinations.
+--
+-- nocombine = true so other syntax highlights on the same row can't
+-- override our fg encoding.
 --
 -- nvim doesn't expose a way to query whether a highlight exists, so we
 -- track our own set to avoid redundant set_hl calls per render.
@@ -151,7 +159,11 @@ local _hl_set = {}
 local function _ensure_hl(id)
   local name = "MercuryImg_" .. tostring(id)
   if _hl_set[name] then return name end
-  vim.api.nvim_set_hl(0, name, { fg = id, nocombine = true })
+  vim.api.nvim_set_hl(0, name, {
+    fg = id,
+    bg = "NONE",
+    nocombine = true,
+  })
   _hl_set[name] = true
   return name
 end
