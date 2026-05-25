@@ -276,6 +276,50 @@ function M.transmit(path, opts)
     path = path,
   }
   _cache[path] = entry
+
+  -- CRITICAL: snacks's image:new() runs `magick identify` ASYNC even
+  -- for already-PNG files (Snacks/image/convert.lua's Convert:resolve
+  -- always appends an identify step). That means img.sent stays false
+  -- until magick finishes; if we return now and nvim draws our
+  -- placeholders before send() completes, kitty sees placeholder
+  -- cells whose fg color encodes an image_id it doesn't have yet —
+  -- nothing renders. By the time send() finally completes, nvim has
+  -- already drawn the screen and won't re-emit the placeholders
+  -- unless something triggers a redraw.
+  --
+  -- Two-pronged fix:
+  --   (a) Wait briefly (up to ~250ms) for img.sent to flip true.
+  --       Matplotlib plots are small (sub-MB) and magick identify is
+  --       fast; most of the time this is well under the timeout.
+  --   (b) ALSO register a fake placement so snacks's on_send callback
+  --       fires when transmission completes — schedules a redraw so
+  --       the placeholders re-emit to kitty even if (a) timed out
+  --       (e.g., magick not installed, large image, slow disk).
+  if not img.sent then
+    -- (a) Bounded sync wait. 250 ms is a balance between not
+    -- blocking the UI noticeably and giving magick identify time to
+    -- finish for typical matplotlib output.
+    pcall(function()
+      vim.wait(250, function() return img.sent == true end, 10)
+    end)
+    -- (b) Async safety net: even if the wait timed out, register an
+    -- on-send hook so kitty gets the placeholders re-emitted once
+    -- transmission completes. We mimic snacks's placement protocol
+    -- by `place()`-ing a stub object whose `update()` triggers a
+    -- redraw — snacks's on_send iterates placements and calls
+    -- update on each.
+    if not img.sent and type(img.place) == "function" then
+      local stub_placement = {
+        update = function(_self)
+          vim.schedule(function() pcall(vim.cmd, "redraw!") end)
+        end,
+        error = function() end,
+        close = function() end,
+      }
+      pcall(function() img:place(stub_placement) end)
+    end
+  end
+
   return entry
 end
 
