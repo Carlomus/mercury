@@ -286,6 +286,101 @@ describe("output.build_virt_lines image_placeholders branch", function()
   end)
 end)
 
+describe("ui.lua picks placeholder mode when snacks is available", function()
+  -- End-to-end pin: when snacks reports placeholder support, the UI
+  -- renderer should call Placeholder.transmit for each image, embed
+  -- the resulting rows in the cell's virt_lines, and NOT call
+  -- image.nvim's from_file.
+  it("renders images via placeholder rows, not image.nvim", function()
+    local fake = _install_fake_snacks(true)
+    require("mercury.config").setup()
+
+    -- Make sure image.nvim's from_file is NEVER called by Mercury
+    -- under placeholder mode. Spy on it via the package.loaded fake
+    -- we use elsewhere.
+    local image_nvim_from_file_calls = 0
+    package.loaded["image"] = {
+      is_enabled = function() return true end,
+      from_file = function(path, opts)
+        image_nvim_from_file_calls = image_nvim_from_file_calls + 1
+        return { render = function() end, clear = function() end }
+      end,
+    }
+    -- Mercury's image module's `available()` checks package.loaded.image,
+    -- so re-require it after stubbing.
+    package.loaded["mercury.image"] = nil
+
+    Util.write_file("/tmp/mph_e2e.png", fake_png(400, 200))
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "# %% id=mphe2e01", "x = 1",
+    })
+    vim.api.nvim_set_current_buf(buf)
+    local Notebook = require("mercury.notebook")
+    local UI = require("mercury.ui")
+    local nb = Notebook.attach(buf); nb:rescan()
+    nb:set_renderer(UI.new(nb))
+    local out = nb:ensure_output(nb.cells[1].id)
+    out.status = "ok"; out.exec_count = 1
+    out.items = { { type = "display_data", data = { ["image/png"] = "a" } } }
+
+    -- Stub extract_images so it returns our tmp file path (the real
+    -- code base64-decodes the data payload — we want to test the
+    -- rendering wiring, not the extraction).
+    local Output_mod = require("mercury.output")
+    local orig_extract = Output_mod.extract_images
+    Output_mod.extract_images = function()
+      return {
+        { kind = "png", path = "/tmp/mph_e2e.png", hash = "e2e", item_index = 1 },
+      }
+    end
+
+    nb._renderer:render()
+    Output_mod.extract_images = orig_extract
+
+    -- Snacks's transmit log must have one entry (we transmitted the
+    -- image via the placeholder path).
+    assert.equals(1, #fake.transmitted,
+      "placeholder mode must transmit the image via snacks")
+    assert.equals("/tmp/mph_e2e.png", fake.transmitted[1])
+
+    -- image.nvim's from_file must NOT have been called — that would
+    -- mean we took the legacy cursor-positioned path even though
+    -- placeholders are available.
+    assert.equals(0, image_nvim_from_file_calls,
+      "placeholder mode must skip image.nvim's from_file entirely")
+
+    -- The buffer's output extmark must contain virt_lines whose first
+    -- chunk on at least one row is a placeholder string with the
+    -- per-image hl.
+    local Notebook_mod = require("mercury.notebook")
+    local ns_out = Notebook_mod.ns("output")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, ns_out, 0, -1,
+      { details = true })
+    assert.is_true(#marks > 0)
+    local virt_lines = marks[1][4].virt_lines or {}
+    local found_placeholder_row = false
+    local P = require("mercury.placeholder_image")
+    for _, vl in ipairs(virt_lines) do
+      for _, chunk in ipairs(vl) do
+        if type(chunk[1]) == "string" and chunk[1]:find(P._placeholder, 1, true) then
+          found_placeholder_row = true
+          assert.matches("^MercuryImg_", chunk[2] or "",
+            "placeholder row must carry the per-image MercuryImg_<id> hl")
+        end
+      end
+    end
+    assert.is_true(found_placeholder_row,
+      "at least one virt_lines row must contain placeholder chars")
+
+    Notebook_mod.detach(buf)
+    os.remove("/tmp/mph_e2e.png")
+    package.loaded["image"] = nil
+    package.loaded["mercury.image"] = nil
+    _uninstall_fake_snacks()
+  end)
+end)
+
 describe("placeholder_image.cleanup", function()
   before_each(function()
     _install_fake_snacks(true)

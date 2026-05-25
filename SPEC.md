@@ -1132,8 +1132,71 @@ updating this spec.
       * Cache-miss replacement inside the render loop — when a new
         image replaces an old one at the same cell.
 
-    **I18 — `window = nil` mode: Mercury bypasses image.nvim's
-    renderer branches entirely and manages screen positioning itself.**
+    **I18 — Kitty unicode placeholders via snacks (PRIMARY). Legacy
+    image.nvim `window = nil` mode kept as fallback.**
+
+    Primary path (when `snacks.image` is loaded AND the terminal
+    supports the kitty unicode-placeholder protocol — kitty,
+    ghostty): Mercury embeds the kitty placeholder character
+    (`U+10EEEE`) into its existing virt_lines, with each cell
+    carrying two diacritics encoding (row, col) inside the image
+    grid and a per-image highlight whose foreground color encodes
+    the image_id. snacks does the byte transmission (handles
+    kitty/tmux passthrough); kitty paints image pixels at exactly
+    the terminal cells where the placeholders land.
+
+    Why this is the correct architecture. Every previous Mercury
+    bug in this area (image-stays-on-scroll-past, image-jumps-on-
+    enter, image-snap-to-image-2, image-overlaps-text, horizontal-
+    shift-on-typing) was a symptom of `image.nvim` trying to
+    compute terminal coordinates from buffer coordinates as
+    cursor-positioning escape sequences. Mercury's virt_lines model
+    doesn't fit that, and every workaround opened a new regression
+    elsewhere (see `img_decisions.md` for the chronicle of failed
+    attempts). With placeholders, image pixels ARE part of nvim's
+    text rendering — they scroll/shift/redraw exactly like any
+    virt_text chunk. No WinScrolled hook, no image:move, no
+    renderer branches.
+
+    Module: `lua/mercury/placeholder_image.lua` (~250 lines, +
+    `tests/placeholder_image_spec.lua` with 15 pin tests).
+      * `M.available()` — gates on snacks + terminal capability.
+      * `M.transmit(path, opts)` — delegates byte upload to
+        `Snacks.image.image.new(path)`, builds the placeholder grid
+        using Mercury's existing `compute_dimensions` math so the
+        cell count matches the legacy path. Returns
+        `{id, width_cells, height_cells, rows, hl, snacks_img}`.
+      * `M.cleanup(path)` — removes a single image; calls
+        `snacks_img:del()` so kitty drops the placement.
+      * Per-image `MercuryImg_<id>` highlight registered via
+        `nvim_set_hl({fg = id, nocombine = true})`. Kitty parses
+        the cell's fg color off the terminal to recover the id.
+      * Diacritic codepoint table borrowed verbatim from
+        `snacks.image.placement` — kitty has a matching table on
+        its side; substituting other combining marks would
+        silently corrupt cells beyond the longest matching
+        contiguous prefix.
+
+    Wiring: `output.lua`'s `build_virt_lines` accepts an
+    `image_placeholders` opt (list parallel to extract_images).
+    When present, `_next_image_emit` pushes the placeholder rows
+    (each tagged with the per-image hl) instead of blank rows.
+    Trailing 1-row gap (SPEC I6) is preserved; rows are marked
+    body_blank[] so they bypass max_preview_lines (SPEC I7).
+    `ui.lua` selects the placeholder path when
+    `placeholder_image.available()` AND clears any stale image.nvim
+    handles before/after to ensure no double-rendering.
+
+    Fallback (legacy): when snacks isn't loaded or the terminal
+    doesn't support placeholders, `ui.lua` calls
+    `self.image:render(...)` with the existing
+    `image.lua` (window=nil) path. Mercury manages screen
+    positioning itself via `_body_end_screen_y_0idx` +
+    `reposition_for_scroll`. See the "legacy mode" section below
+    for that path's documentation.
+
+    **Legacy mode: `window = nil` (kept for terminals without
+    placeholder support).**
 
     Every image is created with `window = nil`. image.nvim's
     renderer.lua then takes a single simple branch (line 214):

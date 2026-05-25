@@ -202,9 +202,59 @@ function Renderer:render_cell_output(cell)
   -- `item._mercury_image_unavailable` to surface a diagnostic line in
   -- place of the image. compute_dimensions then gives us the row count
   -- to reserve per image in the virt_lines stack.
+  --
+  -- Two rendering paths (SPEC I18, post-snacks):
+  --   1. Placeholder mode — preferred. mercury.placeholder_image
+  --      transmits each image to kitty via snacks and returns a
+  --      descriptor with a unicode-placeholder grid that gets
+  --      embedded directly in build_virt_lines's output. Image
+  --      "rendering" happens entirely through the buffer's text
+  --      flow; no image.nvim cursor positioning, no scroll hooks.
+  --   2. Legacy image.nvim mode — fallback for terminals that don't
+  --      support kitty unicode placeholders (wezterm, foot, zellij,
+  --      remote-ssh-no-passthrough). Uses image.nvim's `from_file` +
+  --      cursor-based render. Buggy on scroll (well documented in
+  --      img_decisions.md) but degrades gracefully.
   local images
   local image_heights
-  if not collapsed and Image.available() then
+  local image_placeholders
+  local placeholder_mode = false
+  local Placeholder
+  do
+    local ok_p, mod = pcall(require, "mercury.placeholder_image")
+    if ok_p then Placeholder = mod end
+  end
+  if not collapsed and Placeholder and Placeholder.available() then
+    placeholder_mode = true
+    images = Output.extract_images(out)
+    for _, item in ipairs(out.items or {}) do
+      if item._mercury_image_unavailable then item._mercury_image_unavailable = nil end
+    end
+    if #images > 0 then
+      -- compute_dimensions is reused so width_cells in placeholder
+      -- mode lands at the same column count the old path used.
+      -- available_cols is derived inside compute_dimensions from the
+      -- window width — placeholder.transmit re-applies the same
+      -- bound and the same compute_dimensions math internally.
+      local _, _, available_cols
+      if self.image and self.image.compute_dimensions then
+        _, _, available_cols = self.image:compute_dimensions(images)
+      end
+      available_cols = available_cols or 80
+      image_placeholders = {}
+      for i, img in ipairs(images) do
+        local data = Util.read_file(img.path)
+        if (not data or data == "") and out.items[img.item_index] then
+          out.items[img.item_index]._mercury_image_unavailable = true
+        else
+          local ph = Placeholder.transmit(img.path, {
+            available_cols = available_cols,
+          })
+          if ph then image_placeholders[i] = ph end
+        end
+      end
+    end
+  elseif not collapsed and Image.available() then
     images = Output.extract_images(out)
     for _, item in ipairs(out.items or {}) do
       if item._mercury_image_unavailable then item._mercury_image_unavailable = nil end
@@ -235,6 +285,7 @@ function Renderer:render_cell_output(cell)
     collapsed = collapsed,
     queue_pos = queue_pos,
     image_heights = image_heights,
+    image_placeholders = image_placeholders,
   })
 
   local anchor = nb:cell_anchor_row(cell)
@@ -250,7 +301,12 @@ function Renderer:render_cell_output(cell)
   self._marks[cell.id] = vim.api.nvim_buf_set_extmark(buf, ns_out, anchor, 0, opts)
 
   if not collapsed then
-    if images then
+    if placeholder_mode then
+      -- Image rendering is entirely inline via placeholder rows in
+      -- virt_lines (above). Make sure no stale image.nvim handles
+      -- linger from a previous render that used the legacy path.
+      self.image:clear_cell(cell)
+    elseif images then
       -- Single-extmark layout (SPEC I8). build_virt_lines reserved
       -- image-blank rows per image at its item position; image_offsets[i]
       -- is the matching row offset. image:render anchors each image
