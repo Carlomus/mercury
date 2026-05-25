@@ -940,24 +940,22 @@ function M._register_commands()
     local report = P.diagnose()
     local lines = {
       "[mercury] image rendering diagnostics",
-      ("  snacks_loaded        : %s"):format(tostring(report.snacks_loaded)),
-      ("  snacks_image_module  : %s"):format(tostring(report.snacks_image_module)),
-      ("  snacks_setup_called  : %s"):format(tostring(report.setup_called)),
-      ("  termguicolors        : %s"):format(tostring(report.termguicolors)),
-      ("  env_name             : %s"):format(tostring(report.env_name)),
-      ("  env_supported        : %s"):format(tostring(report.env_supported)),
-      ("  env_placeholders     : %s"):format(tostring(report.env_placeholders)),
-      ("  env_remote           : %s"):format(tostring(report.env_remote)),
-      ("  available()          : %s"):format(tostring(report.available)),
-      ("  cached_images        : %d"):format(#report.cache),
+      ("  snacks_loaded         : %s"):format(tostring(report.snacks_loaded)),
+      ("  snacks_terminal_module: %s"):format(tostring(report.snacks_terminal_module)),
+      ("  snacks_util_module    : %s"):format(tostring(report.snacks_util_module)),
+      ("  termguicolors         : %s"):format(tostring(report.termguicolors)),
+      ("  env_name              : %s"):format(tostring(report.env_name)),
+      ("  env_supported         : %s"):format(tostring(report.env_supported)),
+      ("  env_placeholders      : %s"):format(tostring(report.env_placeholders)),
+      ("  env_remote            : %s"):format(tostring(report.env_remote)),
+      ("  available()           : %s"):format(tostring(report.available)),
+      ("  nvim_id (pid-derived) : %s"):format(tostring(report.nvim_id)),
+      ("  cached_images         : %d"):format(#report.cache),
     }
     for _, entry in ipairs(report.cache) do
-      local img = entry.snacks_img
-      local sent = (img and img.sent == true) and "sent=true"
-        or "sent=" .. tostring(img and img.sent)
-      lines[#lines + 1] = ("    id=%s  %dx%d  hl=%s  %s  %s"):format(
+      lines[#lines + 1] = ("    id=%s  %dx%d  hl=%s  sent=%s  %s"):format(
         tostring(entry.id), entry.width_cells, entry.height_cells,
-        entry.hl or "?", sent, entry.path)
+        entry.hl or "?", tostring(entry.sent), entry.path)
       if entry.hl then
         local h = vim.api.nvim_get_hl(0, { name = entry.hl })
         lines[#lines + 1] = ("      hl_fg=%s  hl_bg=%s"):format(

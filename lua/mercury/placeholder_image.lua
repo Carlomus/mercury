@@ -56,23 +56,34 @@ local function diacritics()
 end
 
 -- ---------- snacks integration ----------
+--
+-- We use snacks at TWO levels:
+--   * High level: nothing. We do NOT use Snacks.image.image.new()
+--     because it always pipes the source through `magick identify`
+--     async — and on systems where magick is missing OR slow, that
+--     never finishes, snacks's send() never fires, and kitty never
+--     gets the bytes. (Diagnostic showed `sent=nil` for every cached
+--     image — magick identify never completed.)
+--   * Low level: snacks.image.terminal.request for writing kitty
+--     graphics escape sequences (handles kitty/tmux passthrough),
+--     and snacks.util.base64 for base64-encoding. These don't depend
+--     on magick.
+-- For PNG files (Mercury's only image source — matplotlib, IPython
+-- rich display, etc., all produce PNG), magick conversion is
+-- unnecessary anyway; kitty reads the PNG directly.
 
--- Resolve `snacks.image.image` lazily so importing Mercury doesn't
--- depend on snacks at load time. Returns the module or nil.
-local function _snacks_image()
-  local ok_snacks = pcall(require, "snacks")
-  if not ok_snacks then return nil end
-  -- Snacks must be loaded; the top-level `snacks` module's image
-  -- submodule resolves via its __index metamethod.
-  if not _G.Snacks or not _G.Snacks.image then return nil end
-  if not _G.Snacks.image.image then return nil end
-  return _G.Snacks.image.image
-end
-
--- Resolve `snacks.image.terminal` for env / placeholder-support detection.
+-- Resolve `snacks.image.terminal` for env / placeholder-support
+-- detection AND for the low-level kitty graphics request.
 local function _snacks_terminal()
   if not _G.Snacks or not _G.Snacks.image then return nil end
   return _G.Snacks.image.terminal
+end
+
+-- Resolve `snacks.util` for base64 encoding. snacks ships its own
+-- implementation; reusing it avoids dragging in an extra library.
+local function _snacks_util()
+  if not _G.Snacks or not _G.Snacks.util then return nil end
+  return _G.Snacks.util
 end
 
 -- Returns true iff (a) snacks is loaded AND (b) the current terminal
@@ -93,14 +104,13 @@ function M.available()
   if Cfg.get and Cfg.get().output and Cfg.get().output.disable_placeholders then
     return false
   end
-  local img_mod = _snacks_image()
-  if not img_mod then return false end
-  if _G.Snacks and _G.Snacks.image and not _setup_done then
-    _setup_done = true
-    pcall(function() _G.Snacks.image.setup() end)
-  end
   local term = _snacks_terminal()
-  if not term or type(term.env) ~= "function" then return false end
+  if not term then return false end
+  local util = _snacks_util()
+  if not util or type(util.base64) ~= "function" then return false end
+  if type(term.env) ~= "function" or type(term.request) ~= "function" then
+    return false
+  end
   local ok, env = pcall(term.env)
   if not ok or type(env) ~= "table" then return false end
   if env.placeholders ~= true then return false end
@@ -215,11 +225,67 @@ local function _compute_grid_size(w_px, h_px, available_cols)
   return width_cells, height_cells
 end
 
+-- ---------- direct kitty transmit (no magick required) ----------
+--
+-- We generate our own image_ids and transmit PNG bytes directly to
+-- kitty via snacks's terminal.request (which handles tmux
+-- passthrough). This bypasses snacks's Snacks.image.image.new()
+-- entirely — it relies on magick identify which the user's
+-- diagnostic showed never completes (`sent=nil` across the board).
+--
+-- Id encoding mirrors snacks's scheme: 10 bits for a per-nvim-instance
+-- id (derived from PID) shifted left 14, plus a 14-bit sequence
+-- counter. The whole id fits in 24 bits — exactly what kitty's unicode
+-- placeholder protocol reads from the cell's foreground color.
+local NVIM_ID_BITS = 10
+local _nvim_id = 0
+local _id_seq = 30   -- start above the small numbers kitty reserves
+
+local function _next_id()
+  if _nvim_id == 0 then
+    local bit = require("bit")
+    local pid = vim.fn.getpid()
+    _nvim_id = bit.band(
+      bit.bxor(pid, bit.rshift(pid, 5), bit.rshift(pid, NVIM_ID_BITS)),
+      0x3FF)
+    if _nvim_id == 0 then _nvim_id = 1 end
+  end
+  _id_seq = _id_seq + 1
+  local bit = require("bit")
+  return bit.bor(bit.lshift(_nvim_id, 24 - NVIM_ID_BITS), _id_seq)
+end
+
+-- Transmit a PNG file to kitty by file path (kitty protocol `t=f`),
+-- using snacks's low-level terminal.request so we get the same
+-- tmux-passthrough handling snacks itself uses. Synchronous: by the
+-- time this returns, kitty has the bytes (or is on its way to having
+-- them — kitty's parser is fast enough that subsequent placeholder
+-- emission lands after the image is indexed).
+--
+-- We DO NOT use snacks.image.image.new because its convert pipeline
+-- requires `magick identify` for every input regardless of file type,
+-- and on systems where magick is missing the convert never completes
+-- and snacks never calls send(). For Mercury's use case (always PNG
+-- from matplotlib / IPython rich display), no conversion is needed.
+local function _kitty_transmit(id, path)
+  local term = _snacks_terminal()
+  local util = _snacks_util()
+  if not term or not util then return false end
+  local ok = pcall(function()
+    term.request({
+      t = "f",            -- transmit by file path
+      i = id,             -- our generated image_id
+      f = 100,            -- format: 100 = PNG (kitty graphics spec)
+      data = util.base64(path),   -- base64-encoded file path
+    })
+  end)
+  return ok
+end
+
 -- ---------- transmit cache ----------
 
 -- Cache keyed by image file path. Value: entry table with id, grid
--- size, pre-built placeholder rows, and the snacks.Image reference
--- (kept alive so snacks doesn't garbage-collect or re-transmit).
+-- size, pre-built placeholder rows.
 --
 -- Mercury's image extraction already content-addresses paths via the
 -- sha256 hash of the image bytes (output.lua's IMAGE_CACHE_DIR layout),
@@ -227,8 +293,8 @@ end
 local _cache = {}
 
 -- Transmit an image to kitty and return its placeholder descriptor.
--- Returns nil if snacks isn't available, the file can't be read, or
--- the dimensions can't be determined.
+-- Returns nil if snacks's terminal/util aren't available, the file
+-- can't be read, or the dimensions can't be determined.
 --
 -- opts:
 --   available_cols: int — upper bound for width_cells. Required.
@@ -244,9 +310,6 @@ function M.transmit(path, opts)
 
   local entry = _cache[path]
   if entry then return entry end
-
-  local img_mod = _snacks_image()
-  if not img_mod then return nil end
 
   -- Pixel dimensions: from opts when caller already has them
   -- (Mercury's UI flow does — see image.lua's compute_dimensions),
@@ -265,73 +328,25 @@ function M.transmit(path, opts)
     if not w_px or not h_px then return nil end
   end
 
-  -- Initiate transmission via snacks. snacks.image.image.new(path) is
-  -- idempotent per file (its internal `images` cache dedupes by
-  -- file path), so calling it multiple times in a session for the same
-  -- path returns the same Image with the same id.
-  local img
-  local ok = pcall(function() img = img_mod.new(path) end)
-  if not ok or not img or not img.id then return nil end
+  local id = _next_id()
+  local ok = _kitty_transmit(id, path)
+  if not ok then return nil end
 
   local available_cols = opts.available_cols or 80
   local width_cells, height_cells = _compute_grid_size(w_px, h_px, available_cols)
   local rows = _build_rows(width_cells, height_cells)
-  local hl = _ensure_hl(img.id)
+  local hl = _ensure_hl(id)
 
   entry = {
-    id = img.id,
+    id = id,
     width_cells = width_cells,
     height_cells = height_cells,
     rows = rows,
     hl = hl,
-    snacks_img = img,   -- retain so snacks doesn't drop the transmit
+    sent = true,   -- snacks's terminal.request is sync; bytes are on the wire
     path = path,
   }
   _cache[path] = entry
-
-  -- CRITICAL: snacks's image:new() runs `magick identify` ASYNC even
-  -- for already-PNG files (Snacks/image/convert.lua's Convert:resolve
-  -- always appends an identify step). That means img.sent stays false
-  -- until magick finishes; if we return now and nvim draws our
-  -- placeholders before send() completes, kitty sees placeholder
-  -- cells whose fg color encodes an image_id it doesn't have yet —
-  -- nothing renders. By the time send() finally completes, nvim has
-  -- already drawn the screen and won't re-emit the placeholders
-  -- unless something triggers a redraw.
-  --
-  -- Two-pronged fix:
-  --   (a) Wait briefly (up to ~250ms) for img.sent to flip true.
-  --       Matplotlib plots are small (sub-MB) and magick identify is
-  --       fast; most of the time this is well under the timeout.
-  --   (b) ALSO register a fake placement so snacks's on_send callback
-  --       fires when transmission completes — schedules a redraw so
-  --       the placeholders re-emit to kitty even if (a) timed out
-  --       (e.g., magick not installed, large image, slow disk).
-  if not img.sent then
-    -- (a) Bounded sync wait. 250 ms is a balance between not
-    -- blocking the UI noticeably and giving magick identify time to
-    -- finish for typical matplotlib output.
-    pcall(function()
-      vim.wait(250, function() return img.sent == true end, 10)
-    end)
-    -- (b) Async safety net: even if the wait timed out, register an
-    -- on-send hook so kitty gets the placeholders re-emitted once
-    -- transmission completes. We mimic snacks's placement protocol
-    -- by `place()`-ing a stub object whose `update()` triggers a
-    -- redraw — snacks's on_send iterates placements and calls
-    -- update on each.
-    if not img.sent and type(img.place) == "function" then
-      local stub_placement = {
-        update = function(_self)
-          vim.schedule(function() pcall(vim.cmd, "redraw!") end)
-        end,
-        error = function() end,
-        close = function() end,
-      }
-      pcall(function() img:place(stub_placement) end)
-    end
-  end
-
   return entry
 end
 
@@ -342,9 +357,13 @@ end
 function M.cleanup(path)
   local entry = _cache[path]
   if not entry then return end
-  local img = entry.snacks_img
-  if img and type(img.del) == "function" then
-    pcall(function() img:del() end)
+  -- Tell kitty to delete the image. `a=d, d=i, i=<id>` deletes by
+  -- image id, freeing the bytes from kitty's memory.
+  local term = _snacks_terminal()
+  if term and type(term.request) == "function" then
+    pcall(function()
+      term.request({ a = "d", d = "i", i = entry.id })
+    end)
   end
   _cache[path] = nil
 end
@@ -361,9 +380,9 @@ function M.diagnose()
   local report = {}
   local snacks_ok = pcall(require, "snacks")
   report.snacks_loaded = snacks_ok and _G.Snacks ~= nil
-  report.snacks_image_module = _snacks_image() ~= nil
+  report.snacks_terminal_module = _snacks_terminal() ~= nil
+  report.snacks_util_module = _snacks_util() ~= nil
   report.termguicolors = vim.o.termguicolors
-  report.setup_called = _setup_done
 
   local term = _snacks_terminal()
   if term and type(term.env) == "function" then
@@ -377,6 +396,7 @@ function M.diagnose()
   end
 
   report.available = M.available()
+  report.nvim_id = _nvim_id
 
   local cache_entries = {}
   for path, entry in pairs(_cache) do
@@ -386,6 +406,7 @@ function M.diagnose()
       width_cells = entry.width_cells,
       height_cells = entry.height_cells,
       hl = entry.hl,
+      sent = entry.sent,
     }
   end
   report.cache = cache_entries

@@ -31,8 +31,15 @@ local function fake_png(w, h)
 end
 
 -- Mount a fake snacks module in package.loaded so require("snacks")
--- and _G.Snacks.image.* resolve to our test doubles. Returns the
--- fake's transmit log so tests can introspect.
+-- and _G.Snacks.image.terminal / _G.Snacks.util resolve to our test
+-- doubles. Returns the fake's transmit log so tests can introspect.
+--
+-- Mercury's placeholder_image module now uses ONLY the low-level
+-- snacks.image.terminal.request (for the kitty graphics escape
+-- sequence) and snacks.util.base64 (for the data field). It does
+-- NOT use snacks.image.image.new because that path goes through
+-- magick identify which never completes on systems without magick
+-- (the user-reported "sent=nil" symptom).
 --
 -- Side effect: enables termguicolors. Placeholder mode requires it
 -- (without termguicolors, the per-image fg color collapses to
@@ -41,42 +48,32 @@ end
 -- opt in explicitly.
 local function _install_fake_snacks(supports_placeholders)
   vim.o.termguicolors = true
-  local transmitted = {}
-  local next_id = 1000
+  local transmitted = {}   ---@type table<integer, {i:integer, t:string, f:integer, data:string}>
 
   local fake_terminal = {
     env = function()
       return { placeholders = supports_placeholders }
     end,
+    request = function(opts)
+      transmitted[#transmitted + 1] = vim.deepcopy(opts)
+    end,
   }
 
-  local fake_image_image = {}
-  local img_cache = {}
-  fake_image_image.new = function(src)
-    if img_cache[src] then return img_cache[src] end
-    next_id = next_id + 1
-    transmitted[#transmitted + 1] = src
-    local img = {
-      src = src,
-      id = next_id,
-      placements = {},
-      del = function(self) self._deleted = true end,
-    }
-    img_cache[src] = img
-    return img
-  end
+  local fake_util = {
+    base64 = function(s) return "base64(" .. s .. ")" end,
+  }
 
   local fake_snacks = {
     image = {
       terminal = fake_terminal,
-      image = fake_image_image,
     },
+    util = fake_util,
   }
 
   package.loaded["snacks"] = fake_snacks
   _G.Snacks = fake_snacks
 
-  return { transmitted = transmitted, img_cache = img_cache }
+  return { transmitted = transmitted }
 end
 
 local function _uninstall_fake_snacks()
@@ -157,15 +154,25 @@ describe("placeholder_image.transmit", function()
     os.remove("/tmp/mph_a.png")
   end)
 
-  it("transmits via snacks (one entry in transmit log per unique path)", function()
+  it("transmits a kitty graphics request once per unique path", function()
     Util.write_file("/tmp/mph_b.png", fake_png(400, 200))
     local P = require("mercury.placeholder_image")
-    -- Two transmits of the same path: snacks.image.image.new dedupes
-    -- by file path, so the transmit log should only show it ONCE.
+    -- Two transmits of the same path: Mercury's internal cache
+    -- dedupes by path, so the kitty graphics request should fire
+    -- only ONCE.
     P.transmit("/tmp/mph_b.png", { available_cols = 80, width_px = 400, height_px = 200 })
     P.transmit("/tmp/mph_b.png", { available_cols = 80, width_px = 400, height_px = 200 })
     assert.equals(1, #fake.transmitted)
-    assert.equals("/tmp/mph_b.png", fake.transmitted[1])
+    -- Verify the request payload is a kitty PNG-by-path transmit.
+    local req = fake.transmitted[1]
+    assert.equals("f", req.t,
+      "kitty graphics t='f' = transmit by file path")
+    assert.equals(100, req.f,
+      "kitty format 100 = PNG")
+    assert.equals("base64(/tmp/mph_b.png)", req.data,
+      "data is base64-encoded file path (we use snacks.util.base64)")
+    assert.is_true(req.i > 0,
+      "the request must carry our generated image_id")
     os.remove("/tmp/mph_b.png")
   end)
 
@@ -356,8 +363,10 @@ describe("ui.lua picks placeholder mode when snacks is available", function()
     -- Snacks's transmit log must have one entry (we transmitted the
     -- image via the placeholder path).
     assert.equals(1, #fake.transmitted,
-      "placeholder mode must transmit the image via snacks")
-    assert.equals("/tmp/mph_e2e.png", fake.transmitted[1])
+      "placeholder mode must transmit the image via snacks's kitty terminal request")
+    assert.equals("f", fake.transmitted[1].t,
+      "transmit must be t='f' (kitty PNG-by-file-path)")
+    assert.equals("base64(/tmp/mph_e2e.png)", fake.transmitted[1].data)
 
     -- image.nvim's from_file must NOT have been called — that would
     -- mean we took the legacy cursor-positioned path even though
@@ -397,22 +406,29 @@ describe("ui.lua picks placeholder mode when snacks is available", function()
 end)
 
 describe("placeholder_image.cleanup", function()
+  local fake
   before_each(function()
-    _install_fake_snacks(true)
+    fake = _install_fake_snacks(true)
     require("mercury.config").setup()
   end)
   after_each(_uninstall_fake_snacks)
 
-  it("drops the cache entry and asks snacks to delete the kitty image", function()
+  it("drops the cache entry and asks kitty to delete the image", function()
     Util.write_file("/tmp/mph_g.png", fake_png(80, 80))
     local P = require("mercury.placeholder_image")
     local entry = P.transmit("/tmp/mph_g.png",
       { available_cols = 80, width_px = 80, height_px = 80 })
     assert.is_table(entry)
     assert.is_not_nil(P._cache["/tmp/mph_g.png"])
+    -- First request was the transmit. Second should be the delete.
+    assert.equals(1, #fake.transmitted)
     P.cleanup("/tmp/mph_g.png")
     assert.is_nil(P._cache["/tmp/mph_g.png"])
-    assert.is_true(entry.snacks_img._deleted)
+    assert.equals(2, #fake.transmitted)
+    local del_req = fake.transmitted[2]
+    assert.equals("d", del_req.a, "kitty a='d' = delete")
+    assert.equals("i", del_req.d, "d='i' = by image id")
+    assert.equals(entry.id, del_req.i)
     os.remove("/tmp/mph_g.png")
   end)
 end)
