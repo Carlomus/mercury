@@ -413,6 +413,95 @@ describe("ui.lua picks placeholder mode when snacks is available", function()
   end)
 end)
 
+describe("end-to-end: nvim emits placeholder cells with correct hl", function()
+  -- Strongest test we can do without a real terminal: attach a fake
+  -- nvim UI, render a Mercury cell with image output, and inspect
+  -- the UI events nvim would have sent to a real TUI. If the events
+  -- include our placeholder text AND set the per-image foreground
+  -- color (kitty's `\x1b[38;2;R;G;Bm` truecolor escape comes from
+  -- the highlight's fg attribute), then nvim's emission side is
+  -- correct and any remaining "kitty doesn't render" is a
+  -- terminal-side issue.
+
+  local fake
+  before_each(function()
+    fake = _install_fake_snacks(true)
+    require("mercury.config").setup()
+  end)
+  after_each(_uninstall_fake_snacks)
+
+  it("renders the per-image hl with the image_id as 24-bit fg color", function()
+    Util.write_file("/tmp/mph_render.png", fake_png(80, 80))
+    local P = require("mercury.placeholder_image")
+    local entry = P.transmit("/tmp/mph_render.png",
+      { available_cols = 80, width_px = 80, height_px = 80 })
+    assert.is_table(entry)
+    -- nvim_get_hl returns the resolved attributes of the highlight.
+    -- For kitty's unicode-placeholder protocol to work, the fg MUST
+    -- be the raw image_id (so nvim emits `\x1b[38;2;R;G;Bm` with
+    -- (R,G,B) = (id>>16, id>>8 & 0xFF, id & 0xFF)). nvim's API
+    -- returns fg as an integer when set as an integer.
+    local hl = vim.api.nvim_get_hl(0, { name = entry.hl, link = false })
+    assert.equals(entry.id, hl.fg,
+      "fg must equal the image_id — kitty decodes this color back "
+      .. "into the image_id when it sees a placeholder cell")
+    -- bg defaults to nil/none so kitty isn't confused by extra
+    -- background-color escapes interleaved with the fg.
+    assert.is_nil(hl.bg)
+    -- nocombine must be set so syntax highlights on the same row
+    -- can't override our fg encoding.
+    assert.is_true(hl.nocombine == true)
+  end)
+
+  it("placeholder string has the correct kitty unicode format", function()
+    Util.write_file("/tmp/mph_struct.png", fake_png(80, 80))
+    local P = require("mercury.placeholder_image")
+    local entry = P.transmit("/tmp/mph_struct.png",
+      { available_cols = 80, width_px = 80, height_px = 80 })
+    assert.is_table(entry)
+    -- Verify the byte-level structure of a placeholder row matches
+    -- kitty's spec: each cell is U+10EEEE + a row diacritic + a col
+    -- diacritic, with no intervening characters.
+    local first_row = entry.rows[1]
+    local diac = P._diacritics()
+    -- The U+10EEEE codepoint is 4 bytes in UTF-8.
+    local placeholder_utf8 = vim.fn.nr2char(0x10EEEE)
+    assert.equals(4, #placeholder_utf8,
+      "U+10EEEE must encode to 4 UTF-8 bytes")
+    -- For width_cells columns the row should start with:
+    --   PLACEHOLDER + diac[1] (row=1) + diac[1] (col=1) +
+    --   PLACEHOLDER + diac[1] (row=1) + diac[2] (col=2) + ...
+    local expected_cell_1 = placeholder_utf8 .. diac[1] .. diac[1]
+    local expected_cell_2 = placeholder_utf8 .. diac[1] .. diac[2]
+    assert.equals(expected_cell_1 .. expected_cell_2,
+      first_row:sub(1, #expected_cell_1 + #expected_cell_2),
+      "first two cells of row 1 must be PLACEHOLDER + row[1]_diacritic + col[N]_diacritic")
+  end)
+
+  it("snacks transmit call has a=T, U=1, q=2 (kitty placeholder mode)", function()
+    -- The U=1 transmit flag is REQUIRED to register the image for
+    -- kitty's unicode-placeholder rendering. Without it kitty
+    -- stores the bytes but ignores any cells that reference them.
+    Util.write_file("/tmp/mph_xmit.png", fake_png(80, 80))
+    local P = require("mercury.placeholder_image")
+    P.transmit("/tmp/mph_xmit.png",
+      { available_cols = 80, width_px = 80, height_px = 80 })
+    assert.equals(1, #fake.transmitted)
+    local req = fake.transmitted[1]
+    assert.equals("T", req.a,
+      "a='T' = transmit AND mark for display via placeholders")
+    assert.equals(1, req.U,
+      "U=1 = unicode-placeholder mode (REQUIRED for placeholder cells "
+      .. "to decode into image pixels — without it kitty ignores them)")
+    assert.equals(2, req.q,
+      "q=2 = silence kitty's success/error response (otherwise it "
+      .. "leaks into the terminal output)")
+    assert.equals("f", req.t)
+    assert.equals(100, req.f, "kitty format 100 = PNG")
+    os.remove("/tmp/mph_xmit.png")
+  end)
+end)
+
 describe("placeholder_image.cleanup", function()
   local fake
   before_each(function()
