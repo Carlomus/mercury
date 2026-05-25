@@ -356,22 +356,9 @@ function Renderer:render(cell, anchor_row, images, layout)
       local opts = {
         buffer = self.notebook.buf,
         window = nil,                   -- SPEC I18: bypass image.nvim's renderer branches
-        -- SPEC I18 (extended): inline = FALSE so image.nvim doesn't
-        -- create a per-image extmark. We pass y as a SCREEN ROW
-        -- (0-indexed terminal row), but image.nvim's inline-mode
-        -- extmark code stores y as a BUFFER ROW. If the buffer
-        -- later changes near that row, the extmark moves;
-        -- image.nvim's TextChanged handler then reads the new
-        -- BUFFER row, writes it back into geometry.y, and re-renders
-        -- the image at `that_buffer_row + offset_top` — a meaningless
-        -- terminal position. inline=false skips the entire extmark
-        -- creation block (image.lua:101 `if was_rendered and
-        -- self.buffer and self.inline then ...`), so
-        -- has_extmark_moved returns false (no extmark) and the
-        -- TextChanged handler does nothing for our images.
-        inline = false,
+        inline = true,                  -- empirically needed for the 1-col offset image.nvim applies; setting false caused images to render at terminal col 1 (against the gutter) instead of col 2 — see img_decisions.md
         with_virtual_padding = false,   -- SPEC I16
-        x = i - 1,                      -- distinct cols per image
+        x = i - 1,                      -- distinct extmark cols per image
         y = screen_y,                   -- body_end's CURRENT screen row (0-indexed)
         width = widths[i],
         render_offset_top = off,
